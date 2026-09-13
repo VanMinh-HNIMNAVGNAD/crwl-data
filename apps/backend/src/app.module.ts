@@ -4,6 +4,7 @@ import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { DatabaseModule } from './modules/database/database.module.js';
 import { DownloaderModule } from './modules/downloader/downloader.module.js';
+import { TurnstileModule } from './modules/turnstile/turnstile.module.js';
 
 @Module({
   imports: [
@@ -13,6 +14,7 @@ import { DownloaderModule } from './modules/downloader/downloader.module.js';
     }),
     DatabaseModule,
     DownloaderModule,
+    TurnstileModule,
   ],
   controllers: [AppController],
   providers: [AppService],

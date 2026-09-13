@@ -25,14 +25,59 @@ export function getDeviceId() {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Turnstile Token (In-memory - reset mỗi khi reload F5)
+// ─────────────────────────────────────────────────────────────────────────────
+let inMemoryTurnstileToken = null
+
+export function setTurnstileToken(token) {
+  inMemoryTurnstileToken = token
+}
+
+export function getTurnstileToken() {
+  return inMemoryTurnstileToken
+}
+
 /**
- * Header mặc định kèm Device ID để backend nhận diện và lưu vết
+ * Gửi token lên backend để xác thực với Cloudflare Siteverify API (nếu backend bật TURNSTILE_SECRET_KEY)
+ */
+export async function verifyTurnstileTokenWithBackend(token) {
+  try {
+    const res = await fetch(`${API_BASE}/api/turnstile/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-device-id': getDeviceId(),
+      },
+      body: JSON.stringify({ token }),
+    })
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}))
+      return { success: false, message: errData.message || 'Xác thực từ máy chủ thất bại.' }
+    }
+
+    const data = await res.json()
+    return { success: true, ...data }
+  } catch (err) {
+    // Nếu backend offline hoặc không gọi được, ghi nhận log và cho phép client-side
+    console.warn('[Turnstile] Backend verify skipped or unavailable:', err)
+    return { success: true, bypassed: true }
+  }
+}
+
+/**
+ * Header mặc định kèm Device ID & Turnstile Token để backend nhận diện và kiểm duyệt an toàn
  */
 function getDefaultHeaders() {
-  return {
+  const headers = {
     'Content-Type': 'application/json',
     'x-device-id': getDeviceId(),
   }
+  if (inMemoryTurnstileToken) {
+    headers['x-turnstile-token'] = inMemoryTurnstileToken
+  }
+  return headers
 }
 
 /**
@@ -53,7 +98,9 @@ export function setActiveBrowser(browserId) {
     } else {
       localStorage.removeItem('selected_browser')
     }
-  } catch {}
+  } catch (err) {
+    void err
+  }
 }
 
 /**

@@ -1,21 +1,37 @@
-import { useState } from 'react'
+import { useState, useCallback } from 'react'
 import SystemHeader from './components/SystemHeader'
 import SingleDownloader from './components/SingleDownloader'
 import MultiLinkDownloader from './components/MultiLinkDownloader'
 import BulkDownloader from './components/BulkDownloader'
 import DownloadHistoryModal from './components/DownloadHistoryModal'
 import CookieManager from './components/CookieManager'
+import TurnstileGate from './components/TurnstileGate'
+import { setTurnstileToken } from './services/api'
 import './App.css'
 
 function App() {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false)
   const [isCookieManagerOpen, setIsCookieManagerOpen] = useState(false)
 
+  // Trạng thái xác thực Turnstile (chỉ lưu in-memory, mỗi lần F5 / reload đều bắt buộc xác thực lại)
+  const [isTurnstileVerified, setIsTurnstileVerified] = useState(false)
+
+  const handleTurnstileVerify = useCallback((token) => {
+    setTurnstileToken(token)
+    setIsTurnstileVerified(true)
+  }, [])
+
   return (
     <div className="media-app-layout">
+      {/* Cổng xác thực Turnstile: Tự động tải lại mỗi lần vào web hoặc F5 */}
+      {!isTurnstileVerified && (
+        <TurnstileGate onVerify={handleTurnstileVerify} />
+      )}
+
       <SystemHeader
         onOpenHistory={() => setIsHistoryOpen(true)}
         onOpenCookies={() => setIsCookieManagerOpen(true)}
+        isTurnstileVerified={isTurnstileVerified}
       />
       <main className="app-main-content">
         <section className="section-block">

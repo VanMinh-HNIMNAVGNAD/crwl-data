@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { getBrowsersList, getSystemHealth, getActiveBrowser, setActiveBrowser, getCookieStatus } from '../services/api'
-import { IconGlobe, IconChevronDown, IconCheck, IconRefresh, IconHistory } from './Icons'
+import { IconGlobe, IconChevronDown, IconCheck, IconRefresh, IconHistory, IconShieldCheck } from './Icons'
 
-export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
+export default function SystemHeader({ onOpenHistory, onOpenCookies, isTurnstileVerified = false }) {
   const [health, setHealth] = useState(null)
   const [browsersData, setBrowsersData] = useState(null)
   const [selectedBrowser, setSelectedBrowser] = useState(getActiveBrowser() || '')
@@ -113,6 +113,13 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
               <span className="engine-status-pill" title="ffmpeg video/audio remuxing">
                 <span className="status-indicator-dot online" />
                 <span className="engine-name">ffmpeg</span>
+              </span>
+            )}
+            {isTurnstileVerified && (
+              <span className="engine-status-pill" title="Phiên làm việc đã xác thực an toàn qua Cloudflare Turnstile">
+                <IconShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="engine-name" style={{ color: '#10b981' }}>Turnstile</span>
+                <span className="engine-ver">Verified</span>
               </span>
             )}
           </div>
