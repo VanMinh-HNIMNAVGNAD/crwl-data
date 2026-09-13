@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/yamadashy/repomix/main/repomix.schema.json",
+  "output": {
+    "filePath": "repomix-frontend-output.xml",
+    "style": "xml",
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "topFilesLength": 10,
+    "showLineNumbers": false
+  },
+  "include": [
+    "apps/frontend/**/*"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/.env*",
+      "**/package-lock.json",
+      "**/pnpm-lock.yaml"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  }
+}

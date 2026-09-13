@@ -1,0 +1,161 @@
+# ==============================================================================
+# 1. BẢO MẬT & TỆP QUAN TRỌNG (SENSITIVE & CREDENTIALS)
+# Các file chứa thông tin nhạy cảm, bảo mật, tài khoản, token, cookies
+# ==============================================================================
+
+# Environment Variables & Secrets
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+# Giữ lại file mẫu cấu hình để chia sẻ cấu trúc
+!.env.example
+
+# Cookies, Session Data & Authentication Tokens
+*.cookies
+*.cookie
+*cookies*.txt
+cookies.txt
+apps/backend/cookies.txt
+crwl-cookies/
+token.json
+credentials.json
+oauth-tokens.json
+session.json
+
+# Private Keys, Certificates
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+id_rsa*
+id_ed25519*
+
+# Databases & Data Dumps
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.sql
+*.sql.gz
+*.dump
+
+# ==============================================================================
+# 2. THƯ MỤC & TỆP KHÔNG CẦN THIẾT (DEPENDENCIES, BUILDS, CACHE, LOGS)
+# Các file rác, thư viện tải về, mã biên dịch, tệp tạm thời
+# ==============================================================================
+
+# Dependencies
+node_modules/
+*/node_modules/
+.pnpm-store/
+.yarn/
+
+# Build Outputs & Compilation Caches
+dist/
+*/dist/
+dist-ssr/
+build/
+out/
+.next/
+.nuxt/
+.cache/
+.turbo/
+.vite/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Python Virtual Environments & Cache
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+tools-venv/
+*/tools-venv/
+gallery-dl-venv/
+*/gallery-dl-venv/
+*.egg-info/
+.eggs/
+
+# Downloaded Binaries & Local Runners (Tự tải bởi BinaryManagerService)
+bin/yt-dlp
+bin/yt-dlp-runner
+bin/gallery-dl
+apps/backend/bin/yt-dlp
+apps/backend/bin/yt-dlp-runner
+apps/backend/bin/gallery-dl
+*/bin/yt-dlp*
+*/bin/gallery-dl*
+# Lưu ý: Giữ lại source code scripts Python trong bin/
+!bin/*.py
+!apps/backend/bin/*.py
+
+# Media Files & Tệp tạm thời khi crawl / download
+downloads/
+*/downloads/
+temp/
+tmp/
+*.part
+*.ytdl
+*.temp
+*.tmp
+*.aria2
+*.vtt
+*.srt
+*.ass
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+*.mp3
+*.m4a
+*.flac
+*.wav
+*.aac
+*.opus
+
+# Test Coverage
+coverage/
+*/coverage/
+.nyc_output/
+
+# Repomix & Code Analysis Reports
+repomix-output*
+repomix-*-output.*
+repomix-*.xml
+*.xml
+!apps/**/*.xml
+
+# IDE & OS Artifacts
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.sublime-workspace
+*.sublime-project
+*.sw?

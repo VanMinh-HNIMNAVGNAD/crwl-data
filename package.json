@@ -1,0 +1,26 @@
+{
+  "name": "crwl-on-socialmedia",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fullstack Social Media Crawler Monorepo",
+  "scripts": {
+    "dev": "pnpm -r --parallel run dev",
+    "dev:frontend": "pnpm --filter frontend dev",
+    "dev:backend": "pnpm --filter backend dev",
+    "build": "pnpm -r run build",
+    "build:frontend": "pnpm --filter frontend build",
+    "build:backend": "pnpm --filter backend build",
+    "lint:frontend": "pnpm --filter frontend lint",
+    "lint:backend": "pnpm --filter backend lint",
+    "repomix:backend": "repomix --config repomix.backend.config.json",
+    "repomix:frontend": "repomix --config repomix.frontend.config.json",
+    "repomix": "pnpm run repomix:backend && pnpm run repomix:frontend"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "repomix": "^1.18.0"
+  }
+}

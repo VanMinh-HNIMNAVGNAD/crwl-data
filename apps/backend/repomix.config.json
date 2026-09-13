@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/yamadashy/repomix/main/repomix.schema.json",
+  "output": {
+    "filePath": "repomix-output.xml",
+    "style": "xml",
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "topFilesLength": 10,
+    "showLineNumbers": false
+  },
+  "include": [
+    "src/**/*",
+    "test/**/*",
+    "package.json",
+    "tsconfig*.json",
+    "nest-cli.json",
+    "README.md"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "node_modules/**",
+      "dist/**",
+      ".env*",
+      "*.tsbuildinfo",
+      "pnpm-lock.yaml"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  }
+}
