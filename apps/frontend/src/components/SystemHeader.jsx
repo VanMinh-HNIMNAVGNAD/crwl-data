@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
-import { getBrowsersList, getSystemHealth, getActiveBrowser, setActiveBrowser, getCookieStatus } from '../services/api'
+import { getBrowsersList, getActiveBrowser, setActiveBrowser, getCookieStatus } from '../services/api'
 import { IconGlobe, IconChevronDown, IconCheck, IconRefresh, IconHistory, IconShieldCheck } from './Icons'
 
 export default function SystemHeader({ onOpenHistory, onOpenCookies, isTurnstileVerified = false }) {
-  const [health, setHealth] = useState(null)
   const [browsersData, setBrowsersData] = useState(null)
   const [selectedBrowser, setSelectedBrowser] = useState(getActiveBrowser() || '')
   const [isDropdownOpen, setIsDropdownOpen] = useState(false)
@@ -18,8 +17,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, isTurnstile
 
   const loadData = async () => {
     try {
-      const [h, b, cs] = await Promise.all([getSystemHealth(), getBrowsersList(), getCookieStatus()])
-      if (h) setHealth(h)
+      const [b, cs] = await Promise.all([getBrowsersList(), getCookieStatus()])
       if (b) {
         setBrowsersData(b)
         if (!getActiveBrowser() && b.current) {
@@ -93,36 +91,16 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, isTurnstile
 
         {/* Trạng thái Binary & Bộ chọn Cookies Trình duyệt */}
         <div className="system-status-group">
-          {/* Engine Badges */}
-          <div className="engine-badges-container">
-            {health?.ytDlp?.available && (
-              <span className="engine-status-pill" title={`yt-dlp ${health.ytDlp.version || ''}`}>
-                <span className="status-indicator-dot online" />
-                <span className="engine-name">yt-dlp</span>
-                <span className="engine-ver">{health.ytDlp.version ? health.ytDlp.version.slice(0, 10) : 'v2026'}</span>
-              </span>
-            )}
-            {health?.galleryDl?.available && (
-              <span className="engine-status-pill" title={`gallery-dl ${health.galleryDl.version || ''}`}>
-                <span className="status-indicator-dot online" />
-                <span className="engine-name">gallery-dl</span>
-                <span className="engine-ver">{health.galleryDl.version ? `v${health.galleryDl.version}` : 'ready'}</span>
-              </span>
-            )}
-            {health?.ffmpeg?.available && (
-              <span className="engine-status-pill" title="ffmpeg video/audio remuxing">
-                <span className="status-indicator-dot online" />
-                <span className="engine-name">ffmpeg</span>
-              </span>
-            )}
-            {isTurnstileVerified && (
+          {/* Turnstile Verified Badge */}
+          {isTurnstileVerified && (
+            <div className="engine-badges-container">
               <span className="engine-status-pill" title="Phiên làm việc đã xác thực an toàn qua Cloudflare Turnstile">
                 <IconShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
                 <span className="engine-name" style={{ color: '#10b981' }}>Turnstile</span>
                 <span className="engine-ver">Verified</span>
               </span>
-            )}
-          </div>
+            </div>
+          )}
 
           {/* Browser Cookies Selector Dropdown */}
           <div className="browser-selector-wrapper" ref={browserDropdownRef}>
