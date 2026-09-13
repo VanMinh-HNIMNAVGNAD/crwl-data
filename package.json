@@ -2,6 +2,7 @@
   "name": "crwl-on-socialmedia",
   "version": "1.0.0",
   "private": true,
+  "packageManager": "pnpm@9.15.5",
   "description": "Fullstack Social Media Crawler Monorepo",
   "scripts": {
     "dev": "pnpm -r --parallel run dev",
