@@ -22,7 +22,7 @@ import DownloadProgressCard from './DownloadProgressCard'
 
 export default function AccountDownloader({ onShowToast }) {
   const [accountInput, setAccountInput] = useState('')
-  const [selectedPlatform] = useState('auto')
+  const [selectedPlatform, setSelectedPlatform] = useState('auto')
   const [mediaTypeFilter, setMediaTypeFilter] = useState('all') // 'all' | 'video' | 'image'
   const [crawlLimit, setCrawlLimit] = useState('20')
   const [rangeFrom, setRangeFrom] = useState('1')
@@ -40,9 +40,9 @@ export default function AccountDownloader({ onShowToast }) {
   const [downloadTaskTitle, setDownloadTaskTitle] = useState('')
   const [isZipDownloading, setIsZipDownloading] = useState(false)
 
-  // Tự động nhận diện platform từ input
+  // Tự động nhận diện platform từ input hoặc dùng platform đã chọn
   const detected = detectPlatform(accountInput)
-  const activePlatform = selectedPlatform === 'auto' ? (detected || 'youtube') : selectedPlatform
+  const activePlatform = selectedPlatform !== 'auto' ? selectedPlatform : (detected || undefined)
 
   const profileMediaList = useMemo(() => profileResult?.media || [], [profileResult])
   const selectedProfileCount = useMemo(
@@ -83,6 +83,11 @@ export default function AccountDownloader({ onShowToast }) {
       return
     }
 
+    if ((target.startsWith('@') || (!target.includes('.') && !target.includes('/'))) && (!activePlatform || activePlatform === 'auto')) {
+      onShowToast?.('Vui lòng bấm chọn một nền tảng (Facebook, Instagram, X...) phía dưới để quét username!')
+      return
+    }
+
     setIsCrawling(true)
     setCrawlProgress(15)
     setStatusText('Đang kết nối tài khoản...')
@@ -99,11 +104,19 @@ export default function AccountDownloader({ onShowToast }) {
 
     try {
       const isRange = crawlLimit === 'range'
-      const startNum = isRange ? (parseInt(rangeFrom, 10) || 1) : undefined
-      const endNum = isRange ? (parseInt(rangeTo, 10) || 50) : undefined
-      const limitNum = isRange
-        ? Math.max(1, endNum - startNum + 1)
-        : (crawlLimit === 'all' ? 100 : parseInt(crawlLimit, 10) || 50)
+      let startNum = undefined
+      let endNum = undefined
+      let limitNum = 20
+
+      if (isRange) {
+        startNum = Math.max(1, parseInt(rangeFrom, 10) || 1)
+        endNum = Math.max(startNum, parseInt(rangeTo, 10) || startNum)
+        limitNum = Math.max(1, endNum - startNum + 1)
+      } else if (crawlLimit === 'all') {
+        limitNum = 0 // 0 = Không giới hạn số lượng, quét toàn bộ
+      } else {
+        limitNum = Math.max(1, parseInt(crawlLimit, 10) || 20)
+      }
 
       setStatusText('Đang quét và lấy danh sách phương tiện...')
       const resultData = await crawlProfile({
@@ -328,36 +341,71 @@ export default function AccountDownloader({ onShowToast }) {
             )}
           </div>
 
+          <div className="pane-control-row" style={{ marginBottom: '8px' }}>
+            <div className="pills-group">
+              <span className="control-label-text">Nền tảng:</span>
+              {[
+                { id: 'auto', label: 'Tự động' },
+                { id: 'facebook', label: 'Facebook' },
+                { id: 'instagram', label: 'Instagram' },
+                { id: 'x', label: 'X (Twitter)' },
+                { id: 'tiktok', label: 'TikTok' },
+                { id: 'youtube', label: 'YouTube' },
+                { id: 'pinterest', label: 'Pinterest' },
+                { id: 'reddit', label: 'Reddit' },
+              ].map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className={`minimal-pill ${selectedPlatform === p.id ? 'active' : ''}`}
+                  onClick={() => setSelectedPlatform(p.id)}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div className="pane-control-row">
             <div className="pills-group">
               <span className="control-label-text">Số lượng:</span>
-              {['20', '50', 'all', 'range'].map((lim) => (
+              {[
+                { id: '20', label: '20' },
+                { id: '50', label: '50' },
+                { id: '100', label: '100' },
+                { id: 'all', label: 'Tất cả' },
+                { id: 'range', label: 'Khoảng' },
+              ].map((item) => (
                 <button
-                  key={lim}
+                  key={item.id}
                   type="button"
-                  className={`minimal-pill ${crawlLimit === lim ? 'active' : ''}`}
-                  onClick={() => setCrawlLimit(lim)}
+                  className={`minimal-pill ${crawlLimit === item.id ? 'active' : ''}`}
+                  onClick={() => setCrawlLimit(item.id)}
                 >
-                  {lim === 'all' ? 'Tất cả' : lim === 'range' ? 'Khoảng' : lim}
+                  {item.label}
                 </button>
               ))}
 
               {crawlLimit === 'range' && (
                 <div className="range-box-inline">
+                  <span>Từ</span>
                   <input
                     type="number"
                     className="range-input-clean"
                     value={rangeFrom}
                     onChange={(e) => setRangeFrom(e.target.value)}
                     min="1"
+                    title="Số thứ tự bắt đầu"
                   />
                   <span>-</span>
+                  <span>Đến</span>
                   <input
                     type="number"
                     className="range-input-clean"
                     value={rangeTo}
                     onChange={(e) => setRangeTo(e.target.value)}
                     min="1"
+                    title="Số thứ tự kết thúc"
                   />
                 </div>
               )}
@@ -430,6 +478,38 @@ export default function AccountDownloader({ onShowToast }) {
                 >
                   {selectedProfileCount === profileMediaList.length ? 'Bỏ chọn' : 'Chọn tất cả'}
                 </button>
+                {profileMediaList.length > 10 && (
+                  <button
+                    type="button"
+                    className="minimal-small-btn"
+                    onClick={() => {
+                      const batch = {}
+                      profileMediaList.slice(0, 10).forEach((it) => {
+                        batch[it.id] = true
+                      })
+                      setSelectedBatchIds(batch)
+                    }}
+                    title="Chọn nhanh 10 tệp đầu tiên"
+                  >
+                    10 đầu
+                  </button>
+                )}
+                {profileMediaList.length > 20 && (
+                  <button
+                    type="button"
+                    className="minimal-small-btn"
+                    onClick={() => {
+                      const batch = {}
+                      profileMediaList.slice(0, 20).forEach((it) => {
+                        batch[it.id] = true
+                      })
+                      setSelectedBatchIds(batch)
+                    }}
+                    title="Chọn nhanh 20 tệp đầu tiên"
+                  >
+                    20 đầu
+                  </button>
+                )}
                 {selectedProfileCount > 0 && (
                   <>
                     <button
@@ -496,6 +576,9 @@ export default function AccountDownloader({ onShowToast }) {
                         src={buildProxyImageUrl(item.thumb || item.url)}
                         alt=""
                         className="profile-item-thumb"
+                        onError={(e) => {
+                          e.target.style.opacity = '0.5'
+                        }}
                       />
                       {item.duration && (
                         <span className="duration-tag">{item.duration}</span>
@@ -504,7 +587,14 @@ export default function AccountDownloader({ onShowToast }) {
                         type="checkbox"
                         className="profile-item-checkbox"
                         checked={isSelected}
-                        onChange={() => {}}
+                        onChange={(e) => {
+                          e.stopPropagation()
+                          setSelectedBatchIds((prev) => ({
+                            ...prev,
+                            [item.id]: !prev[item.id],
+                          }))
+                        }}
+                        onClick={(e) => e.stopPropagation()}
                       />
                     </div>
 

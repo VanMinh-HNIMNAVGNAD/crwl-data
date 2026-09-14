@@ -38,10 +38,6 @@ class YtDlpExtractor(BaseExtractor):
             "--ignore-errors",
         ]
 
-        # Impersonate Chrome cho Facebook
-        is_facebook = any(d in target_url.lower() for d in ("facebook.com", "fb.watch", "fb.com"))
-        if is_facebook:
-            args.extend(["--impersonate", "Chrome-120:Macos-14"])
 
         # Sử dụng Node.js runtime cho YouTube n-sig solver nếu có
         node_bin = self.find_binary("node")
@@ -52,13 +48,21 @@ class YtDlpExtractor(BaseExtractor):
             args.append("--no-playlist")
 
         tmp_cookie_file = None
-        if browser and browser != "none":
+        if browser != "none":
             # Thử tự động xuất cookies từ trình duyệt Linux
-            exported = get_browser_cookies_txt(browser, domain=None)
+            domain = None
+            if target_url:
+                import urllib.parse
+                try:
+                    parsed = urllib.parse.urlparse(target_url)
+                    domain = parsed.netloc or None
+                except Exception:
+                    pass
+            exported = get_browser_cookies_txt(browser or "auto", domain=domain)
             if exported and os.path.exists(exported):
                 args.extend(["--cookies", exported])
                 tmp_cookie_file = exported
-            else:
+            elif browser and browser not in ("auto", ""):
                 args.extend(["--cookies-from-browser", browser])
 
         return args, tmp_cookie_file
@@ -118,19 +122,24 @@ class YtDlpExtractor(BaseExtractor):
             raise RuntimeError("yt-dlp binary không được tìm thấy trên hệ thống.")
 
         args, tmp_cookie = self.get_base_args(allow_playlist=True, browser=browser, target_url=url)
-        range_spec = f"{from_item or 1}-{to_item or limit}"
+        if from_item and to_item and to_item >= from_item:
+            range_spec = f"{from_item}-{to_item}"
+        elif limit and limit > 0:
+            range_spec = f"1-{limit}"
+        else:
+            range_spec = None
 
         cmd = [
             self.binary_path,
             *args,
             "--flat-playlist",
             "--dump-json",
-            "--playlist-items",
-            range_spec,
-            url,
         ]
+        if range_spec:
+            cmd.extend(["--playlist-items", range_spec])
+        cmd.append(url)
 
-        self.log(f"yt-dlp playlist ({range_spec}): {url}")
+        self.log(f"yt-dlp playlist ({range_spec or 'all'}): {url}")
         code, stdout, stderr = self.run_process(cmd, timeout=timeout)
 
         if tmp_cookie and os.path.exists(tmp_cookie):

@@ -138,16 +138,20 @@ export async function crawlProfile({
   rangeStart,
   rangeEnd,
 }) {
-  const targetBrowser = browser !== null ? browser : getActiveBrowser()
   try {
+    const targetBrowser = browser !== null ? browser : getActiveBrowser()
+    const finalLimit = limit === 0 || limit === '0' ? 0 : (Number(limit) || 50)
+    const finalRangeStart = rangeStart != null && !isNaN(Number(rangeStart)) ? Number(rangeStart) : undefined
+    const finalRangeEnd = rangeEnd != null && !isNaN(Number(rangeEnd)) ? Number(rangeEnd) : undefined
+
     return await invoke('crawl_profile', {
       url: url.trim(),
-      limit: Number(limit) || 50,
+      limit: finalLimit,
       mediaType: mediaType || undefined,
       platform: platform && platform !== 'auto' ? platform : undefined,
-      browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : undefined,
-      rangeStart: rangeStart ? Number(rangeStart) : undefined,
-      rangeEnd: rangeEnd ? Number(rangeEnd) : undefined,
+      browser: targetBrowser === 'none' ? 'none' : (targetBrowser || 'auto'),
+      rangeStart: finalRangeStart,
+      rangeEnd: finalRangeEnd,
       deviceId: getDeviceId(),
     })
   } catch (err) {

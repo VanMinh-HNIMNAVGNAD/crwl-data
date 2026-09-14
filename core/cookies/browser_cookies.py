@@ -229,9 +229,44 @@ class BrowserCookieExporter:
 
         return cookies_out
 
+    def find_best_browser(self, domain_filter: Optional[str] = None) -> Optional[str]:
+        """Tự động tìm trình duyệt phù hợp nhất có chứa cookies cho domain"""
+        candidates = ["firefox", "edge", "chrome", "brave", "chromium"]
+        clean_d = domain_filter.lower().lstrip(".") if domain_filter else None
+
+        # 1. Ưu tiên trình duyệt thực sự có cookies cho domain chỉ định
+        if clean_d:
+            for b in candidates:
+                try:
+                    c = self.export_cookies_netscape(b, domain_filter=clean_d)
+                    # Kiểm tra xem có dòng cookie nào ngoài comment không
+                    data_lines = [l for l in c.splitlines() if l and not l.startswith("#")]
+                    if data_lines:
+                        return b
+                except Exception:
+                    continue
+
+        # 2. Nếu không tìm thấy domain cụ thể, chọn trình duyệt đầu tiên trích xuất được cookie bất kỳ
+        for b in candidates:
+            try:
+                c = self.export_cookies_netscape(b)
+                data_lines = [l for l in c.splitlines() if l and not l.startswith("#")]
+                if data_lines:
+                    return b
+            except Exception:
+                continue
+
+        return None
+
     def export_cookies_netscape(self, browser: str, domain_filter: Optional[str] = None) -> str:
         """Xuất cookies sang chuỗi định dạng Netscape chuẩn"""
         b = browser.lower()
+        if b in ("auto", ""):
+            best = self.find_best_browser(domain_filter)
+            if not best:
+                return ""
+            b = best
+
         if "firefox" in b:
             raw_cookies = self.extract_firefox_cookies()
         else:
@@ -256,12 +291,24 @@ class BrowserCookieExporter:
         return "\n".join(lines) + "\n"
 
 
-def get_browser_cookies_txt(browser: str, domain: Optional[str] = None, output_path: Optional[str] = None) -> Optional[str]:
+def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str] = None, output_path: Optional[str] = None) -> Optional[str]:
     """Helper: lấy cookies file cho browser, trả về đường dẫn file cookies tạm"""
+    if browser == "none":
+        return None
     try:
+        # Kiểm tra nếu có file cookie thủ công trong ~/.config/crwl/cookies/
+        if domain:
+            home = os.path.expanduser("~")
+            d_clean = domain.lower().replace("www.", "").lstrip(".")
+            for candidate_name in (d_clean.split(".")[0], d_clean):
+                manual_path = os.path.join(home, ".config/crwl/cookies", f"{candidate_name}.txt")
+                if os.path.isfile(manual_path) and os.path.getsize(manual_path) > 10:
+                    return manual_path
+
         exporter = BrowserCookieExporter()
-        content = exporter.export_cookies_netscape(browser, domain)
-        if not content.strip():
+        target_browser = browser if (browser and browser != "auto") else "auto"
+        content = exporter.export_cookies_netscape(target_browser, domain)
+        if not content.strip() or len([l for l in content.splitlines() if l and not l.startswith("#")]) == 0:
             return None
         if not output_path:
             fd, tmp_file = tempfile.mkstemp(prefix="cookies_", suffix=".txt")
@@ -273,3 +320,4 @@ def get_browser_cookies_txt(browser: str, domain: Optional[str] = None, output_p
     except Exception as e:
         sys.stderr.write(f"[Cookies] Export warning: {e}\n")
         return None
+

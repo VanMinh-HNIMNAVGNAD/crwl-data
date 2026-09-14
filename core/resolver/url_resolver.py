@@ -185,6 +185,10 @@ class UrlResolver:
         # Platform shorteners
         if hostname in ("youtu.be", "t.co", "pin.it", "fb.watch", "fb.me", "dai.ly", "b23.tv", "redd.it"):
             return True
+        # Facebook share redirect links (e.g. facebook.com/share/...)
+        lower_url = url.lower()
+        if ("facebook.com" in lower_url or "fb.com" in lower_url) and "/share/" in lower_url:
+            return True
         # TikTok shortlink like vt.tiktok.com or vm.tiktok.com
         if hostname.endswith(".tiktok.com") and hostname != "www.tiktok.com" and hostname != "tiktok.com":
             return True
@@ -209,21 +213,41 @@ class UrlResolver:
 
     @classmethod
     def unshorten_url(cls, url: str, max_hops: int = 5, timeout: int = 10) -> str:
-        """Lần theo HTTP Redirect để lấy URL cuối cùng"""
+        """Lần theo HTTP Redirect để lấy URL cuối cùng, ưu tiên dùng curl để tránh lỗi 400 Bad Request"""
         current_url = url.strip()
         if not re.match(r"^https?://", current_url, re.IGNORECASE):
             current_url = "https://" + current_url
 
+        # 1. Thử dùng curl -sIL để lấy url_effective (nhanh, chuẩn HTTP/2, không bị Facebook chặn 400)
+        try:
+            import subprocess
+            cmd = [
+                "curl", "-sIL", "-o", "/dev/null", "-w", "%{url_effective}",
+                "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "-H", "Sec-Fetch-Mode: navigate",
+                "-H", "Sec-Fetch-Site: none",
+                "--max-time", str(timeout),
+                current_url,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+            if proc.returncode == 0:
+                eff = proc.stdout.strip()
+                if eff and eff.startswith("http") and eff != current_url:
+                    return eff
+        except Exception:
+            pass
+
+        # 2. Fallback urllib nếu curl không khả dụng
         headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Mode": "navigate",
         }
 
         for _ in range(max_hops):
             try:
-                # Dùng HEAD trước để tiết kiệm băng thông
                 req = urllib.request.Request(current_url, headers=headers, method="HEAD")
-                # Custom redirect handler để kiểm soát từng bước
                 opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler)
                 with opener.open(req, timeout=timeout) as resp:
                     next_url = resp.geturl()
@@ -231,7 +255,6 @@ class UrlResolver:
                         break
                     current_url = next_url
             except urllib.error.HTTPError as e:
-                # Nếu 405 Method Not Allowed khi gọi HEAD, thử lại với GET
                 if e.code in (405, 403):
                     try:
                         req = urllib.request.Request(current_url, headers=headers, method="GET")
@@ -304,6 +327,20 @@ class UrlResolver:
             resolved_url = cls.unshorten_url(original_url)
 
         resolved_url = cls.clean_tracking_params(resolved_url)
+
+        # Chuẩn hóa nếu là Facebook share link dạng số
+        if ("facebook.com" in resolved_url.lower() or "fb.com" in resolved_url.lower()) and "/share/" in resolved_url.lower():
+            m_v = re.search(r"/share/v/(\d+)", resolved_url)
+            if m_v:
+                resolved_url = f"https://www.facebook.com/watch/?v={m_v.group(1)}"
+            else:
+                m_r = re.search(r"/share/r/(\d+)", resolved_url)
+                if m_r:
+                    resolved_url = f"https://www.facebook.com/reel/{m_r.group(1)}"
+                else:
+                    m_p = re.search(r"/share/p/(\d+)", resolved_url)
+                    if m_p:
+                        resolved_url = f"https://www.facebook.com/photo/?fbid={m_p.group(1)}"
 
         platform_id, platform_name = cls.detect_platform(resolved_url)
         is_supported = platform_id is not None and platform_id != "generic"

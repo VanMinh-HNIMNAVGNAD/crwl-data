@@ -21,7 +21,9 @@ import sys
 import time
 from typing import Optional, List, Dict, Any
 from .base import BaseExtractor
-from ..models import StreamFormat
+from ..models import StreamFormat, MediaImage
+from ..cookies.browser_cookies import get_browser_cookies_txt
+import http.cookiejar
 
 # Media URL patterns để lọc các request có giá trị
 MEDIA_URL_PATTERNS = [
@@ -138,6 +140,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
 
         captured_urls: List[str] = []
         iframe_urls: List[str] = []
+        captured_images: List[MediaImage] = []
 
         try:
             with sync_playwright() as p:
@@ -161,6 +164,30 @@ class PlaywrightStreamSniffer(BaseExtractor):
                     ignore_https_errors=True,
                     java_script_enabled=True,
                 )
+
+                # Nạp cookies từ trình duyệt nếu có
+                try:
+                    import urllib.parse
+                    domain = urllib.parse.urlparse(page_url).netloc
+                    cfile = get_browser_cookies_txt("auto", domain=domain)
+                    if cfile and os.path.exists(cfile):
+                        cj = http.cookiejar.MozillaCookieJar(cfile)
+                        cj.load(ignore_discard=True, ignore_expires=True)
+                        pw_cookies = []
+                        for c in cj:
+                            d = c.domain
+                            if not d.startswith(".") and domain in d:
+                                d = "." + d
+                            pw_cookies.append({
+                                "name": c.name,
+                                "value": c.value,
+                                "domain": d,
+                                "path": c.path,
+                            })
+                        if pw_cookies:
+                            context.add_cookies(pw_cookies)
+                except Exception:
+                    pass
 
                 # Bắt tất cả requests
                 page = context.new_page()
@@ -209,6 +236,30 @@ class PlaywrightStreamSniffer(BaseExtractor):
                 actual_wait = min(wait_ms, 12000)
                 page.wait_for_timeout(actual_wait)
 
+                # Bóc tách ảnh từ nội dung trang (ảnh chất lượng cao bài viết)
+                try:
+                    page_html = page.content()
+                    raw_imgs = re.findall(r'https:[^"\'<>\s]+(?:fbcdn\.net|cdninstagram\.com|twimg\.com|pinimg\.com|scontent)[^"\'<>\s]+', page_html)
+                    cleaned_imgs = []
+                    for m in raw_imgs:
+                        u = m.replace(r"\u0025", "%").replace(r"\/", "/").replace("&amp;", "&").replace(r"\\", "")
+                        if any(ext in u.lower() for ext in (".jpg", ".png", ".webp", ".jpeg")):
+                            if not any(skip in u for skip in ("rsrc.php", "p50x50", "s150x150", "emoji")):
+                                cleaned_imgs.append(u)
+                    deduped_imgs = list(dict.fromkeys(cleaned_imgs))
+                    for idx, img_u in enumerate(deduped_imgs[:60], 1):
+                        captured_images.append(
+                            MediaImage(
+                                id=f"sniff_img_{idx}",
+                                url=img_u,
+                                title=f"Ảnh {idx}",
+                                type="image",
+                                thumb=img_u,
+                            )
+                        )
+                except Exception:
+                    pass
+
                 # Nếu chưa tìm được và có iframes, thử từng iframe
                 if not captured_urls and follow_iframes:
                     frames = page.frames
@@ -225,6 +276,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
             self.warn(f"[Sniffer] Playwright error: {e}")
             return {
                 "streams": [],
+                "images": [],
                 "iframe_urls": iframe_urls,
                 "raw_urls": captured_urls,
                 "found": False,
@@ -251,9 +303,10 @@ class PlaywrightStreamSniffer(BaseExtractor):
 
         return {
             "streams": streams,
+            "images": captured_images,
             "iframe_urls": iframe_urls,
             "raw_urls": deduped,
-            "found": bool(streams),
+            "found": bool(streams or captured_images),
             "method": "playwright",
             "error": None,
         }

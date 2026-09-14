@@ -35,8 +35,16 @@ class GalleryDlExtractor(BaseExtractor):
         args = ["--sleep-request", "0"]
         tmp_cookie_file = None
 
-        if browser and browser != "none":
-            exported = get_browser_cookies_txt(browser, domain=None)
+        if browser != "none":
+            domain = None
+            if target_url:
+                import urllib.parse
+                try:
+                    parsed = urllib.parse.urlparse(target_url)
+                    domain = parsed.netloc or None
+                except Exception:
+                    pass
+            exported = get_browser_cookies_txt(browser or "auto", domain=domain)
             if exported and os.path.exists(exported):
                 args.extend(["--cookies", exported])
                 tmp_cookie_file = exported
@@ -84,11 +92,19 @@ class GalleryDlExtractor(BaseExtractor):
             raise RuntimeError("gallery-dl binary không được tìm thấy trên hệ thống.")
 
         args, tmp_cookie = self.get_base_args(target_url=profile_url, browser=browser)
-        range_spec = f"{range_start}-{range_end}" if (range_start and range_end and range_end >= range_start) else f"1-{limit}"
+        if range_start and range_end and range_end >= range_start:
+            range_spec = f"{range_start}-{range_end}"
+        elif limit and limit > 0:
+            range_spec = f"1-{limit}"
+        else:
+            range_spec = ""
 
-        cmd = [self.binary_path, *args, "-j", "--range", range_spec, profile_url]
+        cmd = [self.binary_path, *args, "-j"]
+        if range_spec:
+            cmd.extend(["--range", range_spec])
+        cmd.append(profile_url)
 
-        self.log(f"gallery-dl crawl ({range_spec}): {profile_url}")
+        self.log(f"gallery-dl crawl ({range_spec or 'all'}): {profile_url}")
         code, stdout, stderr = self.run_process(cmd, timeout=timeout)
 
         if tmp_cookie and os.path.exists(tmp_cookie):
@@ -98,6 +114,39 @@ class GalleryDlExtractor(BaseExtractor):
                 pass
 
         raw_entries = self._parse_json(stdout)
+
+        # Kiểm tra lỗi yêu cầu xác thực / cookies
+        auth_err = False
+        if any(isinstance(x, list) and len(x) >= 2 and x[0] == -1 and isinstance(x[1], dict) and "Auth" in str(x[1]) for x in (raw_entries or [])):
+            auth_err = True
+        if "AuthRequired" in stderr or "authenticated cookies needed" in stderr or "401 Unauthorized" in stderr or "KeyError: 'username'" in stderr:
+            auth_err = True
+
+        if auth_err:
+            raise RuntimeError(
+                f"Tài khoản hoặc trang này yêu cầu đăng nhập ({profile_url}). "
+                f"Vui lòng đăng nhập tài khoản trên trình duyệt (Firefox / Edge) hoặc chọn đúng trình duyệt trên thanh tiêu đề để sử dụng Cookies."
+            )
+
+        # Kiểm tra nếu gallery-dl trả về thông điệp Message.Queue (code 6) mà chưa bóc tách media (code 3)
+        has_media = any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in (raw_entries or []))
+        queued_urls = [
+            x[1] for x in (raw_entries or [])
+            if isinstance(x, list) and len(x) >= 2 and x[0] == 6 and isinstance(x[1], str) and x[1] != profile_url
+        ]
+        if not has_media and queued_urls:
+            child_url = queued_urls[0]
+            self.log(f"gallery-dl chuyển tiếp URL con ({range_spec or 'all'}): {child_url}")
+            return self.crawl_profile(
+                child_url,
+                limit=limit,
+                media_type=media_type,
+                browser=browser,
+                range_start=range_start,
+                range_end=range_end,
+                timeout=timeout,
+            )
+
         if not raw_entries:
             if code != 0:
                 raise RuntimeError(f"gallery-dl crawl thất bại: {stderr.strip() or f'Exit code {code}'}")
@@ -113,6 +162,7 @@ class GalleryDlExtractor(BaseExtractor):
             )
 
         return self._parse_crawl_result(raw_entries, profile_url, media_type)
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # Normalizers

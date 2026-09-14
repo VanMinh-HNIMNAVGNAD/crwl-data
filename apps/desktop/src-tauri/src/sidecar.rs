@@ -55,7 +55,6 @@ impl SidecarManager {
 
     /// Tìm đường dẫn extractor_cli.py
     pub fn find_cli_path(resource_dir: Option<&PathBuf>) -> Result<PathBuf, String> {
-        // Thứ tự ưu tiên:
         // 1. Biến môi trường CRWL_CLI_PATH
         if let Ok(p) = std::env::var("CRWL_CLI_PATH") {
             let pb = PathBuf::from(&p);
@@ -64,7 +63,25 @@ impl SidecarManager {
             }
         }
 
-        // 2. Resource dir từ Tauri AppHandle (khi đóng gói bundle deb / AppImage)
+        // 2. Trong môi trường dev (cargo/tauri dev), ưu tiên code nguồn trực tiếp thay vì target/debug cũ
+        #[cfg(debug_assertions)]
+        {
+            let dev_candidates = vec![
+                PathBuf::from("../../core/extractor_cli.py"),
+                PathBuf::from("core/extractor_cli.py"),
+                PathBuf::from("../../../core/extractor_cli.py"),
+            ];
+            for path in &dev_candidates {
+                if path.exists() {
+                    if let Ok(canon) = path.canonicalize() {
+                        return Ok(canon);
+                    }
+                    return Ok(path.clone());
+                }
+            }
+        }
+
+        // 3. Resource dir từ Tauri AppHandle (khi đóng gói bundle deb / AppImage)
         if let Some(res) = resource_dir {
             let p1 = res.join("core/extractor_cli.py");
             if p1.exists() {
@@ -125,14 +142,18 @@ impl SidecarManager {
         let cli = self.cli_path.clone();
         let inner_arc = self.inner.clone();
 
-        let mut child = match Command::new("python3")
-            .arg(&cli)
-            .arg("--stdin")
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new("python3");
+        cmd.arg(&cli).arg("--stdin");
+        cmd.env("PYTHONUNBUFFERED", "1");
+        if let Some(proj_root) = cli.parent().and_then(|p| p.parent()) {
+            cmd.current_dir(proj_root);
+            cmd.env("PYTHONPATH", proj_root);
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // stderr ra console để debug
-            .spawn()
-        {
+            .stderr(Stdio::inherit()); // stderr ra console để debug
+
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 error!("[Sidecar] Không thể khởi động Python worker: {e}");

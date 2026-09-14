@@ -47,17 +47,27 @@ class MediaDispatcher(BaseExtractor):
             "nicovideo.jp", "nico.ms",
             "bilibili.com", "b23.tv",
             "rumble.com", "odysee.com",
-            "facebook.com/reel", "facebook.com/reels", "facebook.com/watch",
-            "facebook.com/share/r", "facebook.com/share/v", "facebook.com/video",
-            "facebook.com/videos", "/videos/", "fb.watch",
             "v.redd.it",
         ]
-        return any(d in lower for d in video_platforms)
+        if any(d in lower for d in video_platforms):
+            return True
+
+        # Facebook Video / Reel / Watch
+        if "facebook.com" in lower or "fb.com" in lower or "fb.watch" in lower:
+            fb_video_markers = ("/reel", "/reels", "/watch", "/videos", "/video", "share/r", "share/v", "fb.watch")
+            return any(m in lower for m in fb_video_markers)
+
+        return False
 
     def is_gallery_platform(self, url: str) -> bool:
         lower = url.lower()
         if "instagram.com" in lower or "instagr.am" in lower:
             return any(p in lower for p in ("/p/", "/reel/", "/reels/", "/stories/", "/tv/"))
+
+        # Facebook Photos / Posts / Albums
+        if "facebook.com" in lower or "fb.com" in lower:
+            fb_gallery_markers = ("/photo", "/photos", "/posts", "/media/set", "story.php", "permalink.php", "share/p")
+            return any(m in lower for m in fb_gallery_markers)
 
         gallery_domains = [
             "pinterest.com", "pin.it",
@@ -67,7 +77,6 @@ class MediaDispatcher(BaseExtractor):
             "threads.net", "bsky.app", "mastodon", "tumblr.com",
             "/photo/",  # TikTok photo slideshow
             "x.com/", "twitter.com/",
-            "facebook.com/photo", "facebook.com/posts",
         ]
         return any(d in lower for d in gallery_domains)
 
@@ -79,9 +88,10 @@ class MediaDispatcher(BaseExtractor):
         """Trích xuất thông tin media từ 1 liên kết duy nhất với cơ chế fallback tự động"""
         trimmed = url.strip()
 
-        # 0. Giải mã liên kết rút gọn nếu có
+        # 0. Giải mã liên kết rút gọn nếu có và chuẩn hóa link đơn
         resolved = self.resolver.resolve_url(trimmed)
         target_url = resolved.resolved_url if resolved.is_shortened else trimmed
+        target_url = self._normalize_facebook_single_url(target_url)
 
         # 1. Tệp ảnh trực tiếp (CDN)
         if self.direct.is_direct_image_url(target_url):
@@ -118,12 +128,17 @@ class MediaDispatcher(BaseExtractor):
                         return self._enhance_metadata(res, target_url)
                     except Exception:
                         pass
-                # Nếu yt-dlp lỗi, fallback sang gallery-dl cho TikTok
-                if "tiktok.com" in target_url:
-                    self.warn(f"TikTok -> gallery-dl fallback: {target_url}")
+                # Fallback sang gallery-dl (cho Facebook post/album/photo, TikTok, Instagram, v.v.)
+                self.warn(f"Video yt-dlp thất bại ({yt_err}), đang thử gallery-dl fallback...")
+                try:
+                    res = self.gallery.extract_gallery(target_url, browser=browser)
+                    return self._enhance_metadata(res, target_url)
+                except Exception as gal_err:
+                    self.warn(f"gallery-dl fallback cũng thất bại ({gal_err}), web_scraper fallback...")
                     try:
-                        res = self.gallery.extract_gallery(target_url, browser=browser)
-                        return self._enhance_metadata(res, target_url)
+                        res = self.web_scraper.extract(target_url)
+                        if res and (res.streams or res.images):
+                            return self._enhance_metadata(res, target_url)
                     except Exception:
                         pass
                 raise yt_err
@@ -228,8 +243,10 @@ class MediaDispatcher(BaseExtractor):
         if resolved.is_shortened:
             target_url = resolved.resolved_url
 
-        # Chuẩn hóa URL Facebook: chuyển profile/groups thông thường sang URL gallery-dl hỗ trợ
+        # Chuẩn hóa URL Facebook / X / Instagram sang URL subpath bóc tách tối ưu
         target_url = self._normalize_facebook_url(target_url, media_type)
+        target_url = self._normalize_x_url(target_url)
+        target_url = self._normalize_instagram_url(target_url, media_type)
 
         is_youtube = clean_hint == "youtube" or any(d in target_url for d in ("youtube.com", "youtu.be", "/playlist"))
         is_tiktok = clean_hint == "tiktok" or "tiktok.com" in target_url
@@ -359,6 +376,25 @@ class MediaDispatcher(BaseExtractor):
             )
 
         streams = sniff_result.get("streams") or []
+        images = sniff_result.get("images") or []
+
+        if not streams and images:
+            self.log(f"Playwright tìm thấy {len(images)} ảnh từ {target_url}")
+            is_fb = "facebook.com" in target_url or "fb.com" in target_url
+            return MediaMetadata(
+                id=str(abs(hash(target_url))),
+                platform="facebook" if is_fb else "generic",
+                title=title or "Bộ sưu tập ảnh",
+                author=domain,
+                author_url=target_url,
+                duration="Không xác định",
+                views="Không xác định",
+                thumbnail=images[0].thumb or images[0].url if images else "",
+                type="album",
+                original_url=target_url,
+                description=f"🔍 Tìm thấy {len(images)} ảnh chất lượng cao.",
+                images=images,
+            )
 
         if not streams:
             # Tìm không ra — thông báo rõ ràng thay vì crash
@@ -396,6 +432,39 @@ class MediaDispatcher(BaseExtractor):
             description=f"🔍 Phát hiện {len(streams)} nguồn stream qua network interceptor.",
             streams=streams,
         )
+
+    @staticmethod
+    def _normalize_facebook_single_url(url: str) -> str:
+        """
+        Chuẩn hóa link Facebook đơn (Reels, Videos, Photos, Watch, Share) sang định dạng chuẩn
+        mà yt-dlp và gallery-dl hỗ trợ tối đa.
+        """
+        import re
+        if "facebook.com" not in url.lower() and "fb.watch" not in url.lower() and "fb.com" not in url.lower():
+            return url
+
+        clean = url.strip()
+
+        # 1. Chuyển m.facebook.com sang www.facebook.com
+        if "m.facebook.com" in clean:
+            clean = clean.replace("m.facebook.com", "www.facebook.com")
+
+        # 2. /share/v/DIGITS -> /watch/?v=DIGITS
+        m_v = re.search(r"/share/v/(\d+)", clean)
+        if m_v:
+            return f"https://www.facebook.com/watch/?v={m_v.group(1)}"
+
+        # 3. /share/r/DIGITS -> /reel/DIGITS
+        m_r = re.search(r"/share/r/(\d+)", clean)
+        if m_r:
+            return f"https://www.facebook.com/reel/{m_r.group(1)}"
+
+        # 4. /share/p/DIGITS -> /photo/?fbid=DIGITS
+        m_p = re.search(r"/share/p/(\d+)", clean)
+        if m_p:
+            return f"https://www.facebook.com/photo/?fbid={m_p.group(1)}"
+
+        return clean
 
     @staticmethod
     def _normalize_facebook_url(url: str, media_type: str = "all") -> str:
@@ -447,6 +516,72 @@ class MediaDispatcher(BaseExtractor):
                 return f"{base}{username}/videos"
             else:
                 return f"{base}{username}/photos"
+
+        return url
+
+    @staticmethod
+    def _normalize_x_url(url: str) -> str:
+        """
+        Chuẩn hóa URL X/Twitter profile (ví dụ https://x.com/wildrift?s=20)
+        thành https://x.com/wildrift/media để gallery-dl bóc tách media trực tiếp.
+        """
+        import re
+        if "twitter.com" not in url.lower() and "x.com" not in url.lower():
+            return url
+
+        # Tách query parameters như ?s=20
+        clean = url.split("?")[0].rstrip("/")
+        match = re.match(r"(https?://(?:www\.)?(?:x\.com|twitter\.com)/)([^/?#]+)(?:/([a-zA-Z0-9_-]+))?$", clean, re.IGNORECASE)
+        if match:
+            base = match.group(1)
+            username = match.group(2)
+            subpath = (match.group(3) or "").lower()
+
+            # Bỏ qua các system routes
+            if username.lower() in ("home", "explore", "notifications", "messages", "search", "i", "settings"):
+                return url
+
+            # Nếu là URL post/tweet (status/123...) thì giữ nguyên
+            if username.lower() == "status" or subpath == "status":
+                return url
+
+            # Đã có subpath media hoặc timeline
+            if subpath in ("media", "timeline", "likes"):
+                return clean
+
+            # Chuyển user profile thông thường sang /media
+            return f"{base}{username}/media"
+
+        return url
+
+    @staticmethod
+    def _normalize_instagram_url(url: str, media_type: str = "all") -> str:
+        """
+        Chuẩn hóa URL Instagram profile (ví dụ https://www.instagram.com/hn950421g/)
+        thành https://www.instagram.com/hn950421g/posts/ (hoặc /reels/) để gallery-dl trích xuất.
+        """
+        import re
+        if "instagram.com" not in url.lower():
+            return url
+
+        clean = url.split("?")[0].rstrip("/")
+        match = re.match(r"(https?://(?:www\.)?instagram\.com/)([^/?#]+)(?:/([a-zA-Z0-9_-]+))?$", clean, re.IGNORECASE)
+        if match:
+            base = match.group(1)
+            username = match.group(2)
+            subpath = (match.group(3) or "").lower()
+
+            # Bỏ qua post đơn, reel đơn, system paths
+            if username.lower() in ("p", "reel", "reels", "stories", "explore", "direct", "accounts"):
+                return url
+
+            # Nếu đã có subpath cụ thể
+            if subpath in ("posts", "reels", "tagged", "channel"):
+                return f"{clean}/"
+
+            if media_type == "video":
+                return f"{base}{username}/reels/"
+            return f"{base}{username}/posts/"
 
         return url
 
