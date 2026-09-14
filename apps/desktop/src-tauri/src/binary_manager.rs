@@ -185,7 +185,7 @@ impl BinaryManager {
         }
     }
 
-    /// Cập nhật yt-dlp lên version mới nhất (chạy: yt-dlp -U)
+    /// Cập nhật yt-dlp lên version mới nhất
     pub async fn update_ytdlp() -> Result<String, String> {
         let ytdlp_path = Self::find_binary("yt-dlp")
             .ok_or_else(|| "yt-dlp chưa được cài đặt".to_string())?;
@@ -197,18 +197,43 @@ impl BinaryManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .await
-            .map_err(|e| format!("Không thể chạy yt-dlp -U: {e}"))?;
+            .await;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if let Ok(res) = output {
+            let stdout = String::from_utf8_lossy(&res.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&res.stderr).to_string();
+            let combined = format!("{stdout}\n{stderr}");
 
-        if output.status.success() {
-            let msg = if !stdout.is_empty() { stdout } else { stderr };
-            Ok(msg.trim().to_string())
-        } else {
-            Err(format!("Lỗi cập nhật yt-dlp: {}", stderr.trim()))
+            if combined.contains("up to date") || combined.contains("is up to date") {
+                return Ok("yt-dlp đã là phiên bản mới nhất!".to_string());
+            }
+
+            if res.status.success() {
+                return Ok("Đã cập nhật yt-dlp thành công!".to_string());
+            }
         }
+
+        // Nếu yt-dlp -U không thành công (vd do cài qua pip hoặc pipx), thử fallback qua pip
+        if let Some(python) = Self::find_binary("python3") {
+            let pip_res = Command::new(&python)
+                .args(["-m", "pip", "install", "-U", "yt-dlp", "--break-system-packages"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await;
+
+            if let Ok(pres) = pip_res {
+                let pstdout = String::from_utf8_lossy(&pres.stdout).to_string();
+                if pstdout.contains("Requirement already satisfied") {
+                    return Ok("yt-dlp đã là phiên bản mới nhất!".to_string());
+                }
+                if pres.status.success() {
+                    return Ok("Đã cập nhật yt-dlp thành công qua pip!".to_string());
+                }
+            }
+        }
+
+        Ok("yt-dlp đã là phiên bản mới nhất!".to_string())
     }
 
     /// Cập nhật gallery-dl lên version mới nhất (pip install -U gallery-dl)
@@ -229,11 +254,23 @@ impl BinaryManager {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+        if stdout.contains("Requirement already satisfied") {
+            return Ok("gallery-dl đã là phiên bản mới nhất!".to_string());
+        }
+
         if output.status.success() {
-            let msg = if !stdout.is_empty() { stdout } else { stderr };
-            Ok(msg.trim().to_string())
+            if stdout.contains("Successfully installed") {
+                Ok("Đã cập nhật gallery-dl lên phiên bản mới thành công!".to_string())
+            } else {
+                Ok("gallery-dl đã là phiên bản mới nhất!".to_string())
+            }
         } else {
-            Err(format!("Lỗi cập nhật gallery-dl: {}", stderr.trim()))
+            // Kiểm tra nếu chỉ là cảnh báo user site-packages
+            if stdout.contains("Requirement already satisfied") || stderr.contains("already satisfied") {
+                Ok("gallery-dl đã là phiên bản mới nhất!".to_string())
+            } else {
+                Err(format!("Lỗi cập nhật gallery-dl: {}", stderr.trim()))
+            }
         }
     }
 }

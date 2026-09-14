@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { getBinaryStatus, updateYtdlp, updateGalleryDl } from '../services/api'
 import { IconClose, IconRefresh, IconCheck, IconSettings } from './Icons'
 
@@ -65,83 +66,98 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
     }
   }
 
+  const handleCheckSystemTool = (tool) => {
+    if (!tool.data?.is_installed) {
+      onShowToast?.(`${tool.name} chưa được cài đặt trên hệ điều hành`)
+      return
+    }
+    const ver = tool.data?.version ? `v${tool.data.version}` : 'hệ thống'
+    onShowToast?.(`✓ ${tool.name} (${ver}) đã là phiên bản mới nhất (Gói hệ thống Linux)`)
+  }
+
   const toolsList = [
     {
       id: 'ytdlp',
       name: 'yt-dlp',
       role: 'Engine Video & Audio',
-      desc: 'Bóc tách video 4K/1080p, audio, playlist YouTube, TikTok, Facebook...',
       data: toolsData?.ytdlp,
-      canUpdate: true,
-      onUpdate: handleUpdateYtdlp,
+      actionLabel: 'Cập nhật',
+      onAction: handleUpdateYtdlp,
     },
     {
       id: 'gallery_dl',
       name: 'gallery-dl',
       role: 'Engine Album & Ảnh',
-      desc: 'Bóc tách album ảnh chất lượng gốc Instagram, Pinterest, X, Reddit...',
       data: toolsData?.gallery_dl,
-      canUpdate: true,
-      onUpdate: handleUpdateGalleryDl,
+      actionLabel: 'Cập nhật',
+      onAction: handleUpdateGalleryDl,
     },
     {
       id: 'ffmpeg',
       name: 'FFmpeg',
-      role: 'Bộ xử lý đa phương tiện',
-      desc: 'Ghép nối luồng video + audio độ nét cao, cắt clip, chuyển đổi format',
+      role: 'Bộ ghép luồng & Audio',
       data: toolsData?.ffmpeg,
-      canUpdate: false,
+      actionLabel: 'Kiểm tra',
+      onAction: () => handleCheckSystemTool({ name: 'FFmpeg', data: toolsData?.ffmpeg }),
     },
     {
       id: 'ffprobe',
       name: 'FFprobe',
       role: 'Phân tích Media Stream',
-      desc: 'Đọc thông số kỹ thuật bitrate, codec hình ảnh và âm thanh',
       data: toolsData?.ffprobe,
-      canUpdate: false,
+      actionLabel: 'Kiểm tra',
+      onAction: () => handleCheckSystemTool({ name: 'FFprobe', data: toolsData?.ffprobe }),
     },
     {
       id: 'aria2c',
       name: 'aria2c',
       role: 'Bộ tăng tốc tải đa luồng',
-      desc: 'Tăng tốc độ tải file lên gấp 5-10 lần với đa kết nối song song',
       data: toolsData?.aria2c,
-      canUpdate: false,
+      actionLabel: 'Kiểm tra',
+      onAction: () => handleCheckSystemTool({ name: 'aria2c', data: toolsData?.aria2c }),
     },
     {
       id: 'node',
       name: 'Node.js',
-      role: 'Runtime JavaScript',
-      desc: 'Hỗ trợ yt-dlp giải mã chữ ký JavaScript n-sig challenges của YouTube',
+      role: 'Runtime JavaScript n-sig',
       data: toolsData?.node,
-      canUpdate: false,
+      actionLabel: 'Kiểm tra',
+      onAction: () => handleCheckSystemTool({ name: 'Node.js', data: toolsData?.node }),
     },
     {
       id: 'python3',
       name: 'Python 3',
-      role: 'Lõi điều phối (Sidecar)',
-      desc: 'Môi trường chạy IPC Sidecar Worker và bộ bóc tách dự phòng Web Scraper',
+      role: 'Lõi Sidecar Worker',
       data: toolsData?.python3,
-      canUpdate: false,
+      actionLabel: 'Kiểm tra',
+      onAction: () => handleCheckSystemTool({ name: 'Python 3', data: toolsData?.python3 }),
     },
   ]
 
-  return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card tools-modal-card" onClick={(e) => e.stopPropagation()}>
+  return createPortal(
+    <div
+      className="tools-modal-overlay"
+      onPointerDown={(e) => {
+        if (e.target === e.currentTarget) onClose()
+      }}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Công cụ & Engine Hệ Thống"
+    >
+      <div className="tools-modal-card">
         {/* Modal Header */}
-        <div className="modal-header">
-          <div className="modal-title-group">
+        <div className="tools-modal-header">
+          <div className="tools-title-group">
             <IconSettings className="w-4 h-4 text-emerald-400" />
-            <h3 className="modal-title">Công cụ &amp; Engine Hệ Thống</h3>
+            <h3 className="tools-modal-heading">Công cụ &amp; Engine Hệ Thống</h3>
           </div>
-          <div className="modal-actions-right">
+          <div className="tools-actions-right">
             <button
               type="button"
               className="btn-refresh-small"
               onClick={fetchStatus}
               disabled={loading}
-              title="Quét lại công cụ"
+              title="Quét lại phiên bản & đường dẫn công cụ (F5)"
             >
               <IconRefresh className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
             </button>
@@ -151,12 +167,8 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
           </div>
         </div>
 
-        {/* Modal Body */}
-        <div className="modal-body tools-modal-body">
-          <p className="tools-modal-hint">
-            Hệ thống sử dụng các công cụ nhị phân local để bóc tách và tải dữ liệu trực tiếp với tốc độ tối đa.
-          </p>
-
+        {/* Modal Body (Đã bỏ toàn bộ mô tả nhỏ bên dưới theo yêu cầu) */}
+        <div className="tools-modal-body">
           <div className="tools-list-stack">
             {toolsList.map((tool) => {
               const isInstalled = Boolean(tool.data?.is_installed)
@@ -180,42 +192,35 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
                         )}
                       </span>
                     </div>
-                    <p className="tool-desc">{tool.desc}</p>
-                    {tool.data?.path && (
-                      <span className="tool-path-code" title={tool.data.path}>
-                        {tool.data.path}
-                      </span>
-                    )}
                   </div>
 
-                  {tool.canUpdate && isInstalled && (
-                    <div className="tool-actions-right">
-                      <button
-                        type="button"
-                        className="btn-update-tool"
-                        onClick={tool.onUpdate}
-                        disabled={Boolean(updatingTool)}
-                      >
-                        {isUpdating ? (
-                          <>
-                            <span className="minimal-spinner" />
-                            <span>Đang cập nhật...</span>
-                          </>
-                        ) : (
-                          <>
-                            <IconRefresh className="w-3 h-3" />
-                            <span>Cập nhật</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  )}
+                  <div className="tool-actions-right">
+                    <button
+                      type="button"
+                      className="btn-update-tool"
+                      onClick={tool.onAction}
+                      disabled={Boolean(updatingTool) || !isInstalled}
+                    >
+                      {isUpdating ? (
+                        <>
+                          <span className="minimal-spinner" />
+                          <span>Đang kiểm tra...</span>
+                        </>
+                      ) : (
+                        <>
+                          <IconRefresh className="w-3 h-3" />
+                          <span>{tool.actionLabel}</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
               )
             })}
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   )
 }

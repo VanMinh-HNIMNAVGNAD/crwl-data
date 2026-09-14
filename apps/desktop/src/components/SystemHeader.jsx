@@ -41,11 +41,14 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
     Promise.all([getBrowsersList(), getCookieStatus(), getDefaultDownloadDirectory()])
       .then(([b, cs, defDir]) => {
         if (!active) return
-        if (b) {
+        if (b?.browsers) {
           setBrowsersData(b)
-          if (!selectedBrowser && b.current) {
-            setSelectedBrowser(b.current)
-            setActiveBrowser(b.current)
+          if (!selectedBrowser) {
+            const detectedOne = b.browsers.find((item) => item.installed || item.detected)
+            if (detectedOne) {
+              setSelectedBrowser(detectedOne.id)
+              setActiveBrowser(detectedOne.id)
+            }
           }
         }
         if (cs) setCookieCount(cs.platforms?.filter((p) => p.isValid).length || 0)
@@ -169,13 +172,13 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
                       >
                         <div className="browser-name-row">
                           <strong>{b.name}</strong>
-                          {b.detected && (
-                            <span className={`badge-detected-chip ${b.id === browsersData?.defaultConfigured ? 'badge-primary' : ''}`}>
-                              {b.id === browsersData?.defaultConfigured
-                                ? 'Mặc định'
-                                : b.id === 'none'
-                                ? 'Tắt cookies'
-                                : 'Có sẵn'}
+                          {(b.detected || b.installed) ? (
+                            <span className="badge-detected-chip badge-primary">
+                              ✓ Đã nhận diện
+                            </span>
+                          ) : (
+                            <span className="badge-detected-chip">
+                              Chưa cài
                             </span>
                           )}
                         </div>
@@ -183,6 +186,16 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
                       </button>
                     )
                   })}
+                  <button
+                    type="button"
+                    className={`browser-item-option ${selectedBrowser === 'none' ? 'is-selected' : ''}`}
+                    onClick={() => handleSelectBrowser('none', 'Tắt Cookies')}
+                  >
+                    <div className="browser-name-row">
+                      <strong>Tắt Cookies (Tải ẩn danh)</strong>
+                    </div>
+                    {selectedBrowser === 'none' && <IconCheck className="browser-check-icon text-emerald-400" />}
+                  </button>
                 </div>
               </div>
             )}
