@@ -54,7 +54,7 @@ impl SidecarManager {
     }
 
     /// Tìm đường dẫn extractor_cli.py
-    pub fn find_cli_path() -> Result<PathBuf, String> {
+    pub fn find_cli_path(resource_dir: Option<&PathBuf>) -> Result<PathBuf, String> {
         // Thứ tự ưu tiên:
         // 1. Biến môi trường CRWL_CLI_PATH
         if let Ok(p) = std::env::var("CRWL_CLI_PATH") {
@@ -64,30 +64,50 @@ impl SidecarManager {
             }
         }
 
+        // 2. Resource dir từ Tauri AppHandle (khi đóng gói bundle deb / AppImage)
+        if let Some(res) = resource_dir {
+            let p1 = res.join("core/extractor_cli.py");
+            if p1.exists() {
+                return Ok(p1);
+            }
+            let p2 = res.join("extractor_cli.py");
+            if p2.exists() {
+                return Ok(p2);
+            }
+        }
+
         let candidates = vec![
             PathBuf::from("core/extractor_cli.py"),
             PathBuf::from("../../core/extractor_cli.py"),
             PathBuf::from("../../../core/extractor_cli.py"),
         ];
 
-        // Kiểm tra tương đối
+        // 3. Kiểm tra tương đối
         for path in &candidates {
             if path.exists() {
                 return Ok(path.clone());
             }
         }
 
-        // Kiểm tra từ exe dir
+        // 4. Kiểm tra từ exe dir
         if let Ok(exe) = std::env::current_exe() {
             if let Some(parent) = exe.parent() {
-                let p = parent.join("core/extractor_cli.py");
-                if p.exists() {
-                    return Ok(p);
+                let exe_candidates = vec![
+                    parent.join("core/extractor_cli.py"),
+                    parent.join("resources/core/extractor_cli.py"),
+                    parent.join("../lib/social-media-crawler/core/extractor_cli.py"),
+                    parent.join("../lib/app/core/extractor_cli.py"),
+                    parent.join("../share/social-media-crawler/core/extractor_cli.py"),
+                ];
+                for p in exe_candidates {
+                    if p.exists() {
+                        return Ok(p);
+                    }
                 }
             }
         }
 
-        // Kiểm tra từ cwd
+        // 5. Kiểm tra từ cwd
         if let Ok(cwd) = std::env::current_dir() {
             for rel in &candidates {
                 let abs = cwd.join(rel);

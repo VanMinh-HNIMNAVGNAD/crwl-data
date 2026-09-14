@@ -35,6 +35,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "../../../core": "core"
+    },
+    "shortDescription": "Social Media Crawler & Downloader",
+    "longDescription": "Desktop App for crawling and downloading social media content",
+    "category": "Utility",
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }

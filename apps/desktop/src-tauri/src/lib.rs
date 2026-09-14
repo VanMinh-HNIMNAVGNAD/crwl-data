@@ -32,7 +32,8 @@ pub fn run() {
             let db = tauri::async_runtime::block_on(async { Database::init().await });
 
             // Tìm đường dẫn Python CLI
-            let cli_path = SidecarManager::find_cli_path()
+            let res_dir = app.path().resource_dir().ok();
+            let cli_path = SidecarManager::find_cli_path(res_dir.as_ref())
                 .unwrap_or_else(|_| std::path::PathBuf::from("core/extractor_cli.py"));
 
             // Khởi động Python Sidecar IPC worker
