@@ -98,7 +98,10 @@ export const PLATFORMS = [
       'motchill', 'phimmoi', 'ophim', 'kkphim', 'subnhanh', 'tvhay', 'bilutv',
       'dongphim', 'xemphim', 'rosetv', 'phim3s', 'hdonline', 'animehay', 'vuighe',
       'fmovies', '123movies', 'soap2day', 'bflix', 'gogoanime', 'aniwatch', 'hianime',
-      'lookmovie', 'sflix', 'vidsrc', 'streamtape', 'doodstream'
+      'lookmovie', 'sflix', 'vidsrc', 'streamtape', 'doodstream',
+      'phimhay', 'phimchill', 'phimfast', 'phimhd', 'phimnhanh', 'phimplus',
+      'vuphim', 'hdviet', 'kphim', 'phimgio', 'iuphim', 'phimbathu', 'phimmoichill',
+      'fullphim', 'phimxuyendem',
     ],
     icon: IconMovie,
     desc: 'Phim trực tuyến, luồng HLS (.m3u8), DASH (.mpd), Video web'
@@ -165,7 +168,10 @@ export function isMatchingDomain(hostname, targetDomain) {
 export function detectPlatform(url = '') {
   if (!url || typeof url !== 'string') return null
   const lower = url.trim().toLowerCase()
-  if (lower.includes('.m3u8') || lower.includes('.mpd') || lower.includes('/hls/')) {
+
+  // Direct stream URLs -> movie
+  if (lower.includes('.m3u8') || lower.includes('.mpd') || lower.includes('/hls/') ||
+      lower.includes('.ts?') || lower.includes('.m4s')) {
     return 'movie'
   }
 
@@ -173,6 +179,7 @@ export function detectPlatform(url = '') {
   if (!parsed) return null
   const { hostname } = parsed
 
+  // Kiểm tra các nền tảng đã biết
   for (const p of PLATFORMS) {
     if (p.id === 'movie') {
       if (p.match.some((m) => hostname.includes(m))) {
@@ -194,8 +201,26 @@ export function detectPlatform(url = '') {
   if (isMatchingDomain(hostname, 'weibo.com')) return 'weibo'
   if (isMatchingDomain(hostname, 'nicovideo.jp') || isMatchingDomain(hostname, 'nico.ms')) return 'niconico'
 
-  const movieKeywords = ['phim', 'movie', 'cinema', 'stream', 'film', 'anime']
-  if (movieKeywords.some((k) => hostname.includes(k))) {
+  // Heuristic: nhận diện trang phim/media chưa biết qua keyword hostname
+  const movieHostnameKeywords = [
+    'phim', 'movie', 'cinema', 'stream', 'film', 'series',
+    'anime', 'xemphim', 'vietsub', 'thuyetminh',
+  ]
+  if (movieHostnameKeywords.some((k) => hostname.includes(k))) {
+    return 'movie'
+  }
+
+  // Heuristic: nhận diện trang nhạc chưa biết
+  const musicHostnameKeywords = ['nhac', 'music', 'audio', 'nhacviet', 'beatvn', 'soundvn']
+  if (musicHostnameKeywords.some((k) => hostname.includes(k))) {
+    return 'movie'
+  }
+
+  // Heuristic: nhận diện qua path chứa keyword phim
+  const { pathname } = parsed.parsedUrl
+  const pathLower = (pathname || '').toLowerCase()
+  const moviePathKeywords = ['episode', 'tap-', 'phan-', 'season', 'watch', 'play', 'vietsub', 'thuyet-minh']
+  if (moviePathKeywords.some((k) => pathLower.includes(k))) {
     return 'movie'
   }
 
@@ -316,11 +341,19 @@ export function validatePlatformUrl(url = '', expectedPlatformId = null) {
 
 export const FORMAT_OPTIONS = [
   { id: 'mp4', label: 'MP4 (Full HD/4K)', desc: 'Video tiêu chuẩn có âm thanh đầy đủ', type: 'video' },
-  { id: 'mp3', label: 'MP3 (320kbps)', desc: 'Âm thanh chất lượng cao 320kbps', type: 'audio' },
-  { id: 'm4a', label: 'M4A / AAC', desc: 'Âm thanh chuẩn nén cho thiết bị Apple', type: 'audio' },
-  { id: 'flac', label: 'FLAC', desc: 'Âm thanh phòng thu chất lượng cao nhất (Lossless)', type: 'audio' },
-  { id: 'wav', label: 'WAV', desc: 'Bản ghi âm thanh không nén (Uncompressed)', type: 'audio' },
+  { id: 'mkv', label: 'MKV (Đa phụ đề/Lossless)', desc: 'Container tối ưu giữ trọn vẹn phụ đề và âm thanh gốc', type: 'video' },
+  { id: 'mov', label: 'MOV (Apple QuickTime)', desc: 'Video chuẩn dựng phim Apple / Premiere Pro', type: 'video' },
   { id: 'webm', label: 'WEBM', desc: 'Video nén dung lượng nhẹ, tối ưu web', type: 'video' },
+  { id: 'avi', label: 'AVI', desc: 'Định dạng tương thích màn hình ô tô và thiết bị cũ', type: 'video' },
+  { id: 'gif', label: 'GIF (Ảnh động)', desc: 'Chuyển đổi video clip thành ảnh động GIF', type: 'video' },
+  { id: 'mp3', label: 'MP3 (320kbps)', desc: 'Âm thanh phổ biến chất lượng cao', type: 'audio' },
+  { id: 'opus', label: 'OPUS (Chuẩn gốc)', desc: 'Âm thanh chất lượng gốc YouTube không bị nén lại', type: 'audio' },
+  { id: 'm4a', label: 'M4A / AAC', desc: 'Âm thanh chuẩn nén cho thiết bị Apple / Mobile', type: 'audio' },
+  { id: 'flac', label: 'FLAC (Lossless)', desc: 'Âm thanh phòng thu chất lượng cao nhất', type: 'audio' },
+  { id: 'wav', label: 'WAV (Uncompressed)', desc: 'Bản ghi âm thanh không nén chất lượng cao', type: 'audio' },
+  { id: 'ogg', label: 'OGG (Vorbis)', desc: 'Âm thanh mã nguồn mở chất lượng cao', type: 'audio' },
+  { id: 'aac', label: 'AAC', desc: 'Luồng âm thanh AAC nguyên bản', type: 'audio' },
+  { id: 'alac', label: 'ALAC (Apple Lossless)', desc: 'Âm thanh chất lượng cao cho Apple Music', type: 'audio' },
 ]
 
 export const AUDIO_BITRATES = [

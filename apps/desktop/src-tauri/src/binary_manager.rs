@@ -24,14 +24,17 @@ pub struct AllBinaryStatus {
     pub ytdlp: BinaryStatus,
     pub gallery_dl: BinaryStatus,
     pub ffmpeg: BinaryStatus,
+    pub ffprobe: BinaryStatus,
+    pub aria2c: BinaryStatus,
     pub python3: BinaryStatus,
+    pub node: BinaryStatus,
 }
 
 pub struct BinaryManager;
 
 impl BinaryManager {
     /// Tìm binary trong PATH và các vị trí phổ biến trên Linux
-    fn find_binary(name: &str) -> Option<PathBuf> {
+    pub fn find_binary(name: &str) -> Option<PathBuf> {
         // Tìm trong PATH
         if let Ok(p) = which::which(name) {
             return Some(p);
@@ -55,6 +58,11 @@ impl BinaryManager {
             }
         }
         None
+    }
+
+    /// Kiểm tra xem binary có sẵn trên máy không
+    pub fn has_binary(name: &str) -> bool {
+        Self::find_binary(name).is_some()
     }
 
     /// Lấy version của binary bằng cách chạy `{binary} --version`
@@ -84,7 +92,10 @@ impl BinaryManager {
         let ytdlp_path = Self::find_binary("yt-dlp");
         let gallery_path = Self::find_binary("gallery-dl");
         let ffmpeg_path = Self::find_binary("ffmpeg");
+        let ffprobe_path = Self::find_binary("ffprobe");
+        let aria2c_path = Self::find_binary("aria2c");
         let python_path = Self::find_binary("python3");
+        let node_path = Self::find_binary("node");
 
         let ytdlp_version = if let Some(ref p) = ytdlp_path {
             Self::get_version(p).await
@@ -104,7 +115,25 @@ impl BinaryManager {
             None
         };
 
+        let ffprobe_version = if let Some(ref p) = ffprobe_path {
+            Self::get_version(p).await
+        } else {
+            None
+        };
+
+        let aria2c_version = if let Some(ref p) = aria2c_path {
+            Self::get_version(p).await
+        } else {
+            None
+        };
+
         let python_version = if let Some(ref p) = python_path {
+            Self::get_version(p).await
+        } else {
+            None
+        };
+
+        let node_version = if let Some(ref p) = node_path {
             Self::get_version(p).await
         } else {
             None
@@ -129,11 +158,29 @@ impl BinaryManager {
                 path: ffmpeg_path.map(|p| p.to_string_lossy().to_string()),
                 version: ffmpeg_version,
             },
+            ffprobe: BinaryStatus {
+                name: "ffprobe".to_string(),
+                is_installed: ffprobe_path.is_some(),
+                path: ffprobe_path.map(|p| p.to_string_lossy().to_string()),
+                version: ffprobe_version,
+            },
+            aria2c: BinaryStatus {
+                name: "aria2c".to_string(),
+                is_installed: aria2c_path.is_some(),
+                path: aria2c_path.map(|p| p.to_string_lossy().to_string()),
+                version: aria2c_version,
+            },
             python3: BinaryStatus {
                 name: "python3".to_string(),
                 is_installed: python_path.is_some(),
                 path: python_path.map(|p| p.to_string_lossy().to_string()),
                 version: python_version,
+            },
+            node: BinaryStatus {
+                name: "node".to_string(),
+                is_installed: node_path.is_some(),
+                path: node_path.map(|p| p.to_string_lossy().to_string()),
+                version: node_version,
             },
         }
     }

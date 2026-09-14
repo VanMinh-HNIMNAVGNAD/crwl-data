@@ -43,6 +43,11 @@ class YtDlpExtractor(BaseExtractor):
         if is_facebook:
             args.extend(["--impersonate", "Chrome-120:Macos-14"])
 
+        # Sử dụng Node.js runtime cho YouTube n-sig solver nếu có
+        node_bin = self.find_binary("node")
+        if node_bin and os.path.exists(node_bin):
+            args.extend(["--js-runtimes", f"node:{node_bin}"])
+
         if not allow_playlist:
             args.append("--no-playlist")
 
@@ -354,11 +359,14 @@ class YtDlpExtractor(BaseExtractor):
 
             # Audio formats chuẩn
             audio_presets = [
+                ("opus_best", "OPUS Chuẩn gốc (160 kbps, không suy hao)", "OPUS", 160),
                 ("mp3_320k", "MP3 Chất lượng cao (320 kbps)", "MP3", 320),
                 ("mp3_192k", "MP3 Chuẩn phổ biến (192 kbps)", "MP3", 192),
                 ("m4a_aac", "M4A / AAC Gốc (256 kbps)", "M4A", 256),
+                ("ogg_vorbis", "OGG Vorbis (192 kbps)", "OGG", 192),
                 ("flac_lossless", "FLAC Âm thanh lossless (phòng thu)", "FLAC", 900),
                 ("wav_lossless", "WAV Bản ghi không nén (Uncompressed)", "WAV", 1411),
+                ("alac_lossless", "ALAC Chuẩn Apple Lossless", "ALAC", 900),
             ]
             for fid, q_label, ext_label, br in audio_presets:
                 sz = self.format_bytes(int(duration_sec * br * 1000 / 8)) if duration_sec else "Tự động"

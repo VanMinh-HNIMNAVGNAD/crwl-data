@@ -92,6 +92,22 @@ export function setCustomDownloadDir(dir) {
   }
 }
 
+export function getAlwaysAskDownloadDir() {
+  try {
+    return localStorage.getItem('always_ask_download_dir') === 'true'
+  } catch {
+    return false
+  }
+}
+
+export function setAlwaysAskDownloadDir(enabled) {
+  try {
+    localStorage.setItem('always_ask_download_dir', enabled ? 'true' : 'false')
+  } catch (err) {
+    void err
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Extract Media
 // ─────────────────────────────────────────────────────────────────────────────

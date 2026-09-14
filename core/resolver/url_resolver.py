@@ -92,8 +92,21 @@ SUPPORTED_PLATFORMS = [
             "dongphim", "xemphim", "rosetv", "phim3s", "hdonline", "animehay", "vuighe",
             "fmovies", "123movies", "soap2day", "bflix", "gogoanime", "aniwatch", "hianime",
             "lookmovie", "sflix", "vidsrc", "streamtape", "doodstream",
+            "phimhay", "phimchill", "phimfast", "phimhd", "phimnhanh", "phimplus",
+            "vuphim", "hdviet", "kphim", "phimgio", "iuphim", "phimbathu",
         ],
     },
+]
+
+# Keywords trong hostname dùng nhận diện trang phim/media chưa biết
+MOVIE_HOSTNAME_KEYWORDS = [
+    "phim", "movie", "cinema", "stream", "film", "series", "anime",
+    "xemphim", "vietsub", "thuyetminh",
+]
+
+# Keywords trong hostname nhận diện trang nhạc/âm nhạc chưa biết  
+MUSIC_HOSTNAME_KEYWORDS = [
+    "nhac", "music", "audio", "nhacviet", "beatvn", "soundvn",
 ]
 
 GENERIC_SHORTENER_DOMAINS = [
@@ -139,10 +152,26 @@ class UrlResolver:
         hostname = cls.parse_hostname(url)
         if not hostname:
             return None, None
+
+        # Direct stream URL → movie
+        url_lower = url.lower()
+        if any(ext in url_lower for ext in (".m3u8", ".mpd", "/hls/", "/dash/", ".ts", ".m4s")):
+            return "movie", "Phim & Stream"
+
+        # Khớp với danh sách platform đã biết
         for p in SUPPORTED_PLATFORMS:
             for d in p["domains"]:
                 if cls.match_domain(hostname, d):
                     return p["id"], p["name"]
+
+        # Heuristic: nhận diện trang phim/media chưa biết qua hostname keyword
+        if any(kw in hostname for kw in MOVIE_HOSTNAME_KEYWORDS):
+            return "movie", "Trang Phim Web"
+
+        # Heuristic: nhận diện trang nhạc chưa biết
+        if any(kw in hostname for kw in MUSIC_HOSTNAME_KEYWORDS):
+            return "movie", "Trang Nhạc Web"
+
         return "generic", "Web Chung"
 
     @classmethod

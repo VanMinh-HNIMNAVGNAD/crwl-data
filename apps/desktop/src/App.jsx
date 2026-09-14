@@ -4,11 +4,13 @@ import LinkDownloader from './components/LinkDownloader'
 import AccountDownloader from './components/AccountDownloader'
 import DownloadHistoryModal from './components/DownloadHistoryModal'
 import CookieManager from './components/CookieManager'
+import ToolsManagerModal from './components/ToolsManagerModal'
 import './App.css'
 
 function App() {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false)
   const [isCookieManagerOpen, setIsCookieManagerOpen] = useState(false)
+  const [isToolsOpen, setIsToolsOpen] = useState(false)
   const [toastMessage, setToastMessage] = useState('')
 
   const showToast = (msg) => {
@@ -22,6 +24,7 @@ function App() {
       <SystemHeader
         onOpenHistory={() => setIsHistoryOpen(true)}
         onOpenCookies={() => setIsCookieManagerOpen(true)}
+        onOpenTools={() => setIsToolsOpen(true)}
         onShowToast={showToast}
       />
 
@@ -51,6 +54,7 @@ function App() {
       {/* Modals */}
       <DownloadHistoryModal isOpen={isHistoryOpen} onClose={() => setIsHistoryOpen(false)} />
       <CookieManager isOpen={isCookieManagerOpen} onClose={() => setIsCookieManagerOpen(false)} />
+      <ToolsManagerModal isOpen={isToolsOpen} onClose={() => setIsToolsOpen(false)} onShowToast={showToast} />
     </div>
   )
 }

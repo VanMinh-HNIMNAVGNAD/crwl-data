@@ -12,9 +12,13 @@ import {
   crawlProfile,
   startNativeDownload,
   downloadZipArchive,
+  downloadAlbumBatch,
   onDownloadProgress,
   buildProxyImageUrl,
+  selectDownloadDirectory,
+  getAlwaysAskDownloadDir,
 } from '../services/api'
+import DownloadProgressCard from './DownloadProgressCard'
 
 export default function AccountDownloader({ onShowToast }) {
   const [accountInput, setAccountInput] = useState('')
@@ -32,6 +36,8 @@ export default function AccountDownloader({ onShowToast }) {
   const [selectedBatchIds, setSelectedBatchIds] = useState({})
   const [downloadingId, setDownloadingId] = useState(null)
   const [nativeProgress, setNativeProgress] = useState(null)
+  const [downloadStartTime, setDownloadStartTime] = useState(null)
+  const [downloadTaskTitle, setDownloadTaskTitle] = useState('')
   const [isZipDownloading, setIsZipDownloading] = useState(false)
 
   // Tự động nhận diện platform từ input
@@ -119,6 +125,25 @@ export default function AccountDownloader({ onShowToast }) {
   // Tải 1 tệp trong profile
   const handleDownloadProfileItem = async (item) => {
     setDownloadingId(item.id)
+
+    let targetDir = undefined
+    if (getAlwaysAskDownloadDir()) {
+      try {
+        targetDir = await selectDownloadDirectory()
+        if (!targetDir) {
+          onShowToast?.('Đã hủy tải do chưa chọn thư mục lưu')
+          setDownloadingId(null)
+          return
+        }
+      } catch (err) {
+        console.warn('Lỗi chọn thư mục:', err)
+      }
+    }
+
+    setDownloadStartTime(Date.now())
+    setDownloadTaskTitle(item.title || 'Tệp tải xuống')
+    setNativeProgress({ percent: 0, speed: '', eta: 'Khởi tạo luồng tải...', status: 'downloading' })
+
     try {
       onShowToast?.(`Bắt đầu tải: ${item.title?.slice(0, 30) || 'video'}...`)
       let unlisten = null
@@ -133,20 +158,22 @@ export default function AccountDownloader({ onShowToast }) {
       const res = await startNativeDownload({
         url: item.url,
         title: item.title,
+        destDir: targetDir,
       })
 
       if (typeof unlisten === 'function') unlisten()
 
       if (res?.file_name) {
+        setNativeProgress({ percent: 100, speed: '', eta: '00:00', status: 'completed' })
         onShowToast?.(`Đã lưu: ${res.file_name}`)
       }
     } catch (err) {
+      setNativeProgress({ percent: 0, speed: '', eta: '', status: 'error' })
       onShowToast?.(err.message || 'Lỗi khi tải video')
     } finally {
       setTimeout(() => {
         setDownloadingId(null)
-        setNativeProgress(null)
-      }, 1500)
+      }, 2000)
     }
   }
 
@@ -163,25 +190,49 @@ export default function AccountDownloader({ onShowToast }) {
     }
   }
 
-  // Tải ZIP các mục đã chọn
-  const handleDownloadProfileZip = async () => {
+  // Tải hàng loạt (thư mục riêng hoặc nén ZIP)
+  const handleDownloadProfileBatch = async (asZip = false) => {
     const itemsToDownload = profileMediaList.filter((it) => selectedBatchIds[it.id])
     if (itemsToDownload.length === 0) {
-      onShowToast?.('Vui lòng chọn ít nhất 1 tệp để tải ZIP')
+      onShowToast?.('Vui lòng chọn ít nhất 1 tệp để tải')
       return
     }
 
+    let targetDir = undefined
+    if (getAlwaysAskDownloadDir()) {
+      try {
+        targetDir = await selectDownloadDirectory()
+        if (!targetDir) {
+          onShowToast?.('Đã hủy do chưa chọn thư mục lưu')
+          return
+        }
+      } catch (err) {
+        console.warn('Lỗi chọn thư mục:', err)
+      }
+    }
+
     setIsZipDownloading(true)
+    setDownloadStartTime(Date.now())
+    setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} tệp`)
+    setNativeProgress({ percent: 15, speed: '', eta: 'Đang chuẩn bị...', status: 'downloading' })
+
     try {
       const zipPayload = itemsToDownload.map((it) => ({
         url: it.url,
         filename: `${it.title || 'media'}_${it.id}.mp4`,
         referer: profileResult?.url,
       }))
-      await downloadZipArchive(zipPayload, `Profile_${profileResult?.name || 'Media'}`)
-      onShowToast?.(`Đã tải file ZIP (${itemsToDownload.length} tệp)!`)
+      const res = await downloadAlbumBatch({
+        items: zipPayload,
+        albumName: `Profile_${profileResult?.name || 'Media'}`,
+        destDir: targetDir,
+        asZip: asZip,
+      })
+      setNativeProgress({ percent: 100, speed: '', eta: '00:00', status: 'completed' })
+      onShowToast?.(res?.message || `Đã tải thành công (${itemsToDownload.length} tệp)!`)
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi tạo file ZIP')
+      setNativeProgress({ percent: 0, speed: '', eta: '', status: 'error' })
+      onShowToast?.(err.message || 'Lỗi khi tải danh sách')
     } finally {
       setIsZipDownloading(false)
     }
@@ -355,15 +406,27 @@ export default function AccountDownloader({ onShowToast }) {
                   {selectedProfileCount === profileMediaList.length ? 'Bỏ chọn' : 'Chọn tất cả'}
                 </button>
                 {selectedProfileCount > 0 && (
-                  <button
-                    type="button"
-                    className="minimal-small-btn"
-                    onClick={handleDownloadProfileZip}
-                    disabled={isZipDownloading}
-                  >
-                    <IconZip className="w-3 h-3" />
-                    <span>Tải ZIP ({selectedProfileCount})</span>
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="minimal-small-btn"
+                      onClick={() => handleDownloadProfileBatch(false)}
+                      disabled={isZipDownloading}
+                      title="Tải toàn bộ tệp đã chọn trực tiếp vào thư mục riêng"
+                    >
+                      <span>📁 Tải thư mục ({selectedProfileCount})</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="minimal-small-btn"
+                      onClick={() => handleDownloadProfileBatch(true)}
+                      disabled={isZipDownloading}
+                      title="Nén toàn bộ tệp đã chọn thành một file ZIP duy nhất"
+                    >
+                      <IconZip className="w-3 h-3" />
+                      <span>Tải ZIP ({selectedProfileCount})</span>
+                    </button>
+                  </>
                 )}
                 <button
                   type="button"
@@ -376,20 +439,14 @@ export default function AccountDownloader({ onShowToast }) {
               </div>
             </div>
 
-            {/* Tiến trình tải Native */}
+            {/* Mục hiển thị Tiến trình chi tiết (Tốc độ, Thời gian đã tải, Ước tính ETA) */}
             {nativeProgress && (
-              <div className="download-progress-bar-wrap">
-                <div className="progress-info-line">
-                  <span>Đang tải xuống: {nativeProgress.percent}%</span>
-                  <span>{nativeProgress.speed || ''}</span>
-                </div>
-                <div className="progress-track">
-                  <div
-                    className="progress-fill"
-                    style={{ width: `${Math.min(100, Math.max(0, nativeProgress.percent || 0))}%` }}
-                  />
-                </div>
-              </div>
+              <DownloadProgressCard
+                progress={nativeProgress}
+                title={downloadTaskTitle}
+                startTime={downloadStartTime}
+                onDismiss={() => setNativeProgress(null)}
+              />
             )}
 
             {/* Lưới tệp video/ảnh của tài khoản */}

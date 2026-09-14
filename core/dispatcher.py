@@ -1,12 +1,12 @@
 """
 Media Dispatcher Engine.
 Coordinates intelligent platform extraction, prioritization, and automatic fallbacks
-across yt-dlp, gallery-dl, tiktok embed resolver, and movie extractor.
+across yt-dlp, gallery-dl, tiktok embed resolver, movie extractor, and Playwright stream sniffer.
 Ported from MediaDispatcherService into standalone Python.
 """
 
 from typing import Optional, Dict, Any, List
-from .models import MediaMetadata, ProfileCrawlResult, ResolveUrlResult
+from .models import MediaMetadata, ProfileCrawlResult, ResolveUrlResult, StreamFormat
 from .resolver.url_resolver import UrlResolver
 from .extractors.base import BaseExtractor
 from .extractors.ytdlp import YtDlpExtractor
@@ -14,6 +14,8 @@ from .extractors.gallery import GalleryDlExtractor
 from .extractors.tiktok import TikTokExtractor
 from .extractors.movie import MovieExtractor
 from .extractors.direct import DirectImageExtractor
+from .extractors.web_scraper import WebScraperExtractor
+from .extractors.stream_sniffer import get_sniffer
 
 
 class MediaDispatcher(BaseExtractor):
@@ -27,6 +29,8 @@ class MediaDispatcher(BaseExtractor):
         self.tiktok = TikTokExtractor()
         self.movie = MovieExtractor(self.ytdlp)
         self.direct = DirectImageExtractor()
+        self.web_scraper = WebScraperExtractor()
+        self.sniffer = get_sniffer()  # Playwright-based stream sniffer (lazy)
 
     # ─────────────────────────────────────────────────────────────────────────
     # URL Classification
@@ -147,9 +151,14 @@ class MediaDispatcher(BaseExtractor):
                     res = self.ytdlp.extract_metadata(target_url, browser=browser)
                     return self._enhance_metadata(res, target_url)
                 except Exception as yt_err:
-                    raise RuntimeError(str(gal_err) or str(yt_err) or "Không thể trích xuất nội dung từ liên kết này")
+                    self.warn(f"yt-dlp thất bại ({yt_err}), web_scraper fallback...")
+                    try:
+                        res = self.web_scraper.extract(target_url)
+                        return self._enhance_metadata(res, target_url)
+                    except Exception:
+                        raise RuntimeError(str(gal_err) or str(yt_err) or "Không thể trích xuất nội dung từ liên kết này")
 
-        # 5. URL không rõ -> thử yt-dlp trước, sau đó gallery-dl
+        # 5. URL không rõ -> yt-dlp -> gallery-dl -> web_scraper -> Playwright sniffer
         try:
             self.log(f"URL không xác định -> yt-dlp first: {target_url}")
             res = self.ytdlp.extract_metadata(target_url, browser=browser)
@@ -160,9 +169,19 @@ class MediaDispatcher(BaseExtractor):
                 res = self.gallery.extract_gallery(target_url, browser=browser)
                 return self._enhance_metadata(res, target_url)
             except Exception as gal_err:
-                raise RuntimeError(
-                    f"Cả hai công cụ đều không trích xuất được liên kết: {gal_err or yt_err}"
-                )
+                self.warn(f"gallery-dl thất bại ({gal_err}), web_scraper fallback...")
+                try:
+                    res = self.web_scraper.extract(target_url)
+                    # Nếu web_scraper tìm thấy streams → trả về
+                    if res.streams:
+                        return self._enhance_metadata(res, target_url)
+                    # Nếu không có streams → thử Playwright sniffer
+                    raise RuntimeError("web_scraper không tìm được stream")
+                except Exception as web_err:
+                    # Thử Playwright sniffer (headless browser intercept)
+                    self.warn(f"web_scraper thất bại ({web_err}), thử Playwright stream sniffer...")
+                    return self._try_playwright_sniff(target_url, gal_err, yt_err)
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # Crawl Profile
@@ -296,6 +315,68 @@ class MediaDispatcher(BaseExtractor):
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _try_playwright_sniff(self, target_url: str, gal_err: Exception, yt_err: Exception) -> MediaMetadata:
+        """Dùng Playwright headless để sniff stream URLs bị ẩn qua XHR/fetch"""
+        import urllib.parse
+        parsed = urllib.parse.urlparse(target_url)
+        domain = parsed.netloc or target_url
+        title = f"Media từ {domain}"
+
+        if not self.sniffer.is_available():
+            raise RuntimeError(
+                f"Cả yt-dlp, gallery-dl, web_scraper đều không trích xuất được. "
+                f"Playwright chưa được cài: pip install playwright && playwright install chromium. "
+                f"Lỗi ban đầu: {yt_err}"
+            )
+
+        self.log(f"Playwright stream sniffer đang quét: {target_url}")
+        sniff_result = self.sniffer.sniff_streams(target_url)
+
+        if sniff_result.get("error") and not sniff_result.get("streams"):
+            raise RuntimeError(
+                f"Playwright sniffer lỗi: {sniff_result['error']}. "
+                f"Lỗi ban đầu: {yt_err or gal_err}"
+            )
+
+        streams = sniff_result.get("streams") or []
+
+        if not streams:
+            # Tìm không ra — thông báo rõ ràng thay vì crash
+            self.warn(f"Playwright không tìm thấy stream từ {target_url}")
+            return MediaMetadata(
+                id=str(abs(hash(target_url))),
+                platform="generic",
+                title=title,
+                author=domain,
+                author_url=target_url,
+                duration="Không xác định",
+                views="Không xác định",
+                thumbnail="",
+                type="video",
+                original_url=target_url,
+                description=(
+                    "⚠️ Không tìm được nguồn video. Player của trang này có thể dùng DRM, "
+                    "mã hóa phức tạp, hoặc token đã hết hạn. Không thể tải về."
+                ),
+                streams=[],
+            )
+
+        self.log(f"Playwright tìm thấy {len(streams)} stream(s) từ {target_url}")
+        return MediaMetadata(
+            id=str(abs(hash(target_url))),
+            platform="generic",
+            title=title,
+            author=domain,
+            author_url=target_url,
+            duration="Không xác định",
+            views="Không xác định",
+            thumbnail="",
+            type="video",
+            original_url=target_url,
+            description=f"🔍 Phát hiện {len(streams)} nguồn stream qua network interceptor.",
+            streams=streams,
+        )
 
     @staticmethod
     def _enhance_metadata(res: MediaMetadata, url: str) -> MediaMetadata:

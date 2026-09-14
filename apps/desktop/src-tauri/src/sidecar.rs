@@ -254,10 +254,10 @@ impl SidecarManager {
             }
         }
 
-        match tokio::time::timeout(Duration::from_secs(30), reply_rx).await {
+        match tokio::time::timeout(Duration::from_secs(90), reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("Sidecar reply channel đóng bất ngờ".to_string()),
-            Err(_) => Err("Timeout: Python worker không phản hồi sau 30 giây".to_string()),
+            Err(_) => Err("Timeout: Python worker không phản hồi sau 90 giây".to_string()),
         }
     }
 

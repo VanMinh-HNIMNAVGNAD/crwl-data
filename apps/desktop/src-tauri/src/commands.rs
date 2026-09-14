@@ -176,17 +176,10 @@ pub async fn download_thumbnail(
     let opts = DownloadOptions {
         url,
         format_id: Some("thumbnail".to_string()),
-        is_audio: false,
-        audio_format: None,
-        audio_bitrate: None,
         title,
-        dest_dir: None,
         browser,
         device_id: device_id.unwrap_or_default(),
-        start_time: None,
-        end_time: None,
-        is_mute: false,
-        sponsor_block: false,
+        ..Default::default()
     };
     DownloaderService::start_download(app, Arc::clone(&state.db), opts).await
 }
@@ -209,17 +202,10 @@ pub async fn download_subtitle(
     let opts = DownloadOptions {
         url,
         format_id: Some(format!("subtitle:{}:{}", lang, format.as_deref().unwrap_or("vtt"))),
-        is_audio: false,
-        audio_format: None,
-        audio_bitrate: None,
         title,
-        dest_dir: None,
         browser,
         device_id: device_id.unwrap_or_default(),
-        start_time: None,
-        end_time: None,
-        is_mute: false,
-        sponsor_block: false,
+        ..Default::default()
     };
     DownloaderService::start_download(app, Arc::clone(&state.db), opts).await
 }

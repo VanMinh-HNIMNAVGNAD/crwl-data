@@ -4,6 +4,7 @@ from .gallery import GalleryDlExtractor
 from .tiktok import TikTokExtractor
 from .movie import MovieExtractor
 from .direct import DirectImageExtractor
+from .web_scraper import WebScraperExtractor
 
 __all__ = [
     "BaseExtractor",
@@ -12,4 +13,6 @@ __all__ = [
     "TikTokExtractor",
     "MovieExtractor",
     "DirectImageExtractor",
+    "WebScraperExtractor",
 ]
+

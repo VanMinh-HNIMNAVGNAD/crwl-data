@@ -180,7 +180,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_download_history_downloaded_at ON download_history(downloaded_at DESC);
         "#;
 
-        sqlx::query(ddl).execute(pool).await?;
+        sqlx::raw_sql(ddl).execute(pool).await?;
         info!("✅ Schema PostgreSQL đã được xác thực/khởi tạo đồng bộ.");
         Ok(())
     }

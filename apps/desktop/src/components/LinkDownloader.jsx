@@ -9,6 +9,7 @@ import {
   IconVideo,
   IconAudio,
   IconCopy,
+  IconSettings,
 } from './Icons'
 import { FORMAT_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform } from '../constants'
 import {
@@ -19,11 +20,16 @@ import {
   downloadThumbnail,
   downloadSubtitle,
   downloadZipArchive,
+  downloadAlbumBatch,
   downloadDirectFile,
   onDownloadProgress,
   buildProxyMediaUrl,
   buildProxyImageUrl,
+  selectDownloadDirectory,
+  getAlwaysAskDownloadDir,
+  setAlwaysAskDownloadDir,
 } from '../services/api'
+import DownloadProgressCard from './DownloadProgressCard'
 
 export default function LinkDownloader({ onShowToast }) {
   const [mode, setMode] = useState('single') // 'single' | 'batch'
@@ -40,12 +46,23 @@ export default function LinkDownloader({ onShowToast }) {
   const [selectedImages, setSelectedImages] = useState({})
   const [downloadingId, setDownloadingId] = useState(null)
   const [nativeProgress, setNativeProgress] = useState(null)
+  const [downloadStartTime, setDownloadStartTime] = useState(null)
+  const [downloadTaskTitle, setDownloadTaskTitle] = useState('')
+  const [selectedSubLang, setSelectedSubLang] = useState('')
+  const [alwaysAskDir, setAlwaysAskDir] = useState(getAlwaysAskDownloadDir())
   const [isZipDownloading, setIsZipDownloading] = useState(false)
 
   // Trimmer tool state
   const [isTrimmerOpen, setIsTrimmerOpen] = useState(false)
   const [trimStart, setTrimStart] = useState('')
   const [trimEnd, setTrimEnd] = useState('')
+
+  // Advanced download options state
+  const [isOptionsOpen, setIsOptionsOpen] = useState(false)
+  const [embedSubs, setEmbedSubs] = useState(false)
+  const [embedMetadata, setEmbedMetadata] = useState(true)
+  const [accelerate, setAccelerate] = useState(true)
+  const [videoContainer, setVideoContainer] = useState('auto')
 
   // Synchronous validation state computed from URL
   const trimmedUrl = url.trim()
@@ -56,14 +73,24 @@ export default function LinkDownloader({ onShowToast }) {
     if (initial.status === 'needs_resolve') {
       return { valid: true, status: 'needs_resolve', message: 'Đang kiểm tra chuyển hướng link...' }
     } else if (initial.status === 'matched') {
+      const pName = getPlatform(detected)?.name
+      if (detected === 'movie') {
+        return {
+          valid: true,
+          status: 'matched',
+          platform: detected,
+          message: `✓ Nhận diện: Phim / Web Media`,
+        }
+      }
       return {
         valid: true,
         status: 'matched',
         platform: detected,
-        message: `✓ Hợp lệ: ${getPlatform(detected)?.name || detected}`,
+        message: `✓ Hợp lệ: ${pName || detected}`,
       }
     } else {
-      return { valid: true, status: 'unknown', message: 'Liên kết hợp lệ' }
+      // URL hợp lệ nhưng không rõ nền tảng → vẫn cho phép thử
+      return { valid: true, status: 'unknown', message: '🌐 Sẽ thử phân tích web media...' }
     }
   }, [trimmedUrl])
 
@@ -102,6 +129,12 @@ export default function LinkDownloader({ onShowToast }) {
 
   const validationState = asyncResolved && syncValidation.status === 'needs_resolve' ? asyncResolved : syncValidation
   const resolvedUrl = asyncResolved?.resolvedUrl || trimmedUrl
+
+  useEffect(() => {
+    if (singleMedia?.subtitles && singleMedia.subtitles.length > 0) {
+      setSelectedSubLang(singleMedia.subtitles[0].lang)
+    }
+  }, [singleMedia])
 
   const parsedBatchLinks = useMemo(() => {
     return batchText
@@ -193,6 +226,25 @@ export default function LinkDownloader({ onShowToast }) {
     if (!singleMedia) return
     const streamId = stream.formatId || stream.quality || 'stream'
     setDownloadingId(streamId)
+
+    let targetDir = undefined
+    if (alwaysAskDir) {
+      try {
+        targetDir = await selectDownloadDirectory()
+        if (!targetDir) {
+          onShowToast?.('Đã hủy tải do chưa chọn thư mục lưu')
+          setDownloadingId(null)
+          return
+        }
+      } catch (err) {
+        console.warn('Lỗi chọn thư mục:', err)
+      }
+    }
+
+    setDownloadStartTime(Date.now())
+    setDownloadTaskTitle(singleMedia.title || stream.quality || 'Video')
+    setNativeProgress({ percent: 0, speed: '', eta: 'Khởi tạo luồng tải...', status: 'downloading' })
+
     try {
       const isAudioOnly = stream.streamType === 'audio'
       const isMute = stream.streamType === 'mute'
@@ -215,20 +267,27 @@ export default function LinkDownloader({ onShowToast }) {
         startTime: trimStart || undefined,
         endTime: trimEnd || undefined,
         title: singleMedia.title,
+        destDir: targetDir,
+        embedSubs: embedSubs,
+        embedMetadata: embedMetadata,
+        embedThumbnail: embedMetadata,
+        concurrentFragments: accelerate ? 8 : 1,
+        videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
       })
 
       if (typeof unlisten === 'function') unlisten()
 
       if (res && res.file_name) {
+        setNativeProgress({ percent: 100, speed: '', eta: '00:00', status: 'completed' })
         onShowToast?.(`Đã tải xong: ${res.file_name}`)
       }
     } catch (err) {
+      setNativeProgress({ percent: 0, speed: '', eta: '', status: 'error' })
       onShowToast?.(err.message || 'Lỗi khi tải stream')
     } finally {
       setTimeout(() => {
         setDownloadingId(null)
-        setNativeProgress(null)
-      }, 1500)
+      }, 2000)
     }
   }
 
@@ -313,24 +372,48 @@ export default function LinkDownloader({ onShowToast }) {
     }
   }
 
-  const handleDownloadAlbumZip = async () => {
+  const handleDownloadAlbum = async (asZip = false) => {
     const itemsToDownload = albumImages.filter((img) => selectedImages[img.id])
     if (itemsToDownload.length === 0) {
-      onShowToast?.('Vui lòng chọn ít nhất 1 ảnh để tải ZIP')
+      onShowToast?.('Vui lòng chọn ít nhất 1 ảnh để tải')
       return
     }
 
+    let targetDir = undefined
+    if (alwaysAskDir) {
+      try {
+        targetDir = await selectDownloadDirectory()
+        if (!targetDir) {
+          onShowToast?.('Đã hủy do chưa chọn thư mục lưu')
+          return
+        }
+      } catch (err) {
+        console.warn('Lỗi chọn thư mục:', err)
+      }
+    }
+
     setIsZipDownloading(true)
+    setDownloadStartTime(Date.now())
+    setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} ảnh`)
+    setNativeProgress({ percent: 15, speed: '', eta: 'Đang tải ảnh...', status: 'downloading' })
+
     try {
-      const zipPayload = itemsToDownload.map((img) => ({
+      const itemsPayload = itemsToDownload.map((img) => ({
         url: img.url,
         filename: `${img.title || 'image'}.${img.ext || 'jpg'}`,
         referer: singleMedia?.originalUrl,
       }))
-      await downloadZipArchive(zipPayload, `${singleMedia?.title || 'Album'}_Media`)
-      onShowToast?.(`Đã tải file ZIP (${itemsToDownload.length} ảnh)!`)
+      const res = await downloadAlbumBatch({
+        items: itemsPayload,
+        albumName: `${singleMedia?.title || 'Album'}_Media`,
+        destDir: targetDir,
+        asZip: asZip,
+      })
+      setNativeProgress({ percent: 100, speed: '', eta: '00:00', status: 'completed' })
+      onShowToast?.(res?.message || `Đã tải xong ${itemsToDownload.length} ảnh!`)
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi tạo file ZIP')
+      setNativeProgress({ percent: 0, speed: '', eta: '', status: 'error' })
+      onShowToast?.(err.message || 'Lỗi khi tải album')
     } finally {
       setIsZipDownloading(false)
     }
@@ -382,7 +465,7 @@ export default function LinkDownloader({ onShowToast }) {
               <input
                 type="text"
                 className="pane-input"
-                placeholder="Dán link YouTube, TikTok, Facebook, Instagram, X, Pinterest..."
+                placeholder="Dán link YouTube, TikTok, Facebook, Instagram, phimhay.com, nhac.vn..."
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 disabled={isLoading}
@@ -574,6 +657,14 @@ export default function LinkDownloader({ onShowToast }) {
                     <IconScissors className="w-3 h-3" />
                     <span>Cắt đoạn</span>
                   </button>
+                  <button
+                    type="button"
+                    className={`minimal-small-btn ${isOptionsOpen ? 'active' : ''}`}
+                    onClick={() => setIsOptionsOpen(!isOptionsOpen)}
+                  >
+                    <IconSettings className="w-3 h-3" />
+                    <span>Tùy chọn tải</span>
+                  </button>
                 </div>
               </div>
             </div>
@@ -600,39 +691,125 @@ export default function LinkDownloader({ onShowToast }) {
               </div>
             )}
 
-            {/* Tiến trình tải Native */}
-            {nativeProgress && (
-              <div className="download-progress-bar-wrap">
-                <div className="progress-info-line">
-                  <span>Đang tải xuống: {nativeProgress.percent}%</span>
-                  <span>{nativeProgress.speed || ''}</span>
-                </div>
-                <div className="progress-track">
-                  <div
-                    className="progress-fill"
-                    style={{ width: `${Math.min(100, Math.max(0, nativeProgress.percent || 0))}%` }}
+            {/* Advanced download options box (nếu mở) */}
+            {isOptionsOpen && (
+              <div className="download-options-inline-box">
+                <label className="checkbox-opt-label">
+                  <input
+                    type="checkbox"
+                    checked={accelerate}
+                    onChange={(e) => setAccelerate(e.target.checked)}
                   />
+                  <span>Tăng tốc 8x (Đa luồng)</span>
+                </label>
+
+                <label className="checkbox-opt-label">
+                  <input
+                    type="checkbox"
+                    checked={embedMetadata}
+                    onChange={(e) => setEmbedMetadata(e.target.checked)}
+                  />
+                  <span>Nhúng ID3 &amp; Thumbnail</span>
+                </label>
+
+                <label className="checkbox-opt-label">
+                  <input
+                    type="checkbox"
+                    checked={embedSubs}
+                    onChange={(e) => setEmbedSubs(e.target.checked)}
+                  />
+                  <span>Nhúng phụ đề</span>
+                </label>
+
+                <label className="checkbox-opt-label">
+                  <input
+                    type="checkbox"
+                    checked={alwaysAskDir}
+                    onChange={(e) => {
+                      setAlwaysAskDir(e.target.checked)
+                      setAlwaysAskDownloadDir(e.target.checked)
+                    }}
+                  />
+                  <span>Hỏi nơi lưu trữ trước khi tải</span>
+                </label>
+
+                <div className="container-select-group">
+                  <span>Định dạng:</span>
+                  <select
+                    className="container-select"
+                    value={videoContainer}
+                    onChange={(e) => setVideoContainer(e.target.value)}
+                  >
+                    <option value="auto">Gốc / Mặc định</option>
+                    <option value="mp4">MP4 (Phổ biến)</option>
+                    <option value="mkv">MKV (Lossless)</option>
+                    <option value="mov">MOV (Apple/Pro)</option>
+                    <option value="webm">WEBM (Web)</option>
+                    <option value="gif">GIF (Ảnh động)</option>
+                  </select>
                 </div>
               </div>
             )}
 
-            {/* Phụ đề có sẵn */}
+            {/* Mục hiển thị Tiến trình chi tiết (Tốc độ, Thời gian đã tải, Ước tính ETA) */}
+            {nativeProgress && (
+              <DownloadProgressCard
+                progress={nativeProgress}
+                title={downloadTaskTitle}
+                startTime={downloadStartTime}
+                onDismiss={() => setNativeProgress(null)}
+              />
+            )}
+
+            {/* Phụ đề có sẵn (Nếu nhiều hơn 2 thì dùng Dropdown chọn gọn gàng) */}
             {singleMedia.subtitles && singleMedia.subtitles.length > 0 && (
               <div className="subtitles-section">
-                <span className="sub-title-label">Phụ đề:</span>
-                <div className="sub-pills-row">
-                  {singleMedia.subtitles.map((sub) => (
-                    <button
-                      key={sub.lang}
-                      type="button"
-                      className="minimal-pill-small"
-                      onClick={() => handleDownloadSubtitle(sub)}
-                    >
-                      <IconSubtitle className="w-3 h-3" />
-                      <span>{sub.name || sub.lang}</span>
-                    </button>
-                  ))}
+                <div className="sub-title-label">
+                  <IconSubtitle className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Phụ đề ({singleMedia.subtitles.length}):</span>
                 </div>
+                {singleMedia.subtitles.length <= 2 ? (
+                  <div className="sub-pills-row">
+                    {singleMedia.subtitles.map((sub) => (
+                      <button
+                        key={sub.lang}
+                        type="button"
+                        className="minimal-pill-small"
+                        onClick={() => handleDownloadSubtitle(sub)}
+                      >
+                        <IconSubtitle className="w-3 h-3" />
+                        <span>{sub.name || sub.lang}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="sub-dropdown-control">
+                    <select
+                      className="sub-select-dropdown"
+                      value={selectedSubLang}
+                      onChange={(e) => setSelectedSubLang(e.target.value)}
+                    >
+                      {singleMedia.subtitles.map((sub) => (
+                        <option key={sub.lang} value={sub.lang}>
+                          {sub.name ? `${sub.name} (${sub.lang})` : sub.lang}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="btn-download-sub-action"
+                      onClick={() => {
+                        const chosen =
+                          singleMedia.subtitles.find((s) => s.lang === selectedSubLang) ||
+                          singleMedia.subtitles[0]
+                        if (chosen) handleDownloadSubtitle(chosen)
+                      }}
+                    >
+                      <IconDownload className="w-3.5 h-3.5" />
+                      <span>Tải phụ đề</span>
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -650,15 +827,27 @@ export default function LinkDownloader({ onShowToast }) {
                       {selectedImageCount === albumImages.length ? 'Bỏ chọn' : 'Chọn tất cả'}
                     </button>
                     {selectedImageCount > 0 && (
-                      <button
-                        type="button"
-                        className="minimal-small-btn"
-                        onClick={handleDownloadAlbumZip}
-                        disabled={isZipDownloading}
-                      >
-                        <IconZip className="w-3 h-3" />
-                        <span>Tải ZIP ({selectedImageCount})</span>
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          className="minimal-small-btn"
+                          onClick={() => handleDownloadAlbum(false)}
+                          disabled={isZipDownloading}
+                          title="Tải ảnh trực tiếp vào một thư mục riêng biệt"
+                        >
+                          <span>📁 Tải thư mục ({selectedImageCount})</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="minimal-small-btn"
+                          onClick={() => handleDownloadAlbum(true)}
+                          disabled={isZipDownloading}
+                          title="Đóng gói toàn bộ ảnh đã chọn thành file nén ZIP"
+                        >
+                          <IconZip className="w-3 h-3" />
+                          <span>Tải ZIP ({selectedImageCount})</span>
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -700,6 +889,26 @@ export default function LinkDownloader({ onShowToast }) {
                     </div>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/* Cảnh báo khi stream bị ẩn / DRM */}
+            {singleMedia.streams !== null && singleMedia.streams !== undefined &&
+             singleMedia.streams.length === 0 && singleMedia.description?.startsWith('⚠️') && (
+              <div className="stream-not-found-notice">
+                <div className="stream-not-found-icon">🔒</div>
+                <div className="stream-not-found-text">
+                  <strong>Không tìm được nguồn video</strong>
+                  <p>Player của trang này có thể dùng DRM (Widevine/PlayReady), mã hóa phức tạp, hoặc token đã hết hạn ngay khi load. Không thể tải về.</p>
+                  <p className="stream-not-found-hint">💡 Thử mở trang bằng trình duyệt, chọn chất lượng và sao chép URL stream trực tiếp.</p>
+                </div>
+              </div>
+            )}
+
+            {/* Badge khi stream được phát hiện bởi Playwright sniffer */}
+            {singleMedia.description?.startsWith('🔍') && singleMedia.streams && singleMedia.streams.length > 0 && (
+              <div className="sniff-success-badge">
+                🔍 Đã phát hiện {singleMedia.streams.length} nguồn stream ẩn qua Network Interceptor
               </div>
             )}
 

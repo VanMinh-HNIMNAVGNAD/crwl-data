@@ -8,10 +8,11 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::binary_manager::BinaryManager;
 use crate::cookies::CookieService;
 use crate::db::Database;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DownloadOptions {
     pub url: String,
     #[serde(alias = "formatId")]
@@ -36,6 +37,20 @@ pub struct DownloadOptions {
     pub is_mute: bool,
     #[serde(default, alias = "sponsorBlock")]
     pub sponsor_block: bool,
+    #[serde(default, alias = "embedSubs")]
+    pub embed_subs: bool,
+    #[serde(default, alias = "embedThumbnail")]
+    pub embed_thumbnail: bool,
+    #[serde(default, alias = "embedMetadata")]
+    pub embed_metadata: bool,
+    #[serde(default, alias = "splitChapters")]
+    pub split_chapters: bool,
+    #[serde(alias = "concurrentFragments")]
+    pub concurrent_fragments: Option<u32>,
+    #[serde(alias = "proxy")]
+    pub proxy: Option<String>,
+    #[serde(alias = "videoFormat")]
+    pub video_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +200,22 @@ impl DownloaderService {
         cmd.arg("--progress-template")
             .arg("download-progress:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s");
 
+        // Tự động dùng Node.js runtime cho YouTube n-sig challenge nếu có
+        if let Some(node_path) = BinaryManager::find_binary("node") {
+            cmd.arg("--js-runtimes").arg(format!("node:{}", node_path.to_string_lossy()));
+        }
+
+        // Tăng tốc tải đa luồng song song (-N 8)
+        let frags = opts.concurrent_fragments.unwrap_or(8);
+        cmd.arg("-N").arg(frags.to_string());
+
+        // Sử dụng aria2c làm downloader ngoài nếu đã cài đặt
+        if BinaryManager::has_binary("aria2c") {
+            info!("Phát hiện aria2c: Kích hoạt bộ tải ngoài tăng tốc đa luồng");
+            cmd.arg("--downloader").arg("aria2c");
+            cmd.arg("--downloader-args").arg("aria2c:-s 16 -x 16 -k 1M -j 16");
+        }
+
         // Cắt clip theo mốc thời gian (Trimmer)
         let normalize_time = |t: Option<&str>| -> Option<String> {
             let s = t?.trim();
@@ -212,15 +243,38 @@ impl DownloaderService {
             cmd.arg("--sponsorblock-remove").arg("default");
         }
 
+        // Proxy nếu được chỉ định
+        if let Some(ref proxy) = opts.proxy {
+            if !proxy.trim().is_empty() {
+                cmd.arg("--proxy").arg(proxy.trim());
+            }
+        }
+
         // Tùy chọn định dạng Video hoặc Audio
         if opts.is_audio {
             cmd.arg("-x");
             let fmt = opts.audio_format.as_deref().unwrap_or("mp3");
-            cmd.arg("--audio-format").arg(fmt);
+            let safe_fmt = if fmt == "opus" {
+                "opus"
+            } else if fmt == "ogg" || fmt == "vorbis" {
+                "vorbis"
+            } else if fmt == "flac" {
+                "flac"
+            } else if fmt == "wav" {
+                "wav"
+            } else if fmt == "m4a" || fmt == "aac" {
+                "m4a"
+            } else if fmt == "alac" {
+                "alac"
+            } else {
+                "mp3"
+            };
+            cmd.arg("--audio-format").arg(safe_fmt);
             let quality = match opts.audio_bitrate.as_deref() {
                 Some("320") | Some("320k") | Some("320kbps") => "0",
                 Some("256") | Some("256k") | Some("256kbps") => "2",
                 Some("192") | Some("192k") | Some("192kbps") => "4",
+                Some("128") | Some("128k") | Some("128kbps") => "6",
                 _ => "0",
             };
             cmd.arg("--audio-quality").arg(quality);
@@ -251,9 +305,23 @@ impl DownloaderService {
                     .arg("--sub-format")
                     .arg(sub_fmt)
                     .arg("--skip-download");
-            } else if fid.starts_with("mp3") || fid.starts_with("m4a") || fid.starts_with("flac") {
+            } else if fid.starts_with("mp3") || fid.starts_with("m4a") || fid.starts_with("flac") || fid.starts_with("opus") || fid.starts_with("ogg") || fid.starts_with("wav") || fid.starts_with("alac") {
                 cmd.arg("-x");
-                let fmt = if fid.contains("flac") { "flac" } else if fid.contains("m4a") { "m4a" } else { "mp3" };
+                let fmt = if fid.contains("flac") {
+                    "flac"
+                } else if fid.contains("opus") {
+                    "opus"
+                } else if fid.contains("ogg") {
+                    "vorbis"
+                } else if fid.contains("wav") {
+                    "wav"
+                } else if fid.contains("alac") {
+                    "alac"
+                } else if fid.contains("m4a") {
+                    "m4a"
+                } else {
+                    "mp3"
+                };
                 cmd.arg("--audio-format").arg(fmt);
                 cmd.arg("--embed-metadata");
                 cmd.arg("--embed-thumbnail");
@@ -264,6 +332,40 @@ impl DownloaderService {
             }
         } else {
             cmd.arg("-f").arg("bestvideo+bestaudio/best");
+        }
+
+        // Tùy chọn chuyển đổi Container Video (MKV, MOV, AVI, WEBM, MP4, GIF)
+        if !opts.is_audio {
+            if let Some(ref vfmt) = opts.video_format {
+                let vf = vfmt.trim().to_lowercase();
+                if vf == "gif" {
+                    cmd.arg("--recode-video").arg("gif");
+                } else if vf == "mkv" || vf == "mov" || vf == "avi" || vf == "webm" || vf == "mp4" {
+                    cmd.arg("--remux-video").arg(&vf);
+                }
+            }
+        }
+
+        // Nhúng phụ đề vào video nếu được bật
+        if opts.embed_subs && !opts.is_audio {
+            cmd.arg("--embed-subs");
+            cmd.arg("--sub-langs").arg("all");
+        }
+
+        // Nhúng thumbnail vào video/audio nếu bật
+        if opts.embed_thumbnail && !opts.is_audio {
+            cmd.arg("--embed-thumbnail");
+        }
+
+        // Nhúng metadata & chapters
+        if opts.embed_metadata && !opts.is_audio {
+            cmd.arg("--embed-metadata");
+            cmd.arg("--embed-chapters");
+        }
+
+        // Tách theo chapter
+        if opts.split_chapters {
+            cmd.arg("--split-chapters");
         }
 
         // Cookies — ưu tiên: 1) file cookie đã lưu, 2) cookie-from-browser
@@ -590,6 +692,9 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
                 if st.success() {
                     let zip_size = zip_path.metadata().map(|m| m.len() as i64).ok();
                     let zip_str = zip_path.to_string_lossy().to_string();
+
+                    // Dọn dẹp thư mục nguồn sau khi đã nén vào ZIP để tránh nhân đôi dung lượng
+                    let _ = tokio::fs::remove_dir_all(&target_dir).await;
 
                     db.record_download_history(
                         device_id,

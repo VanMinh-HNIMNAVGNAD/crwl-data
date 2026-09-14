@@ -1,10 +1,18 @@
 import { useState, useEffect, useRef } from 'react'
-import { getBrowsersList, getActiveBrowser, setActiveBrowser, getCookieStatus } from '../services/api'
-import { IconGlobe, IconChevronDown, IconCheck, IconRefresh, IconHistory } from './Icons'
+import {
+  getBrowsersList,
+  getActiveBrowser,
+  setActiveBrowser,
+  getCookieStatus,
+  getDefaultDownloadDirectory,
+  selectDownloadDirectory,
+} from '../services/api'
+import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings } from './Icons'
 
-export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
+export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools }) {
   const [browsersData, setBrowsersData] = useState(null)
   const [selectedBrowser, setSelectedBrowser] = useState(getActiveBrowser() || '')
+  const [downloadDir, setDownloadDir] = useState('')
   const [isDropdownOpen, setIsDropdownOpen] = useState(false)
   const [toastMsg, setToastMsg] = useState('')
   const [cookieCount, setCookieCount] = useState(0)
@@ -30,8 +38,8 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
 
   useEffect(() => {
     let active = true
-    Promise.all([getBrowsersList(), getCookieStatus()])
-      .then(([b, cs]) => {
+    Promise.all([getBrowsersList(), getCookieStatus(), getDefaultDownloadDirectory()])
+      .then(([b, cs, defDir]) => {
         if (!active) return
         if (b) {
           setBrowsersData(b)
@@ -41,6 +49,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
           }
         }
         if (cs) setCookieCount(cs.platforms?.filter((p) => p.isValid).length || 0)
+        if (defDir) setDownloadDir(defDir)
       })
       .catch((err) => {
         console.warn('Lỗi khi tải thông tin hệ thống:', err)
@@ -49,6 +58,24 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
       active = false
     }
   }, [selectedBrowser])
+
+  const handleSelectFolder = async () => {
+    try {
+      const dir = await selectDownloadDirectory()
+      if (dir) {
+        setDownloadDir(dir)
+        showToast(`Đã đổi nơi lưu: ${dir}`)
+      }
+    } catch (err) {
+      console.warn('Lỗi khi chọn thư mục:', err)
+    }
+  }
+
+  const formatDirDisplay = (dir) => {
+    if (!dir) return 'Thư mục lưu'
+    const parts = dir.replace(/\\/g, '/').split('/').filter(Boolean)
+    return parts.length > 0 ? `📁 ${parts[parts.length - 1]}` : '📁 Thư mục lưu'
+  }
 
   // Đóng dropdown khi click ra ngoài hoặc nhấn phím ESC
   useEffect(() => {
@@ -95,12 +122,8 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
       )}
 
       <div className="system-header-inner">
-        {/* Brand / Tiêu đề */}
+        {/* Brand / Tiêu đề (Đã bỏ hẳn icon theo yêu cầu) */}
         <div className="system-brand-group">
-          <div className="system-brand-icon">
-            <IconGlobe className="w-4 h-4 text-emerald-400" />
-            <span className="brand-dot-pulse" />
-          </div>
           <h1 className="system-brand-title">Media Downloader</h1>
         </div>
 
@@ -179,6 +202,16 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
             )}
           </button>
 
+          {/* Chọn nơi lưu trữ tệp */}
+          <button
+            type="button"
+            className="btn-folder-trigger"
+            onClick={handleSelectFolder}
+            title={`Thư mục lưu hiện tại:\n${downloadDir || 'Mặc định (~/Downloads)'}\n\nNhấp để chọn thư mục lưu khác...`}
+          >
+            <span className="folder-name-text">{formatDirDisplay(downloadDir)}</span>
+          </button>
+
           {/* History Button Trigger */}
           <button
             type="button"
@@ -188,6 +221,17 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
           >
             <IconHistory className="w-4 h-4 text-slate-400" />
             <span>Lịch sử tải</span>
+          </button>
+
+          {/* Tools & Engine Status Trigger */}
+          <button
+            type="button"
+            className="btn-tools-trigger"
+            onClick={onOpenTools}
+            title="Kiểm tra & Cập nhật các công cụ Engine (yt-dlp, gallery-dl, FFmpeg, aria2c...)"
+          >
+            <IconSettings className="w-4 h-4 text-slate-400" />
+            <span>Công cụ</span>
           </button>
         </div>
       </div>
