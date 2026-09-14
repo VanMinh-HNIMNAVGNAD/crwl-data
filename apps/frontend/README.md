@@ -1,16 +1,12 @@
-# React + Vite
+# Desktop Frontend (React 19 + Vite + Tauri 2)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This directory contains the user interface for the Social Media Crawler Linux Desktop application.
 
-Currently, two official plugins are available:
+## Development & Build Commands
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- `pnpm dev`: Runs the Vite web preview server locally at `http://localhost:5173`.
+- `pnpm tauri dev` (or `pnpm dev:tauri` from repo root): Launches the full Tauri 2 native desktop application with live reload.
+- `pnpm build`: Builds the production web frontend distribution files into `dist/`.
+- `pnpm tauri build` (or `pnpm build:tauri` from repo root): Packages the native Linux desktop binary (`.deb`, `.AppImage`).
+- `pnpm lint`: Runs ESLint validation.
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.

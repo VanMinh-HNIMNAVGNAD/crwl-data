@@ -1,22 +1,33 @@
 /**
- * API Client & Services Layer
- * Kết nối đồng bộ 100% chức năng Frontend với Backend API & PostgreSQL Tracking
+ * API Client — Tauri Native Only
+ * Tất cả các tính năng đều chạy qua Tauri IPC (invoke/listen).
+ * NestJS backend đã được loại bỏ hoàn toàn.
  */
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
+import { invoke, isTauri as checkIsTauri } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Core Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Lấy hoặc tự động khởi tạo Device ID duy nhất trong localStorage
- */
+export function isTauri() {
+  try {
+    return Boolean(checkIsTauri && checkIsTauri())
+  } catch {
+    return false
+  }
+}
+
 export function getDeviceId() {
   try {
     let id = localStorage.getItem('app_device_id')
     if (!id) {
-      id = 'dev_' + (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '').slice(0, 16) : Math.random().toString(36).slice(2, 14))
+      id =
+        'dev_' +
+        (typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+          : Math.random().toString(36).slice(2, 14))
       localStorage.setItem('app_device_id', id)
     }
     return id
@@ -26,63 +37,21 @@ export function getDeviceId() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Turnstile Token (In-memory - reset mỗi khi reload F5)
+// Turnstile (Removed — bypassed permanently)
 // ─────────────────────────────────────────────────────────────────────────────
-let inMemoryTurnstileToken = null
 
-export function setTurnstileToken(token) {
-  inMemoryTurnstileToken = token
-}
-
+export function setTurnstileToken() {}
 export function getTurnstileToken() {
-  return inMemoryTurnstileToken
+  return null
+}
+export async function verifyTurnstileTokenWithBackend() {
+  return { success: true, bypassed: true }
 }
 
-/**
- * Gửi token lên backend để xác thực với Cloudflare Siteverify API (nếu backend bật TURNSTILE_SECRET_KEY)
- */
-export async function verifyTurnstileTokenWithBackend(token) {
-  try {
-    const res = await fetch(`${API_BASE}/api/turnstile/verify`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-device-id': getDeviceId(),
-      },
-      body: JSON.stringify({ token }),
-    })
+// ─────────────────────────────────────────────────────────────────────────────
+// Browser & Download Directory preferences (localStorage)
+// ─────────────────────────────────────────────────────────────────────────────
 
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}))
-      return { success: false, message: errData.message || 'Xác thực từ máy chủ thất bại.' }
-    }
-
-    const data = await res.json()
-    return { success: true, ...data }
-  } catch (err) {
-    // Nếu backend offline hoặc không gọi được, ghi nhận log và cho phép client-side
-    console.warn('[Turnstile] Backend verify skipped or unavailable:', err)
-    return { success: true, bypassed: true }
-  }
-}
-
-/**
- * Header mặc định kèm Device ID & Turnstile Token để backend nhận diện và kiểm duyệt an toàn
- */
-function getDefaultHeaders() {
-  const headers = {
-    'Content-Type': 'application/json',
-    'x-device-id': getDeviceId(),
-  }
-  if (inMemoryTurnstileToken) {
-    headers['x-turnstile-token'] = inMemoryTurnstileToken
-  }
-  return headers
-}
-
-/**
- * Lưu trữ & đọc trình duyệt cookie người dùng lựa chọn từ localStorage
- */
 export function getActiveBrowser() {
   try {
     return localStorage.getItem('selected_browser') || ''
@@ -103,234 +72,47 @@ export function setActiveBrowser(browserId) {
   }
 }
 
-/**
- * Helper kích hoạt tải file an toàn trên trình duyệt qua thẻ <a> ẩn
- */
-export function triggerFileDownload(downloadUrl, filename = '') {
-  const a = document.createElement('a')
-  a.href = downloadUrl
-  if (filename) a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
+export function getCustomDownloadDir() {
+  try {
+    return localStorage.getItem('custom_download_dir') || ''
+  } catch {
+    return ''
+  }
+}
+
+export function setCustomDownloadDir(dir) {
+  try {
+    if (dir) {
+      localStorage.setItem('custom_download_dir', dir)
+    } else {
+      localStorage.removeItem('custom_download_dir')
+    }
+  } catch (err) {
+    void err
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Extract
+// 1. Extract Media
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Phân tích liên kết đơn lẻ
- * POST /api/media/extract
- */
 export async function extractMedia(url, browserOverride = null) {
   const browser = browserOverride !== null ? browserOverride : getActiveBrowser()
-  const response = await fetch(`${API_BASE}/api/media/extract`, {
-    method: 'POST',
-    headers: getDefaultHeaders(),
-    body: JSON.stringify({
+  try {
+    return await invoke('extract_media', {
       url: url.trim(),
       browser: browser || undefined,
-    }),
-  })
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}))
-    throw new Error(errorData.message || `Lỗi máy chủ (${response.status})`)
+      deviceId: getDeviceId(),
+    })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi trích xuất media', { cause: err })
   }
-
-  return await response.json()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Stream Download
+// 2. Crawl Profile / Channel
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Tạo URL tải stream video / audio
- * GET /api/media/download/stream
- */
-export function buildStreamDownloadUrl({
-  url,
-  formatId,
-  isAudio = false,
-  title = 'media',
-  audioFormat,
-  audioBitrate,
-  startTime,
-  endTime,
-  format,
-  streamType,
-  isMute = false,
-  sponsorBlock = false,
-  embedThumbnail = false,
-  embedMetadata = false,
-  browser = null,
-  referer = null,
-}) {
-  const params = new URLSearchParams()
-  params.append('url', url)
-  params.append('deviceId', getDeviceId())
-  if (formatId) params.append('formatId', formatId)
-  if (referer) params.append('referer', referer)
-  params.append('isAudio', String(Boolean(isAudio)))
-  if (title) params.append('title', title)
-  if (audioFormat) params.append('audioFormat', audioFormat)
-  if (audioBitrate) params.append('audioBitrate', audioBitrate)
-  if (startTime) params.append('startTime', startTime)
-  if (endTime) params.append('endTime', endTime)
-  if (format) params.append('format', format)
-  if (streamType) params.append('streamType', streamType)
-  if (isMute) params.append('isMute', 'true')
-  if (sponsorBlock) params.append('sponsorBlock', 'true')
-  if (embedThumbnail) params.append('embedThumbnail', 'true')
-  if (embedMetadata) params.append('embedMetadata', 'true')
-
-  const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  if (targetBrowser && targetBrowser !== 'none') {
-    params.append('browser', targetBrowser)
-  }
-
-  return `${API_BASE}/api/media/download/stream?${params.toString()}`
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. Subtitle Download
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Tạo URL tải file phụ đề (.srt / .vtt)
- * GET /api/media/download/subtitle
- */
-export function buildSubtitleDownloadUrl({ url, lang, format = 'vtt', title = 'subtitle', browser = null }) {
-  const params = new URLSearchParams()
-  params.append('url', url)
-  params.append('deviceId', getDeviceId())
-  params.append('lang', lang)
-  params.append('format', format)
-  if (title) params.append('title', title)
-
-  const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  if (targetBrowser && targetBrowser !== 'none') {
-    params.append('browser', targetBrowser)
-  }
-
-  return `${API_BASE}/api/media/download/subtitle?${params.toString()}`
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. Thumbnail Download
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Tạo URL tải thumbnail / cover art riêng
- * GET /api/media/download/thumbnail
- */
-export function buildThumbnailDownloadUrl({ url, title = 'thumbnail', browser = null }) {
-  const params = new URLSearchParams()
-  params.append('url', url)
-  params.append('deviceId', getDeviceId())
-  if (title) params.append('title', title)
-
-  const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  if (targetBrowser && targetBrowser !== 'none') {
-    params.append('browser', targetBrowser)
-  }
-
-  return `${API_BASE}/api/media/download/thumbnail?${params.toString()}`
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. Proxy Media
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Tạo URL tải ảnh/tệp đơn qua Proxy chống chặn 403
- * GET /api/media/proxy-media
- */
-export function buildProxyMediaUrl(mediaUrl, filename = 'media.jpg') {
-  const params = new URLSearchParams()
-  params.append('url', mediaUrl)
-  params.append('deviceId', getDeviceId())
-  params.append('filename', filename)
-  return `${API_BASE}/api/media/proxy-media?${params.toString()}`
-}
-
-/**
- * Tạo URL hiển thị ảnh/avatar an toàn chống chặn CORP (ERR_BLOCKED_BY_RESPONSE.NotSameOrigin) và 403 Forbidden
- * GET /api/media/proxy-image
- */
-export function buildProxyImageUrl(rawUrl) {
-  if (!rawUrl) return ''
-  if (
-    rawUrl.startsWith('data:') ||
-    rawUrl.startsWith('blob:') ||
-    rawUrl.includes('/api/media/proxy-')
-  ) {
-    return rawUrl
-  }
-  const params = new URLSearchParams()
-  params.append('url', rawUrl)
-  return `${API_BASE}/api/media/proxy-image?${params.toString()}`
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. ZIP Download
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Đóng gói các tệp đã chọn thành file ZIP và tải về
- * Hỗ trợ nhận luồng stream dữ liệu và báo cáo tiến trình theo thời gian thực
- * POST /api/media/download-zip
- */
-export async function downloadZipArchive(items, zipName = 'Album_Media', onProgress) {
-  const response = await fetch(`${API_BASE}/api/media/download-zip`, {
-    method: 'POST',
-    headers: getDefaultHeaders(),
-    body: JSON.stringify({ items, zipName }),
-  })
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}))
-    throw new Error(errorData.message || 'Lỗi khi tạo và tải tệp nén ZIP từ máy chủ')
-  }
-
-  let blob
-  if (response.body && response.body.getReader) {
-    const reader = response.body.getReader()
-    const chunks = []
-    let receivedBytes = 0
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (value) {
-        chunks.push(value)
-        receivedBytes += value.length
-        if (onProgress) {
-          onProgress({ receivedBytes })
-        }
-      }
-    }
-    blob = new Blob(chunks, { type: 'application/zip' })
-  } else {
-    blob = await response.blob()
-  }
-
-  const downloadUrl = URL.createObjectURL(blob)
-  triggerFileDownload(downloadUrl, `${zipName}.zip`)
-  setTimeout(() => URL.revokeObjectURL(downloadUrl), 5000)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 7. Crawl Profile
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Quét toàn bộ hồ sơ / tài khoản / playlist
- * POST /api/media/crawl-profile
- */
 export async function crawlProfile({
   url,
   limit = 50,
@@ -341,192 +123,358 @@ export async function crawlProfile({
   rangeEnd,
 }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  const payload = {
-    url: url.trim(),
-    limit,
-    mediaType,
-    platform,
-  }
-  if (targetBrowser && targetBrowser !== 'none') {
-    payload.browser = targetBrowser
-  }
-  if (rangeStart && rangeEnd && rangeEnd >= rangeStart) {
-    payload.rangeStart = Number(rangeStart)
-    payload.rangeEnd = Number(rangeEnd)
-  }
-
-  const response = await fetch(`${API_BASE}/api/media/crawl-profile`, {
-    method: 'POST',
-    headers: getDefaultHeaders(),
-    body: JSON.stringify(payload),
-  })
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}))
-    throw new Error(errorData.message || 'Lỗi khi quét tài khoản')
-  }
-
-  return await response.json()
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 8. System Info & Browsers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Lấy danh sách trình duyệt khả dụng trên máy chủ
- * GET /api/media/browsers
- */
-export async function getBrowsersList() {
-  const response = await fetch(`${API_BASE}/api/media/browsers`, {
-    headers: { 'x-device-id': getDeviceId() },
-  })
-  if (!response.ok) return null
-  return await response.json()
-}
-
-/**
- * Lấy cấu hình hiện tại của hệ thống
- * GET /api/media/config
- */
-export async function getSystemConfig() {
-  const response = await fetch(`${API_BASE}/api/media/config`, {
-    headers: { 'x-device-id': getDeviceId() },
-  })
-  if (!response.ok) return null
-  return await response.json()
-}
-
-/**
- * Kiểm tra sức khỏe hệ thống (binary status)
- * GET /api/media/health
- */
-export async function getSystemHealth() {
-  const response = await fetch(`${API_BASE}/api/media/health`, {
-    headers: { 'x-device-id': getDeviceId() },
-  })
-  if (!response.ok) return null
-  return await response.json()
-}
-
-/**
- * Lấy lịch sử tải xuống gần nhất từ PostgreSQL
- * GET /api/media/history
- */
-export async function getDownloadHistory(limit = 30) {
   try {
-    const deviceId = getDeviceId()
-    const response = await fetch(`${API_BASE}/api/media/history?limit=${limit}&deviceId=${deviceId}`, {
-      headers: { 'x-device-id': deviceId },
+    return await invoke('crawl_profile', {
+      url: url.trim(),
+      limit: Number(limit) || 50,
+      mediaType: mediaType || undefined,
+      platform: platform && platform !== 'auto' ? platform : undefined,
+      browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : undefined,
+      rangeStart: rangeStart ? Number(rangeStart) : undefined,
+      rangeEnd: rangeEnd ? Number(rangeEnd) : undefined,
+      deviceId: getDeviceId(),
     })
-    if (!response.ok) return { total: 0, history: [] }
-    return await response.json()
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi quét tài khoản', { cause: err })
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. Resolve Short URL
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function resolveShortUrl(url, expectedPlatform = null) {
+  try {
+    return await invoke('resolve_short_url', {
+      url: url.trim(),
+      expectedPlatform: expectedPlatform || undefined,
+    })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi giải mã URL', { cause: err })
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. Native Downloads (Video / Audio / Thumbnail / Subtitle)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function startNativeDownload({
+  url,
+  formatId,
+  isAudio = false,
+  audioFormat,
+  audioBitrate,
+  title,
+  destDir,
+  browser = null,
+  startTime = null,
+  endTime = null,
+  isMute = false,
+  sponsorBlock = false,
+}) {
+  const targetBrowser = browser !== null ? browser : getActiveBrowser()
+  const customDir = destDir || getCustomDownloadDir() || null
+
+  return await invoke('start_download', {
+    options: {
+      url: url.trim(),
+      format_id: formatId || null,
+      is_audio: Boolean(isAudio),
+      audio_format: audioFormat || null,
+      audio_bitrate: audioBitrate || null,
+      title: title || null,
+      dest_dir: customDir,
+      browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
+      device_id: getDeviceId(),
+      start_time: startTime || null,
+      end_time: endTime || null,
+      is_mute: Boolean(isMute),
+      sponsor_block: Boolean(sponsorBlock),
+    },
+  })
+}
+
+/**
+ * Tải ảnh bìa (thumbnail) — thay thế /api/media/download/thumbnail
+ */
+export async function downloadThumbnail({ url, title, browser = null }) {
+  const targetBrowser = browser !== null ? browser : getActiveBrowser()
+  return await invoke('download_thumbnail', {
+    url: url.trim(),
+    title: title || null,
+    browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
+    deviceId: getDeviceId(),
+  })
+}
+
+/**
+ * Tải phụ đề (subtitle) — thay thế /api/media/download/subtitle
+ */
+export async function downloadSubtitle({ url, lang, format = 'vtt', title, browser = null }) {
+  const targetBrowser = browser !== null ? browser : getActiveBrowser()
+  return await invoke('download_subtitle', {
+    url: url.trim(),
+    lang,
+    format,
+    title: title || null,
+    browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
+    deviceId: getDeviceId(),
+  })
+}
+
+/**
+ * Hộp thoại chọn thư mục lưu tệp tải về
+ */
+export async function selectDownloadDirectory() {
+  const dir = await invoke('select_download_directory')
+  if (dir) {
+    setCustomDownloadDir(dir)
+  }
+  return dir
+}
+
+export async function getDefaultDownloadDirectory() {
+  const custom = getCustomDownloadDir()
+  if (custom) return custom
+  return await invoke('get_default_download_directory')
+}
+
+export async function openDownloadFolder(filePath) {
+  if (filePath) {
+    return await invoke('open_download_folder', { path: filePath })
+  }
+  return false
+}
+
+/**
+ * Lắng nghe tiến trình % tải xuống từ Rust Core
+ */
+export function onDownloadProgress(callback) {
+  return listen('download-progress', (event) => {
+    callback?.(event.payload)
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. System Info & Browsers
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getBrowsersList() {
+  try {
+    const browsers = await invoke('get_browsers_list')
+    return { browsers }
+  } catch {
+    return null
+  }
+}
+
+export async function getSystemHealth() {
+  try {
+    return await invoke('get_system_health')
+  } catch {
+    return null
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Download History
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getDownloadHistory(limit = 30) {
+  const deviceId = getDeviceId()
+  try {
+    const list = await invoke('get_download_history', {
+      limit: Number(limit) || 30,
+      deviceId,
+    })
+    return { total: list?.length || 0, history: list || [] }
   } catch {
     return { total: 0, history: [] }
   }
 }
 
-/**
- * Xóa lịch sử tải xuống của thiết bị hiện tại
- * DELETE /api/media/history
- */
 export async function clearDownloadHistory() {
+  const deviceId = getDeviceId()
   try {
-    const deviceId = getDeviceId()
-    const response = await fetch(`${API_BASE}/api/media/history?deviceId=${deviceId}`, {
-      method: 'DELETE',
-      headers: { 'x-device-id': deviceId },
-    })
-    if (!response.ok) return { success: false }
-    return await response.json()
+    const ok = await invoke('clear_download_history', { deviceId })
+    return { success: Boolean(ok) }
   } catch {
     return { success: false }
   }
 }
 
-/**
- * Giải mã liên kết rút gọn và xác thực nền tảng trên backend
- * POST /api/media/resolve-url
- */
-export async function resolveShortUrl(url, expectedPlatform = null) {
-  const response = await fetch(`${API_BASE}/api/media/resolve-url`, {
-    method: 'POST',
-    headers: getDefaultHeaders(),
-    body: JSON.stringify({
-      url: url.trim(),
-      expectedPlatform: expectedPlatform || undefined,
-    }),
-  })
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}))
-    throw new Error(errorData.message || `Lỗi khi giải mã URL (${response.status})`)
-  }
-
-  return await response.json()
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// 9. Cookie Manager
+// 7. Cookie Manager — Native (thay thế toàn bộ /api/media/cookies)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Lưu cookie của một nền tảng từ chuỗi DevTools
- * POST /api/media/cookies
- */
-export async function savePlatformCookies(platform, cookieString, domain = null) {
-  const response = await fetch(`${API_BASE}/api/media/cookies`, {
-    method: 'POST',
-    headers: getDefaultHeaders(),
-    body: JSON.stringify({ platform, cookieString, domain: domain || undefined }),
-  })
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}))
-    throw new Error(errorData.message || 'Lỗi khi lưu cookie')
+export async function savePlatformCookies(platform, cookieString) {
+  try {
+    return await invoke('save_platform_cookies', { platform, cookieString })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi lưu cookie', { cause: err })
   }
-  return await response.json()
 }
 
-/**
- * Lấy trạng thái cookies đã lưu (không trả giá trị thực)
- * GET /api/media/cookies
- */
 export async function getCookieStatus() {
-  const response = await fetch(`${API_BASE}/api/media/cookies`, {
-    headers: { 'x-device-id': getDeviceId() },
-  })
-  if (!response.ok) return null
-  return await response.json()
-}
-
-/**
- * Lấy danh sách nền tảng được hỗ trợ với thông tin cookie cần thiết
- * GET /api/media/cookies/platforms
- */
-export async function getSupportedCookiePlatforms() {
-  const response = await fetch(`${API_BASE}/api/media/cookies/platforms`, {
-    headers: { 'x-device-id': getDeviceId() },
-  })
-  if (!response.ok) return []
-  return await response.json()
-}
-
-/**
- * Xóa cookie theo domain hoặc toàn bộ
- * DELETE /api/media/cookies
- */
-export async function deletePlatformCookies(domain = null) {
-  const url = domain
-    ? `${API_BASE}/api/media/cookies?domain=${encodeURIComponent(domain)}`
-    : `${API_BASE}/api/media/cookies`
-  const response = await fetch(url, {
-    method: 'DELETE',
-    headers: { 'x-device-id': getDeviceId() },
-  })
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}))
-    throw new Error(errorData.message || 'Lỗi khi xóa cookie')
+  try {
+    return await invoke('get_cookie_status')
+  } catch {
+    return null
   }
-  return await response.json()
 }
 
+export async function getSupportedCookiePlatforms() {
+  try {
+    return await invoke('get_supported_cookie_platforms')
+  } catch {
+    return []
+  }
+}
+
+export async function deletePlatformCookies(platform = null) {
+  try {
+    return await invoke('delete_platform_cookies', {
+      platform: platform || null,
+    })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi xóa cookie', { cause: err })
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Proxy & Direct / Album Download — Native Desktop (không bị CORS/403)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function buildProxyImageUrl(rawUrl) {
+  return rawUrl || ''
+}
+
+export function buildProxyMediaUrl(mediaUrl) {
+  return mediaUrl || ''
+}
+
+/**
+ * Tải một tệp ảnh trực tiếp về thư mục Downloads với header chống chặn 403
+ */
+export async function downloadDirectFile({ url, filename, referer, destDir }) {
+  const customDir = destDir || getCustomDownloadDir() || null
+  return await invoke('download_direct_file', {
+    url: url.trim(),
+    filename: filename || null,
+    referer: referer || null,
+    destDir: customDir,
+    deviceId: getDeviceId(),
+  })
+}
+
+/**
+ * Tải album nhiều ảnh hoặc đóng gói thành file ZIP native trên máy
+ */
+export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, asZip = false }) {
+  const customDir = destDir || getCustomDownloadDir() || null
+  return await invoke('download_album_batch', {
+    items: items.map((it) => ({
+      url: it.url,
+      filename: it.filename || it.title || null,
+      referer: it.referer || null,
+    })),
+    albumName: albumName || 'Album_Media',
+    destDir: customDir,
+    asZip: Boolean(asZip),
+    deviceId: getDeviceId(),
+  })
+}
+
+/**
+ * ZIP download: Trong Tauri dùng Native Rust (nhanh, chống 403, lưu trực tiếp ổ cứng).
+ * Nếu chạy web thuần thì fallback sang JSZip.
+ */
+export async function downloadZipArchive(items, zipName = 'Album_Media', onProgress) {
+  if (isTauri()) {
+    onProgress?.({ receivedBytes: 1, total: items.length })
+    const res = await downloadAlbumBatch({
+      items,
+      albumName: zipName,
+      asZip: true,
+    })
+    onProgress?.({ receivedBytes: items.length, total: items.length })
+    return res
+  }
+
+  // Dynamic import JSZip cho fallback browser
+  let JSZip
+  try {
+    const mod = await import('jszip')
+    JSZip = mod.default
+  } catch (err) {
+    throw new Error('JSZip chưa được cài. Chạy: pnpm add jszip', { cause: err })
+  }
+
+  const zip = new JSZip()
+  const folder = zip.folder(zipName)
+  let done = 0
+
+  await Promise.all(
+    items.map(async (item) => {
+      try {
+        const res = await fetch(item.url)
+        if (!res.ok) return
+        const blob = await res.blob()
+        const ext = item.ext || 'jpg'
+        const filename = `${item.title || `media_${done + 1}`}.${ext}`
+        folder.file(filename, blob)
+      } catch {
+        // skip failed items
+      } finally {
+        done++
+        onProgress?.({ receivedBytes: done, total: items.length })
+      }
+    })
+  )
+
+  const content = await zip.generateAsync({ type: 'blob' })
+  const downloadUrl = URL.createObjectURL(content)
+  const a = document.createElement('a')
+  a.href = downloadUrl
+  a.download = `${zipName}.zip`
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  setTimeout(() => URL.revokeObjectURL(downloadUrl), 5000)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Binary Manager — kiểm tra và cập nhật yt-dlp, gallery-dl, ffmpeg
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getBinaryStatus() {
+  try {
+    return await invoke('get_binary_status')
+  } catch {
+    return null
+  }
+}
+
+export async function updateYtdlp() {
+  return await invoke('update_ytdlp')
+}
+
+export async function updateGalleryDl() {
+  return await invoke('update_gallery_dl')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. App Settings — đọc/ghi cấu hình ~/.config/crwl/settings.json
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getAppSettings() {
+  try {
+    return await invoke('get_app_settings')
+  } catch {
+    return null
+  }
+}
+
+export async function saveAppSettings(settings) {
+  return await invoke('save_app_settings', { settings })
+}

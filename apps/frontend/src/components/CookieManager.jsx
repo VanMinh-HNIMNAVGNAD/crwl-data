@@ -127,12 +127,22 @@ export default function CookieManager({ isOpen, onClose }) {
     try {
       const s = await getCookieStatus()
       setStatus(s)
-    } catch {}
+    } catch (err) {
+      void err
+    }
   }
 
   useEffect(() => {
+    let active = true
     if (isOpen) {
-      loadStatus()
+      getCookieStatus()
+        .then((s) => {
+          if (active) setStatus(s)
+        })
+        .catch(() => {})
+    }
+    return () => {
+      active = false
     }
   }, [isOpen])
 

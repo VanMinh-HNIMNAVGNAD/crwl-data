@@ -6,19 +6,15 @@
   "engines": {
     "node": ">=22.12.0"
   },
-  "description": "Fullstack Social Media Crawler Monorepo",
+  "description": "Social Media Crawler — Tauri 2 Desktop App (React + Rust Native)",
   "scripts": {
-    "dev": "pnpm -r --parallel run dev",
-    "dev:frontend": "pnpm --filter frontend dev",
-    "dev:backend": "pnpm --filter backend dev",
-    "build": "pnpm -r run build",
-    "build:frontend": "pnpm --filter frontend build",
-    "build:backend": "pnpm --filter backend build",
-    "lint:frontend": "pnpm --filter frontend lint",
-    "lint:backend": "pnpm --filter backend lint",
-    "repomix:backend": "repomix --config repomix.backend.config.json",
-    "repomix:frontend": "repomix --config repomix.frontend.config.json",
-    "repomix": "pnpm run repomix:backend && pnpm run repomix:frontend"
+    "dev": "pnpm --filter frontend dev",
+    "dev:tauri": "pnpm --filter frontend tauri dev",
+    "build": "pnpm --filter frontend build",
+    "build:tauri": "pnpm --filter frontend tauri build",
+    "lint": "pnpm --filter frontend lint",
+    "test:core": "python3 scripts/test_desktop_system.py",
+    "repomix": "repomix --config repomix.frontend.config.json"
   },
   "keywords": [],
   "author": "",

@@ -61,9 +61,21 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
 
   // Tự động tải dữ liệu khi mở modal
   useEffect(() => {
+    let active = true
     if (isOpen) {
-      setConfirmClear(false)
-      loadHistory()
+      getDownloadHistory(50)
+        .then((res) => {
+          if (active) {
+            setConfirmClear(false)
+            setData(res)
+          }
+        })
+        .catch((err) => {
+          console.warn('Lỗi khi tải lịch sử:', err)
+        })
+    }
+    return () => {
+      active = false
     }
   }, [isOpen])
 

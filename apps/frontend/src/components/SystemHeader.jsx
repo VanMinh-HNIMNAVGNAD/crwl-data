@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { getBrowsersList, getActiveBrowser, setActiveBrowser, getCookieStatus } from '../services/api'
-import { IconGlobe, IconChevronDown, IconCheck, IconRefresh, IconHistory, IconShieldCheck } from './Icons'
+import { IconGlobe, IconChevronDown, IconCheck, IconRefresh, IconHistory } from './Icons'
 
-export default function SystemHeader({ onOpenHistory, onOpenCookies, isTurnstileVerified = false }) {
+export default function SystemHeader({ onOpenHistory, onOpenCookies }) {
   const [browsersData, setBrowsersData] = useState(null)
   const [selectedBrowser, setSelectedBrowser] = useState(getActiveBrowser() || '')
   const [isDropdownOpen, setIsDropdownOpen] = useState(false)
@@ -15,25 +15,40 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, isTurnstile
     setTimeout(() => setToastMsg(''), 3000)
   }
 
-  const loadData = async () => {
+
+  const handleRefreshBrowsers = async (e) => {
+    e?.stopPropagation()
+    showToast('Đang quét lại trình duyệt trên máy...')
     try {
       const [b, cs] = await Promise.all([getBrowsersList(), getCookieStatus()])
-      if (b) {
-        setBrowsersData(b)
-        if (!getActiveBrowser() && b.current) {
-          setSelectedBrowser(b.current)
-          setActiveBrowser(b.current)
-        }
-      }
+      if (b) setBrowsersData(b)
       if (cs) setCookieCount(cs.platforms?.filter((p) => p.isValid).length || 0)
     } catch (err) {
-      console.error('Lỗi khi tải thông tin hệ thống:', err)
+      console.warn('Lỗi khi làm mới trình duyệt:', err)
     }
   }
 
   useEffect(() => {
-    loadData()
-  }, [])
+    let active = true
+    Promise.all([getBrowsersList(), getCookieStatus()])
+      .then(([b, cs]) => {
+        if (!active) return
+        if (b) {
+          setBrowsersData(b)
+          if (!selectedBrowser && b.current) {
+            setSelectedBrowser(b.current)
+            setActiveBrowser(b.current)
+          }
+        }
+        if (cs) setCookieCount(cs.platforms?.filter((p) => p.isValid).length || 0)
+      })
+      .catch((err) => {
+        console.warn('Lỗi khi tải thông tin hệ thống:', err)
+      })
+    return () => {
+      active = false
+    }
+  }, [selectedBrowser])
 
   // Đóng dropdown khi click ra ngoài hoặc nhấn phím ESC
   useEffect(() => {
@@ -91,17 +106,6 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, isTurnstile
 
         {/* Trạng thái Binary & Bộ chọn Cookies Trình duyệt */}
         <div className="system-status-group">
-          {/* Turnstile Verified Badge */}
-          {isTurnstileVerified && (
-            <div className="engine-badges-container">
-              <span className="engine-status-pill" title="Phiên làm việc đã xác thực an toàn qua Cloudflare Turnstile">
-                <IconShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="engine-name" style={{ color: '#10b981' }}>Turnstile</span>
-                <span className="engine-ver">Verified</span>
-              </span>
-            </div>
-          )}
-
           {/* Browser Cookies Selector Dropdown */}
           <div className="browser-selector-wrapper" ref={browserDropdownRef}>
             <button
@@ -124,11 +128,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, isTurnstile
                   <button
                     type="button"
                     className="btn-refresh-browsers"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      loadData()
-                      showToast('Đang quét lại trình duyệt trên máy chủ...')
-                    }}
+                    onClick={handleRefreshBrowsers}
                     title="Quét lại trình duyệt"
                   >
                     <IconRefresh className="w-3.5 h-3.5" />
