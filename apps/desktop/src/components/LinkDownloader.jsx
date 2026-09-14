@@ -428,6 +428,30 @@ export default function LinkDownloader({ onShowToast }) {
     return singleMedia.streams
   }, [singleMedia, streamFilter])
 
+  const handleClearUrl = () => {
+    setUrl('')
+    setSingleMedia(null)
+    setBatchMedias([])
+    setAsyncResolved(null)
+    setSelectedImages({})
+    setNativeProgress(null)
+    setDownloadStartTime(null)
+    setDownloadTaskTitle('')
+    setDownloadingId(null)
+    setIsZipDownloading(false)
+    setIsTrimmerOpen(false)
+  }
+
+  const handleClearBatch = () => {
+    setBatchText('')
+    setBatchMedias([])
+    setSelectedImages({})
+    setNativeProgress(null)
+    setDownloadStartTime(null)
+    setDownloadingId(null)
+    setIsZipDownloading(false)
+  }
+
   const handleCopy = (text) => {
     if (!text) return
     navigator.clipboard.writeText(text)
@@ -467,14 +491,26 @@ export default function LinkDownloader({ onShowToast }) {
                 className="pane-input"
                 placeholder="Dán link YouTube, TikTok, Facebook, Instagram, phimhay.com, nhac.vn..."
                 value={url}
-                onChange={(e) => setUrl(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value
+                  setUrl(val)
+                  if (!val.trim()) {
+                    setSingleMedia(null)
+                    setBatchMedias([])
+                    setAsyncResolved(null)
+                    setSelectedImages({})
+                    setNativeProgress(null)
+                    setDownloadStartTime(null)
+                    setDownloadTaskTitle('')
+                  }
+                }}
                 disabled={isLoading}
               />
               {url ? (
                 <button
                   type="button"
                   className="input-inline-btn"
-                  onClick={() => setUrl('')}
+                  onClick={handleClearUrl}
                   title="Xóa URL"
                 >
                   <IconClose className="w-3.5 h-3.5" />
@@ -537,7 +573,16 @@ export default function LinkDownloader({ onShowToast }) {
                 className="pane-textarea"
                 placeholder="Dán danh sách liên kết, mỗi link một dòng (tối đa 10 link)..."
                 value={batchText}
-                onChange={(e) => setBatchText(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value
+                  setBatchText(val)
+                  if (!val.trim()) {
+                    setBatchMedias([])
+                    setSelectedImages({})
+                    setNativeProgress(null)
+                    setDownloadStartTime(null)
+                  }
+                }}
                 disabled={isLoading}
               />
               <div className="textarea-footer-bar">
@@ -554,7 +599,7 @@ export default function LinkDownloader({ onShowToast }) {
                     <button
                       type="button"
                       className="minimal-small-btn"
-                      onClick={() => setBatchText('')}
+                      onClick={handleClearBatch}
                     >
                       Xóa
                     </button>

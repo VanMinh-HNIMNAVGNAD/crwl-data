@@ -50,6 +50,19 @@ export default function AccountDownloader({ onShowToast }) {
     [selectedBatchIds]
   )
 
+  const handleClearAccount = () => {
+    setAccountInput('')
+    setProfileResult(null)
+    setSelectedBatchIds({})
+    setNativeProgress(null)
+    setDownloadStartTime(null)
+    setDownloadTaskTitle('')
+    setCrawlProgress(0)
+    setStatusText('')
+    setDownloadingId(null)
+    setIsZipDownloading(false)
+  }
+
   const handlePaste = async () => {
     try {
       const text = await navigator.clipboard.readText()
@@ -279,14 +292,26 @@ export default function AccountDownloader({ onShowToast }) {
               className="pane-input"
               placeholder="Nhập @username hoặc link profile TikTok, Instagram, YouTube..."
               value={accountInput}
-              onChange={(e) => setAccountInput(e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value
+                setAccountInput(val)
+                if (!val.trim()) {
+                  setProfileResult(null)
+                  setSelectedBatchIds({})
+                  setNativeProgress(null)
+                  setDownloadStartTime(null)
+                  setDownloadTaskTitle('')
+                  setCrawlProgress(0)
+                  setStatusText('')
+                }
+              }}
               disabled={isCrawling}
             />
             {accountInput ? (
               <button
                 type="button"
                 className="input-inline-btn"
-                onClick={() => setAccountInput('')}
+                onClick={handleClearAccount}
                 title="Xóa tài khoản"
               >
                 <IconClose className="w-3.5 h-3.5" />
