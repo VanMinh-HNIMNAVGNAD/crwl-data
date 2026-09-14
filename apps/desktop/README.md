@@ -10,3 +10,4 @@ This directory contains the user interface for the Social Media Crawler Linux De
 - `pnpm tauri build` (or `pnpm build:tauri` from repo root): Packages the native Linux desktop binary (`.deb`, `.AppImage`).
 - `pnpm lint`: Runs ESLint validation.
 
+Chi tiết hướng dẫn đầy đủ xem tại: [docs/guide-run-and-build.md](../../docs/guide-run-and-build.md)

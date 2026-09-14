@@ -8,6 +8,7 @@ import {
   selectDownloadDirectory,
 } from '../services/api'
 import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings } from './Icons'
+import mediaLogo from '../assets/media-record-svgrepo-com.svg'
 
 export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools }) {
   const [browsersData, setBrowsersData] = useState(null)
@@ -125,8 +126,11 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
       )}
 
       <div className="system-header-inner">
-        {/* Brand / Tiêu đề (Đã bỏ hẳn icon theo yêu cầu) */}
+        {/* Brand / Tiêu đề & Logo mới */}
         <div className="system-brand-group">
+          <div className="system-brand-logo-wrap" title="Media Downloader">
+            <img src={mediaLogo} alt="Media Downloader Logo" className="system-brand-logo" />
+          </div>
           <h1 className="system-brand-title">Media Downloader</h1>
         </div>
 
