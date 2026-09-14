@@ -208,6 +208,8 @@ class MediaDispatcher(BaseExtractor):
                 target_url = f"https://www.tiktok.com/@{username}"
             elif clean_hint == "instagram":
                 target_url = f"https://www.instagram.com/{username}/reels/" if media_type == "video" else f"https://www.instagram.com/{username}/posts/"
+            elif clean_hint in ("facebook", "fb"):
+                target_url = f"https://www.facebook.com/{username}/photos"
             elif clean_hint == "pinterest":
                 target_url = f"https://www.pinterest.com/{username}/"
             elif clean_hint == "reddit":
@@ -225,6 +227,9 @@ class MediaDispatcher(BaseExtractor):
         resolved = self.resolver.resolve_url(target_url)
         if resolved.is_shortened:
             target_url = resolved.resolved_url
+
+        # Chuẩn hóa URL Facebook: chuyển profile/groups thông thường sang URL gallery-dl hỗ trợ
+        target_url = self._normalize_facebook_url(target_url, media_type)
 
         is_youtube = clean_hint == "youtube" or any(d in target_url for d in ("youtube.com", "youtu.be", "/playlist"))
         is_tiktok = clean_hint == "tiktok" or "tiktok.com" in target_url
@@ -289,6 +294,7 @@ class MediaDispatcher(BaseExtractor):
             raise RuntimeError(f"Không thể quét tài khoản TikTok từ {target_url}")
 
         # Mạng xã hội hình ảnh (Instagram, Pinterest, Reddit, Twitter...) -> gallery-dl
+        gal_err_saved: Optional[Exception] = None
         try:
             self.log(f"Quét profile mạng xã hội qua gallery-dl: {target_url}")
             res = self.gallery.crawl_profile(
@@ -301,15 +307,28 @@ class MediaDispatcher(BaseExtractor):
             )
             if res.media:
                 return res
+            # gallery-dl thành công nhưng trả về rỗng (không có exception)
+            # → lưu lại để fallback bên dưới xử lý
+            gal_err_saved = RuntimeError(f"gallery-dl không tìm thấy media từ {target_url}")
         except Exception as gal_err:
-            if "facebook.com" in target_url:
-                self.warn(f"Facebook gallery-dl thất bại ({gal_err}), yt-dlp fallback...")
-                try:
-                    return self.ytdlp.extract_playlist(target_url, limit=limit, browser=browser)
-                except Exception:
-                    pass
-            raise gal_err
+            gal_err_saved = gal_err
 
+        # Fallback yt-dlp cho Facebook (Groups, Profile, Page...)
+        if "facebook.com" in target_url or "fb.com" in target_url:
+            self.warn(f"Facebook gallery-dl thất bại ({gal_err_saved}), yt-dlp fallback...")
+            try:
+                return self.ytdlp.extract_playlist(
+                    target_url,
+                    limit=limit,
+                    browser=browser,
+                    from_item=range_start,
+                    to_item=range_end,
+                )
+            except Exception as yt_err:
+                self.warn(f"Facebook yt-dlp cũng thất bại: {yt_err}")
+
+        if gal_err_saved:
+            raise gal_err_saved
         raise RuntimeError(f"Không tìm thấy tệp phương tiện nào từ {target_url}")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -377,6 +396,59 @@ class MediaDispatcher(BaseExtractor):
             description=f"🔍 Phát hiện {len(streams)} nguồn stream qua network interceptor.",
             streams=streams,
         )
+
+    @staticmethod
+    def _normalize_facebook_url(url: str, media_type: str = "all") -> str:
+        """
+        Chuyển đổi URL Facebook profile/groups sang URL mà gallery-dl hỗ trợ.
+
+        gallery-dl hỗ trợ:
+          - facebook.com/USERNAME/photos          (ảnh)
+          - facebook.com/USERNAME/photos_albums   (albums)
+          - facebook.com/USERNAME/videos          (video - thường thất bại, dùng yt-dlp)
+        gallery-dl KHÔNG hỗ trợ:
+          - facebook.com/USERNAME/               (timeline chung)
+          - facebook.com/groups/GROUP_ID/        (groups)
+          - facebook.com/profile.php?id=...      (profile ID)
+        """
+        import re
+        if "facebook.com" not in url.lower() and "fb.com" not in url.lower():
+            return url
+
+        lower = url.lower()
+
+        # Đã có subpath cụ thể mà gallery-dl hỗ trợ → giữ nguyên
+        supported_paths = ("/photos", "/photos_albums", "/avatar", "/videos")
+        if any(p in lower for p in supported_paths):
+            return url
+
+        # Groups URL → giữ nguyên để yt-dlp xử lý (gallery-dl không hỗ trợ)
+        if "/groups/" in lower:
+            return url
+
+        # profile.php?id=... → giữ nguyên
+        if "profile.php" in lower:
+            return url
+
+        # Các URL có dạng facebook.com/USERNAME hoặc facebook.com/USERNAME/
+        # Chuyển sang /photos hoặc /videos tùy media_type
+        match = re.match(
+            r"(https?://(?:www\.)?facebook\.com/)([^/?#]+)(?:/)?$",
+            url,
+            re.IGNORECASE,
+        )
+        if match:
+            base = match.group(1)
+            username = match.group(2)
+            # Bỏ qua các path đặc biệt của Facebook
+            if username.lower() in ("watch", "reel", "reels", "groups", "pages", "marketplace", "gaming", "events"):
+                return url
+            if media_type == "video":
+                return f"{base}{username}/videos"
+            else:
+                return f"{base}{username}/photos"
+
+        return url
 
     @staticmethod
     def _enhance_metadata(res: MediaMetadata, url: str) -> MediaMetadata:
