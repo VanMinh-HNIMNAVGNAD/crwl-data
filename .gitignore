@@ -159,3 +159,7 @@ Thumbs.db
 *.sublime-workspace
 *.sublime-project
 *.sw?
+
+.agents
+.agents/
+.agents/rules
