@@ -155,8 +155,8 @@ pnpm tauri build
 ```
 
 Sau khi hoàn thành, file thành phẩm sẽ nằm tại:
-* **AppImage:** `apps/frontend/src-tauri/target/release/bundle/appimage/*.AppImage`
-* **Deb:** `apps/frontend/src-tauri/target/release/bundle/deb/*_amd64.deb`
+* **AppImage:** `apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage`
+* **Deb:** `apps/desktop/src-tauri/target/release/bundle/deb/*_amd64.deb`
 
 ### 5.3. Cách Chạy Thật
 * **Với AppImage:**

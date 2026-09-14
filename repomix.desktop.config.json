@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/yamadashy/repomix/main/repomix.schema.json",
   "output": {
-    "filePath": "repomix-frontend-output.xml",
+    "filePath": "repomix-desktop-output.xml",
     "style": "xml",
     "removeComments": false,
     "removeEmptyLines": false,
@@ -9,7 +9,7 @@
     "showLineNumbers": false
   },
   "include": [
-    "apps/frontend/**/*"
+    "apps/desktop/**/*"
   ],
   "ignore": {
     "useGitignore": true,

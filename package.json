@@ -8,13 +8,13 @@
   },
   "description": "Social Media Crawler — Tauri 2 Desktop App (React + Rust Native)",
   "scripts": {
-    "dev": "pnpm --filter frontend dev",
-    "dev:tauri": "pnpm --filter frontend tauri dev",
-    "build": "pnpm --filter frontend build",
-    "build:tauri": "pnpm --filter frontend tauri build",
-    "lint": "pnpm --filter frontend lint",
+    "dev": "pnpm --filter desktop dev",
+    "dev:tauri": "pnpm --filter desktop tauri dev",
+    "build": "pnpm --filter desktop build",
+    "build:tauri": "pnpm --filter desktop tauri build",
+    "lint": "pnpm --filter desktop lint",
     "test:core": "python3 scripts/test_desktop_system.py",
-    "repomix": "repomix --config repomix.frontend.config.json"
+    "repomix": "repomix --config repomix.desktop.config.json"
   },
   "keywords": [],
   "author": "",

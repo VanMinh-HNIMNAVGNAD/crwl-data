@@ -3,19 +3,49 @@ import {
   IconDownload,
   IconClose,
   IconPaste,
-  IconTrash,
-  IconSparkles,
+  IconScissors,
+  IconSubtitle,
+  IconZip,
+  IconVideo,
+  IconAudio,
+  IconCopy,
 } from './Icons'
 import { FORMAT_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform } from '../constants'
-import { extractMedia, resolveShortUrl } from '../services/api'
+import {
+  extractMedia,
+  resolveShortUrl,
+  isTauri,
+  startNativeDownload,
+  downloadThumbnail,
+  downloadSubtitle,
+  downloadZipArchive,
+  downloadDirectFile,
+  onDownloadProgress,
+  buildProxyMediaUrl,
+  buildProxyImageUrl,
+} from '../services/api'
 
-export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isGlobalLoading, onShowToast }) {
+export default function LinkDownloader({ onShowToast }) {
   const [mode, setMode] = useState('single') // 'single' | 'batch'
   const [url, setUrl] = useState('')
   const [batchText, setBatchText] = useState('')
   const [selectedFormat, setSelectedFormat] = useState('all')
   const [isLoading, setIsLoading] = useState(false)
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, statusText: '' })
+
+  // Kết quả sau khi phân tích
+  const [singleMedia, setSingleMedia] = useState(null)
+  const [batchMedias, setBatchMedias] = useState([])
+  const [streamFilter, setStreamFilter] = useState('all') // 'all' | 'full' | 'mute' | 'audio'
+  const [selectedImages, setSelectedImages] = useState({})
+  const [downloadingId, setDownloadingId] = useState(null)
+  const [nativeProgress, setNativeProgress] = useState(null)
+  const [isZipDownloading, setIsZipDownloading] = useState(false)
+
+  // Trimmer tool state
+  const [isTrimmerOpen, setIsTrimmerOpen] = useState(false)
+  const [trimStart, setTrimStart] = useState('')
+  const [trimEnd, setTrimEnd] = useState('')
 
   // Synchronous validation state computed from URL
   const trimmedUrl = url.trim()
@@ -39,7 +69,6 @@ export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isG
 
   const [asyncResolved, setAsyncResolved] = useState(null)
 
-  // Asynchronously resolve shortened links
   useEffect(() => {
     if (syncValidation.status === 'needs_resolve') {
       let active = true
@@ -74,7 +103,6 @@ export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isG
   const validationState = asyncResolved && syncValidation.status === 'needs_resolve' ? asyncResolved : syncValidation
   const resolvedUrl = asyncResolved?.resolvedUrl || trimmedUrl
 
-  // Phân tích danh sách link hàng loạt
   const parsedBatchLinks = useMemo(() => {
     return batchText
       .split('\n')
@@ -83,7 +111,6 @@ export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isG
       .slice(0, 10)
   }, [batchText])
 
-  // Dán từ Clipboard
   const handlePaste = async (targetMode) => {
     try {
       const text = await navigator.clipboard.readText()
@@ -96,11 +123,10 @@ export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isG
         onShowToast?.('Đã dán liên kết từ bộ nhớ tạm')
       }
     } catch {
-      onShowToast?.('Vui lòng cấp quyền đọc clipboard hoặc dùng Ctrl+V')
+      onShowToast?.('Vui lòng dùng phím tắt Ctrl+V để dán')
     }
   }
 
-  // Xử lý trích xuất 1 liên kết
   const handleSingleExtract = async (e) => {
     e?.preventDefault()
     const targetUrl = (resolvedUrl || url).trim()
@@ -113,26 +139,26 @@ export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isG
     try {
       const data = await extractMedia(targetUrl)
       if (data) {
-        onMediaExtracted?.(data)
-        onShowToast?.(`Đã trích xuất thành công: ${data.title?.slice(0, 35)}...`)
+        setSingleMedia(data)
+        setBatchMedias([])
+        onShowToast?.(`Đã trích xuất: ${data.title?.slice(0, 30) || 'Thành công'}...`)
       }
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi trích xuất thông tin liên kết')
+      onShowToast?.(err.message || 'Lỗi khi trích xuất liên kết')
     } finally {
       setIsLoading(false)
     }
   }
 
-  // Xử lý bóc tách nhiều liên kết
   const handleBatchExtract = async (e) => {
     e?.preventDefault()
     if (parsedBatchLinks.length === 0) {
-      onShowToast?.('Vui lòng nhập ít nhất 1 đường dẫn hợp lệ!')
+      onShowToast?.('Vui lòng nhập ít nhất 1 liên kết!')
       return
     }
 
     setIsLoading(true)
-    setBatchProgress({ current: 0, total: parsedBatchLinks.length, statusText: 'Đang chuẩn bị...' })
+    setBatchProgress({ current: 0, total: parsedBatchLinks.length, statusText: 'Đang bắt đầu...' })
 
     const results = []
     for (let i = 0; i < parsedBatchLinks.length; i++) {
@@ -140,13 +166,13 @@ export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isG
       setBatchProgress({
         current: i + 1,
         total: parsedBatchLinks.length,
-        statusText: `Đang xử lý liên kết ${i + 1}/${parsedBatchLinks.length}...`,
+        statusText: `Đang xử lý ${i + 1}/${parsedBatchLinks.length}...`,
       })
       try {
         const item = await extractMedia(link)
         if (item) results.push(item)
       } catch (err) {
-        console.warn(`Lỗi bóc tách link ${link}:`, err)
+        console.warn(`Lỗi bóc tách ${link}:`, err)
       }
     }
 
@@ -154,37 +180,193 @@ export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isG
     setBatchProgress({ current: 0, total: 0, statusText: '' })
 
     if (results.length > 0) {
-      onBatchExtracted?.(results)
-      onShowToast?.(`Đã giải mã thành công ${results.length}/${parsedBatchLinks.length} liên kết!`)
+      setBatchMedias(results)
+      setSingleMedia(null)
+      onShowToast?.(`Giải mã thành công ${results.length}/${parsedBatchLinks.length} liên kết!`)
     } else {
       onShowToast?.('Không thể giải mã các liên kết đã nhập.')
     }
   }
 
-  return (
-    <div className="panel-card panel-left-link">
-      {/* Header của Panel */}
-      <div className="panel-card-header">
-        <div className="panel-title-area">
-          <div className="panel-badge-num">01</div>
-          <div>
-            <h2 className="panel-title">Tải theo liên kết</h2>
-            <p className="panel-subtitle">Hỗ trợ tải 1 bài viết hoặc danh sách tối đa 10 link</p>
-          </div>
-        </div>
+  // Tải stream video/audio đơn
+  const handleDownloadStream = async (stream) => {
+    if (!singleMedia) return
+    const streamId = stream.formatId || stream.quality || 'stream'
+    setDownloadingId(streamId)
+    try {
+      const isAudioOnly = stream.streamType === 'audio'
+      const isMute = stream.streamType === 'mute'
+      onShowToast?.(`Đang tải: ${stream.quality || 'tệp'}`)
 
-        {/* Tab chuyển đổi 1 link vs Nhiều link */}
-        <div className="mode-toggle-group">
+      let unlisten = null
+      try {
+        unlisten = await onDownloadProgress((payload) => {
+          setNativeProgress(payload)
+        })
+      } catch (e) {
+        console.warn('Cannot attach progress listener:', e)
+      }
+
+      const res = await startNativeDownload({
+        url: singleMedia.originalUrl,
+        formatId: stream.formatId,
+        isAudio: isAudioOnly,
+        isMute: isMute,
+        startTime: trimStart || undefined,
+        endTime: trimEnd || undefined,
+        title: singleMedia.title,
+      })
+
+      if (typeof unlisten === 'function') unlisten()
+
+      if (res && res.file_name) {
+        onShowToast?.(`Đã tải xong: ${res.file_name}`)
+      }
+    } catch (err) {
+      onShowToast?.(err.message || 'Lỗi khi tải stream')
+    } finally {
+      setTimeout(() => {
+        setDownloadingId(null)
+        setNativeProgress(null)
+      }, 1500)
+    }
+  }
+
+  // Tải thumbnail
+  const handleDownloadThumbnail = async () => {
+    if (!singleMedia) return
+    try {
+      onShowToast?.('Đang tải ảnh thumbnail...')
+      const res = await downloadThumbnail({
+        url: singleMedia.originalUrl,
+        title: singleMedia.title,
+      })
+      if (res?.file_name) {
+        onShowToast?.(`Đã lưu thumbnail: ${res.file_name}`)
+      }
+    } catch (err) {
+      onShowToast?.(err.message || 'Lỗi khi tải thumbnail')
+    }
+  }
+
+  // Tải phụ đề
+  const handleDownloadSubtitle = async (sub) => {
+    if (!singleMedia) return
+    try {
+      onShowToast?.(`Đang tải phụ đề: ${sub.name || sub.lang}...`)
+      const res = await downloadSubtitle({
+        url: singleMedia.originalUrl,
+        lang: sub.lang,
+        title: singleMedia.title,
+      })
+      if (res?.file_name) {
+        onShowToast?.(`Đã lưu phụ đề: ${res.file_name}`)
+      }
+    } catch (err) {
+      onShowToast?.(err.message || 'Lỗi khi tải phụ đề')
+    }
+  }
+
+  // Tải ảnh album đơn lẻ
+  const handleDownloadImage = async (img) => {
+    try {
+      if (isTauri()) {
+        onShowToast?.(`Đang tải ảnh: ${img.title || 'photo'}...`)
+        const res = await downloadDirectFile({
+          url: img.url,
+          filename: `${img.title || 'photo'}.${img.ext || 'jpg'}`,
+          referer: singleMedia?.originalUrl,
+        })
+        if (res?.file_name) {
+          onShowToast?.(`Đã lưu: ${res.file_name}`)
+        }
+        return
+      }
+      const directUrl = buildProxyMediaUrl(img.url)
+      const a = document.createElement('a')
+      a.href = directUrl
+      a.download = `${img.title || 'photo'}.${img.ext || 'jpg'}`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      onShowToast?.('Bắt đầu tải ảnh')
+    } catch (err) {
+      onShowToast?.(err.message || 'Lỗi khi tải ảnh')
+    }
+  }
+
+  const albumImages = useMemo(() => singleMedia?.images || [], [singleMedia])
+  const selectedImageCount = useMemo(
+    () => Object.values(selectedImages).filter(Boolean).length,
+    [selectedImages]
+  )
+
+  const handleToggleSelectAllImages = () => {
+    if (selectedImageCount === albumImages.length) {
+      setSelectedImages({})
+    } else {
+      const all = {}
+      albumImages.forEach((img) => {
+        all[img.id] = true
+      })
+      setSelectedImages(all)
+    }
+  }
+
+  const handleDownloadAlbumZip = async () => {
+    const itemsToDownload = albumImages.filter((img) => selectedImages[img.id])
+    if (itemsToDownload.length === 0) {
+      onShowToast?.('Vui lòng chọn ít nhất 1 ảnh để tải ZIP')
+      return
+    }
+
+    setIsZipDownloading(true)
+    try {
+      const zipPayload = itemsToDownload.map((img) => ({
+        url: img.url,
+        filename: `${img.title || 'image'}.${img.ext || 'jpg'}`,
+        referer: singleMedia?.originalUrl,
+      }))
+      await downloadZipArchive(zipPayload, `${singleMedia?.title || 'Album'}_Media`)
+      onShowToast?.(`Đã tải file ZIP (${itemsToDownload.length} ảnh)!`)
+    } catch (err) {
+      onShowToast?.(err.message || 'Lỗi khi tạo file ZIP')
+    } finally {
+      setIsZipDownloading(false)
+    }
+  }
+
+  const filteredStreams = useMemo(() => {
+    if (!singleMedia?.streams) return []
+    if (streamFilter === 'all') return singleMedia.streams
+    if (streamFilter === 'full') return singleMedia.streams.filter((s) => s.streamType === 'full')
+    if (streamFilter === 'mute') return singleMedia.streams.filter((s) => s.streamType === 'mute')
+    if (streamFilter === 'audio') return singleMedia.streams.filter((s) => s.streamType === 'audio')
+    return singleMedia.streams
+  }, [singleMedia, streamFilter])
+
+  const handleCopy = (text) => {
+    if (!text) return
+    navigator.clipboard.writeText(text)
+    onShowToast?.('Đã sao chép liên kết vào bộ nhớ tạm')
+  }
+
+  return (
+    <div className="downloader-pane">
+      {/* Header khu vực Tải theo liên kết */}
+      <div className="pane-header">
+        <h2 className="pane-title">Tải theo liên kết</h2>
+        <div className="pane-toggle-group">
           <button
             type="button"
-            className={`mode-toggle-btn ${mode === 'single' ? 'active' : ''}`}
+            className={`pane-toggle-btn ${mode === 'single' ? 'active' : ''}`}
             onClick={() => setMode('single')}
           >
             1 Liên kết
           </button>
           <button
             type="button"
-            className={`mode-toggle-btn ${mode === 'batch' ? 'active' : ''}`}
+            className={`pane-toggle-btn ${mode === 'batch' ? 'active' : ''}`}
             onClick={() => setMode('batch')}
           >
             Nhiều link ({parsedBatchLinks.length}/10)
@@ -192,185 +374,481 @@ export default function LinkDownloader({ onMediaExtracted, onBatchExtracted, isG
         </div>
       </div>
 
-      {/* Thân nhập liệu */}
-      <div className="panel-card-body">
+      {/* Form nhập liệu */}
+      <div className="pane-input-section">
         {mode === 'single' ? (
-          <form onSubmit={handleSingleExtract} className="form-stack">
-            {/* Hàng 1: Input URL đơn */}
-            <div className="input-with-actions">
+          <form onSubmit={handleSingleExtract} className="pane-form">
+            <div className="input-group">
               <input
                 type="text"
-                className="clean-input"
-                placeholder="Dán liên kết YouTube, TikTok, Facebook, Instagram, X, Pinterest..."
+                className="pane-input"
+                placeholder="Dán link YouTube, TikTok, Facebook, Instagram, X, Pinterest..."
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                disabled={isLoading || isGlobalLoading}
+                disabled={isLoading}
               />
               {url ? (
                 <button
                   type="button"
-                  className="icon-tool-btn"
+                  className="input-inline-btn"
                   onClick={() => setUrl('')}
                   title="Xóa URL"
                 >
-                  <IconClose className="w-4 h-4" />
+                  <IconClose className="w-3.5 h-3.5" />
                 </button>
               ) : (
                 <button
                   type="button"
-                  className="icon-tool-btn"
+                  className="input-inline-btn"
                   onClick={() => handlePaste('single')}
                   title="Dán từ bộ nhớ tạm"
                 >
-                  <IconPaste className="w-4 h-4" />
+                  <IconPaste className="w-3.5 h-3.5" />
                 </button>
               )}
             </div>
 
-            {/* Hàng 2: Tùy chọn định dạng & Trạng thái phân tích */}
-            <div className="config-grid-row">
-              <div className="limit-selector-container">
-                <span className="control-label">Định dạng:</span>
-                <div className="format-pills">
-                  {FORMAT_OPTIONS.slice(0, 3).map((f) => (
-                    <button
-                      key={f.id}
-                      type="button"
-                      className={`format-pill ${selectedFormat === f.id ? 'active' : ''}`}
-                      onClick={() => setSelectedFormat(f.id)}
-                    >
-                      {f.label}
-                    </button>
-                  ))}
-                </div>
+            <div className="pane-control-row">
+              <div className="pills-group">
+                {FORMAT_OPTIONS.slice(0, 3).map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className={`minimal-pill ${selectedFormat === f.id ? 'active' : ''}`}
+                    onClick={() => setSelectedFormat(f.id)}
+                  >
+                    {f.label}
+                  </button>
+                ))}
               </div>
 
-              {validationState.message ? (
-                <div className={`validation-status-text ${validationState.status === 'matched' ? 'status-ok' : ''}`}>
+              {validationState.message && (
+                <span className={`validation-hint ${validationState.status === 'matched' ? 'status-ok' : ''}`}>
                   {validationState.message}
-                </div>
-              ) : (
-                <span className="action-hint">Tự động nhận diện nền tảng</span>
+                </span>
               )}
-            </div>
-
-            {/* Hàng 3: Gợi ý và Nút hành động */}
-            <div className="action-row">
-              <span className="action-hint">
-                Hỗ trợ tải Video 4K, MP3, Reels, Shorts, Album ảnh
-              </span>
 
               <button
                 type="submit"
-                className="primary-action-btn"
-                disabled={!url.trim() || isLoading || isGlobalLoading}
+                className="pane-submit-btn"
+                disabled={isLoading || !url.trim()}
               >
                 {isLoading ? (
                   <>
-                    <span className="clean-spinner" />
-                    <span>Đang phân tích...</span>
+                    <span className="minimal-spinner" />
+                    <span>Đang bóc tách...</span>
                   </>
                 ) : (
                   <>
-                    <IconSparkles className="w-4 h-4" />
-                    <span>Trích xuất liên kết</span>
+                    <IconDownload className="w-3.5 h-3.5" />
+                    <span>Phân tích &amp; Tải</span>
                   </>
                 )}
               </button>
             </div>
           </form>
         ) : (
-          <form onSubmit={handleBatchExtract} className="form-stack">
-            {/* Hàng 1: Textarea danh sách link */}
-            <div className="textarea-container">
+          <form onSubmit={handleBatchExtract} className="pane-form">
+            <div className="batch-textarea-wrap">
               <textarea
-                className="clean-textarea"
-                rows={2}
-                placeholder="Điền mỗi dòng 1 liên kết (Tối đa 10 link cùng lúc)...&#10;https://www.youtube.com/watch?v=...&#10;https://www.tiktok.com/@user/video/..."
+                className="pane-textarea"
+                placeholder="Dán danh sách liên kết, mỗi link một dòng (tối đa 10 link)..."
                 value={batchText}
                 onChange={(e) => setBatchText(e.target.value)}
-                disabled={isLoading || isGlobalLoading}
+                disabled={isLoading}
               />
-              <div className="textarea-footer">
-                <span className="batch-counter">
-                  Đã nhận diện: <strong>{parsedBatchLinks.length}</strong> / 10 liên kết
-                </span>
-                <div className="textarea-actions">
+              <div className="textarea-footer-bar">
+                <span>{parsedBatchLinks.length}/10 link hợp lệ</span>
+                <div className="textarea-footer-actions">
                   <button
                     type="button"
-                    className="btn-tiny"
+                    className="minimal-small-btn"
                     onClick={() => handlePaste('batch')}
-                    title="Dán thêm link"
                   >
-                    <IconPaste className="w-3.5 h-3.5" /> Dán
+                    Dán thêm
                   </button>
                   {batchText && (
                     <button
                       type="button"
-                      className="btn-tiny"
+                      className="minimal-small-btn"
                       onClick={() => setBatchText('')}
-                      title="Xóa trắng"
                     >
-                      <IconTrash className="w-3.5 h-3.5" /> Xóa
+                      Xóa
                     </button>
                   )}
                 </div>
               </div>
             </div>
 
-            {/* Hàng 2: Tùy chọn định dạng & Trạng thái bóc tách hàng loạt */}
-            <div className="config-grid-row">
-              <div className="limit-selector-container">
-                <span className="control-label">Định dạng:</span>
-                <div className="format-pills">
-                  {FORMAT_OPTIONS.slice(0, 3).map((f) => (
-                    <button
-                      key={f.id}
-                      type="button"
-                      className={`format-pill ${selectedFormat === f.id ? 'active' : ''}`}
-                      onClick={() => setSelectedFormat(f.id)}
-                    >
-                      {f.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {isLoading && batchProgress.total > 0 ? (
-                <div className="progress-mini-label">
-                  <span>{batchProgress.statusText}</span>
-                  <strong>{Math.round((batchProgress.current / batchProgress.total) * 100)}%</strong>
-                </div>
-              ) : (
-                <span className="action-hint">Phân tích song song tối đa 10 liên kết</span>
+            <div className="pane-control-row">
+              {batchProgress.statusText && (
+                <span className="validation-hint">{batchProgress.statusText}</span>
               )}
-            </div>
-
-            {/* Hàng 3: Nút hành động bóc tách hàng loạt */}
-            <div className="action-row">
-              <span className="action-hint">
-                {parsedBatchLinks.length > 0 ? `Sẵn sàng trích xuất ${parsedBatchLinks.length} liên kết` : 'Nhập danh sách liên kết để bắt đầu'}
-              </span>
 
               <button
                 type="submit"
-                className="primary-action-btn"
-                disabled={parsedBatchLinks.length === 0 || isLoading || isGlobalLoading}
+                className="pane-submit-btn"
+                disabled={isLoading || parsedBatchLinks.length === 0}
               >
                 {isLoading ? (
                   <>
-                    <span className="clean-spinner" />
-                    <span>Đang giải mã...</span>
+                    <span className="minimal-spinner" />
+                    <span>Đang tải hàng loạt...</span>
                   </>
                 ) : (
                   <>
-                    <IconDownload className="w-4 h-4" />
-                    <span>Bóc tách {parsedBatchLinks.length > 0 ? `${parsedBatchLinks.length} link` : 'hàng loạt'}</span>
+                    <IconDownload className="w-3.5 h-3.5" />
+                    <span>Bóc tách hàng loạt</span>
                   </>
                 )}
               </button>
             </div>
           </form>
+        )}
+      </div>
+
+      {/* Khu vực hiển thị kết quả (Scrollable) */}
+      <div className="pane-results-container">
+        {/* Kết quả tải đơn */}
+        {singleMedia && (
+          <div className="result-content-wrap">
+            {/* Header thông tin media */}
+            <div className="media-summary-row">
+              <div className="media-thumb-box">
+                <img
+                  src={buildProxyImageUrl(singleMedia.thumbnail || singleMedia.highResThumbnail)}
+                  alt={singleMedia.title}
+                  className="preview-img"
+                  onError={(e) => {
+                    e.target.src = singleMedia.thumbnail || singleMedia.highResThumbnail
+                  }}
+                />
+                {singleMedia.duration && (
+                  <span className="duration-tag">{singleMedia.duration}</span>
+                )}
+              </div>
+
+              <div className="media-info-box">
+                <div className="media-title-line">
+                  <h3 className="media-title" title={singleMedia.title}>
+                    {singleMedia.title || 'Phương tiện đã bóc tách'}
+                  </h3>
+                  <button
+                    type="button"
+                    className="icon-close-small"
+                    onClick={() => setSingleMedia(null)}
+                    title="Đóng kết quả"
+                  >
+                    <IconClose className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <p className="media-meta-line">
+                  {singleMedia.platform?.toUpperCase()}
+                  {singleMedia.author && ` • @${singleMedia.author}`}
+                  {singleMedia.viewCount && ` • ${singleMedia.viewCount}`}
+                </p>
+
+                {/* Các nút công cụ nhanh */}
+                <div className="media-actions-toolbar">
+                  <button
+                    type="button"
+                    className="minimal-small-btn"
+                    onClick={() => handleCopy(singleMedia.originalUrl)}
+                  >
+                    <IconCopy className="w-3 h-3" />
+                    <span>Copy URL</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="minimal-small-btn"
+                    onClick={handleDownloadThumbnail}
+                  >
+                    <span>Lưu Thumbnail</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`minimal-small-btn ${isTrimmerOpen ? 'active' : ''}`}
+                    onClick={() => setIsTrimmerOpen(!isTrimmerOpen)}
+                  >
+                    <IconScissors className="w-3 h-3" />
+                    <span>Cắt đoạn</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Trimmer box (nếu mở) */}
+            {isTrimmerOpen && (
+              <div className="trimmer-inline-box">
+                <span className="trimmer-label">Cắt clip:</span>
+                <input
+                  type="text"
+                  className="trimmer-input"
+                  placeholder="00:00"
+                  value={trimStart}
+                  onChange={(e) => setTrimStart(e.target.value)}
+                />
+                <span>đến</span>
+                <input
+                  type="text"
+                  className="trimmer-input"
+                  placeholder="00:30"
+                  value={trimEnd}
+                  onChange={(e) => setTrimEnd(e.target.value)}
+                />
+              </div>
+            )}
+
+            {/* Tiến trình tải Native */}
+            {nativeProgress && (
+              <div className="download-progress-bar-wrap">
+                <div className="progress-info-line">
+                  <span>Đang tải xuống: {nativeProgress.percent}%</span>
+                  <span>{nativeProgress.speed || ''}</span>
+                </div>
+                <div className="progress-track">
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${Math.min(100, Math.max(0, nativeProgress.percent || 0))}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Phụ đề có sẵn */}
+            {singleMedia.subtitles && singleMedia.subtitles.length > 0 && (
+              <div className="subtitles-section">
+                <span className="sub-title-label">Phụ đề:</span>
+                <div className="sub-pills-row">
+                  {singleMedia.subtitles.map((sub) => (
+                    <button
+                      key={sub.lang}
+                      type="button"
+                      className="minimal-pill-small"
+                      onClick={() => handleDownloadSubtitle(sub)}
+                    >
+                      <IconSubtitle className="w-3 h-3" />
+                      <span>{sub.name || sub.lang}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Nếu là bài viết Album Ảnh */}
+            {albumImages.length > 0 && (
+              <div className="album-section">
+                <div className="album-header-bar">
+                  <span className="album-count-text">Album ảnh ({albumImages.length} tệp)</span>
+                  <div className="album-actions-group">
+                    <button
+                      type="button"
+                      className="minimal-small-btn"
+                      onClick={handleToggleSelectAllImages}
+                    >
+                      {selectedImageCount === albumImages.length ? 'Bỏ chọn' : 'Chọn tất cả'}
+                    </button>
+                    {selectedImageCount > 0 && (
+                      <button
+                        type="button"
+                        className="minimal-small-btn"
+                        onClick={handleDownloadAlbumZip}
+                        disabled={isZipDownloading}
+                      >
+                        <IconZip className="w-3 h-3" />
+                        <span>Tải ZIP ({selectedImageCount})</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="album-grid">
+                  {albumImages.map((img) => (
+                    <div
+                      key={img.id}
+                      className={`album-item ${selectedImages[img.id] ? 'is-selected' : ''}`}
+                      onClick={() =>
+                        setSelectedImages((prev) => ({
+                          ...prev,
+                          [img.id]: !prev[img.id],
+                        }))
+                      }
+                    >
+                      <img
+                        src={buildProxyImageUrl(img.thumb || img.url)}
+                        alt=""
+                        className="album-img"
+                      />
+                      <input
+                        type="checkbox"
+                        className="album-checkbox"
+                        checked={Boolean(selectedImages[img.id])}
+                        onChange={() => {}}
+                      />
+                      <button
+                        type="button"
+                        className="album-download-btn"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          handleDownloadImage(img)
+                        }}
+                        title="Tải ảnh này"
+                      >
+                        <IconDownload className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Danh sách định dạng Video / Âm thanh */}
+            {filteredStreams.length > 0 && (
+              <div className="streams-section">
+                {/* Bộ lọc format stream */}
+                <div className="streams-filter-bar">
+                  <button
+                    type="button"
+                    className={`stream-tab-btn ${streamFilter === 'all' ? 'active' : ''}`}
+                    onClick={() => setStreamFilter('all')}
+                  >
+                    Tất cả định dạng
+                  </button>
+                  <button
+                    type="button"
+                    className={`stream-tab-btn ${streamFilter === 'full' ? 'active' : ''}`}
+                    onClick={() => setStreamFilter('full')}
+                  >
+                    Có tiếng
+                  </button>
+                  <button
+                    type="button"
+                    className={`stream-tab-btn ${streamFilter === 'mute' ? 'active' : ''}`}
+                    onClick={() => setStreamFilter('mute')}
+                  >
+                    Chỉ video
+                  </button>
+                  <button
+                    type="button"
+                    className={`stream-tab-btn ${streamFilter === 'audio' ? 'active' : ''}`}
+                    onClick={() => setStreamFilter('audio')}
+                  >
+                    Âm thanh (MP3)
+                  </button>
+                </div>
+
+                {/* Danh sách các stream */}
+                <div className="streams-list">
+                  {filteredStreams.map((stream, sIdx) => {
+                    const isAudio = stream.streamType === 'audio'
+                    const streamId = stream.formatId || stream.quality || sIdx
+                    const isCurrentDownloading = downloadingId === streamId
+
+                    return (
+                      <div key={streamId} className="stream-row-item">
+                        <div className="stream-left-info">
+                          {isAudio ? (
+                            <IconAudio className="w-4 h-4 text-emerald-400" />
+                          ) : (
+                            <IconVideo className="w-4 h-4 text-blue-400" />
+                          )}
+                          <div className="stream-title-group">
+                            <span className="stream-quality-title">
+                              {stream.quality || (isAudio ? 'MP3 Audio' : 'Video Stream')}
+                            </span>
+                            <span className="stream-details-sub">
+                              {stream.ext?.toUpperCase() || (isAudio ? 'MP3' : 'MP4')}
+                              {stream.filesize ? ` • ${stream.filesize}` : ''}
+                              {stream.resolution ? ` • ${stream.resolution}` : ''}
+                            </span>
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          className="stream-download-btn"
+                          onClick={() => handleDownloadStream(stream)}
+                          disabled={isCurrentDownloading}
+                        >
+                          {isCurrentDownloading ? (
+                            <>
+                              <span className="minimal-spinner" />
+                              <span>Đang tải...</span>
+                            </>
+                          ) : (
+                            <>
+                              <IconDownload className="w-3.5 h-3.5" />
+                              <span>Tải về</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Kết quả nhiều link (Batch) */}
+        {batchMedias && batchMedias.length > 0 && (
+          <div className="batch-results-list">
+            <div className="batch-results-header">
+              <span>Đã bóc tách {batchMedias.length} liên kết</span>
+              <button
+                type="button"
+                className="minimal-small-btn"
+                onClick={() => setBatchMedias([])}
+              >
+                Xóa kết quả
+              </button>
+            </div>
+            <div className="batch-items-stack">
+              {batchMedias.map((m, idx) => (
+                <div key={m.id || idx} className="batch-row-item">
+                  <img
+                    src={buildProxyImageUrl(m.thumbnail || m.highResThumbnail)}
+                    alt=""
+                    className="batch-item-thumb"
+                  />
+                  <div className="batch-item-info">
+                    <span className="batch-item-title" title={m.title}>
+                      {m.title || 'Liên kết'}
+                    </span>
+                    <span className="batch-item-sub">
+                      {m.platform?.toUpperCase()}
+                      {m.duration ? ` • ${m.duration}` : ''}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="minimal-small-btn"
+                    onClick={() => {
+                      const topStream = m.streams?.[0]
+                      if (topStream) {
+                        setSingleMedia(m)
+                        handleDownloadStream(topStream)
+                      }
+                    }}
+                  >
+                    <IconDownload className="w-3.5 h-3.5" />
+                    <span>Tải về</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Trạng thái trống tối giản */}
+        {!singleMedia && (!batchMedias || batchMedias.length === 0) && (
+          <div className="pane-empty-state">
+            <p className="empty-subtle-hint">
+              Dán liên kết video, Reels hoặc album bài viết để phân tích và tải về
+            </p>
+          </div>
         )}
       </div>
     </div>

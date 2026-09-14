@@ -1,15 +1,22 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import {
   IconClose,
   IconPaste,
-  IconSparkles,
   IconVideo,
   IconImage,
+  IconDownload,
+  IconZip,
 } from './Icons'
 import { detectPlatform } from '../constants'
-import { crawlProfile } from '../services/api'
+import {
+  crawlProfile,
+  startNativeDownload,
+  downloadZipArchive,
+  onDownloadProgress,
+  buildProxyImageUrl,
+} from '../services/api'
 
-export default function AccountDownloader({ onProfileCrawled, isGlobalLoading, onShowToast }) {
+export default function AccountDownloader({ onShowToast }) {
   const [accountInput, setAccountInput] = useState('')
   const [selectedPlatform] = useState('auto')
   const [mediaTypeFilter, setMediaTypeFilter] = useState('all') // 'all' | 'video' | 'image'
@@ -20,9 +27,22 @@ export default function AccountDownloader({ onProfileCrawled, isGlobalLoading, o
   const [crawlProgress, setCrawlProgress] = useState(0)
   const [statusText, setStatusText] = useState('')
 
+  // Kết quả quét tài khoản
+  const [profileResult, setProfileResult] = useState(null)
+  const [selectedBatchIds, setSelectedBatchIds] = useState({})
+  const [downloadingId, setDownloadingId] = useState(null)
+  const [nativeProgress, setNativeProgress] = useState(null)
+  const [isZipDownloading, setIsZipDownloading] = useState(false)
+
   // Tự động nhận diện platform từ input
   const detected = detectPlatform(accountInput)
   const activePlatform = selectedPlatform === 'auto' ? (detected || 'youtube') : selectedPlatform
+
+  const profileMediaList = useMemo(() => profileResult?.media || [], [profileResult])
+  const selectedProfileCount = useMemo(
+    () => Object.values(selectedBatchIds).filter(Boolean).length,
+    [selectedBatchIds]
+  )
 
   const handlePaste = async () => {
     try {
@@ -32,7 +52,7 @@ export default function AccountDownloader({ onProfileCrawled, isGlobalLoading, o
         onShowToast?.('Đã dán tài khoản từ bộ nhớ tạm')
       }
     } catch {
-      onShowToast?.('Vui lòng cấp quyền đọc clipboard hoặc dùng Ctrl+V')
+      onShowToast?.('Vui lòng dùng phím tắt Ctrl+V để dán')
     }
   }
 
@@ -40,7 +60,7 @@ export default function AccountDownloader({ onProfileCrawled, isGlobalLoading, o
     e?.preventDefault()
     const target = accountInput.trim()
     if (!target) {
-      onShowToast?.('Vui lòng nhập tên người dùng (@username) hoặc liên kết tài khoản!')
+      onShowToast?.('Vui lòng nhập tên người dùng (@username) hoặc liên kết!')
       return
     }
 
@@ -66,7 +86,7 @@ export default function AccountDownloader({ onProfileCrawled, isGlobalLoading, o
         ? Math.max(1, endNum - startNum + 1)
         : (crawlLimit === 'all' ? 100 : parseInt(crawlLimit, 10) || 50)
 
-      setStatusText('Đang quét và phân tích danh sách phương tiện...')
+      setStatusText('Đang quét và lấy danh sách phương tiện...')
       const resultData = await crawlProfile({
         url: target,
         limit: limitNum,
@@ -80,8 +100,9 @@ export default function AccountDownloader({ onProfileCrawled, isGlobalLoading, o
       setCrawlProgress(100)
 
       if (resultData && resultData.media && resultData.media.length > 0) {
-        onProfileCrawled?.(resultData)
-        onShowToast?.(`Đã quét thành công ${resultData.media.length} tệp từ @${resultData.name || 'tài khoản'}!`)
+        setProfileResult(resultData)
+        setSelectedBatchIds({})
+        onShowToast?.(`Đã quét được ${resultData.media.length} tệp từ @${resultData.name || 'tài khoản'}!`)
       } else {
         onShowToast?.('Không tìm thấy tệp phương tiện công khai nào từ tài khoản này.')
       }
@@ -95,160 +116,355 @@ export default function AccountDownloader({ onProfileCrawled, isGlobalLoading, o
     }
   }
 
-  return (
-    <div className="panel-card panel-right-account">
-      {/* Header của Panel */}
-      <div className="panel-card-header">
-        <div className="panel-title-area">
-          <div className="panel-badge-num">02</div>
-          <div>
-            <h2 className="panel-title">Tải theo tài khoản</h2>
-            <p className="panel-subtitle">Quét toàn bộ bài viết, Reels, video theo hồ sơ người dùng</p>
-          </div>
-        </div>
+  // Tải 1 tệp trong profile
+  const handleDownloadProfileItem = async (item) => {
+    setDownloadingId(item.id)
+    try {
+      onShowToast?.(`Bắt đầu tải: ${item.title?.slice(0, 30) || 'video'}...`)
+      let unlisten = null
+      try {
+        unlisten = await onDownloadProgress((payload) => {
+          setNativeProgress(payload)
+        })
+      } catch (e) {
+        console.warn('Cannot attach progress listener:', e)
+      }
 
-        {/* Bộ lọc loại media (Tất cả / Video / Ảnh) */}
-        <div className="media-type-filter-group">
+      const res = await startNativeDownload({
+        url: item.url,
+        title: item.title,
+      })
+
+      if (typeof unlisten === 'function') unlisten()
+
+      if (res?.file_name) {
+        onShowToast?.(`Đã lưu: ${res.file_name}`)
+      }
+    } catch (err) {
+      onShowToast?.(err.message || 'Lỗi khi tải video')
+    } finally {
+      setTimeout(() => {
+        setDownloadingId(null)
+        setNativeProgress(null)
+      }, 1500)
+    }
+  }
+
+  // Chọn tất cả
+  const handleToggleSelectAllProfile = () => {
+    if (selectedProfileCount === profileMediaList.length) {
+      setSelectedBatchIds({})
+    } else {
+      const all = {}
+      profileMediaList.forEach((it) => {
+        all[it.id] = true
+      })
+      setSelectedBatchIds(all)
+    }
+  }
+
+  // Tải ZIP các mục đã chọn
+  const handleDownloadProfileZip = async () => {
+    const itemsToDownload = profileMediaList.filter((it) => selectedBatchIds[it.id])
+    if (itemsToDownload.length === 0) {
+      onShowToast?.('Vui lòng chọn ít nhất 1 tệp để tải ZIP')
+      return
+    }
+
+    setIsZipDownloading(true)
+    try {
+      const zipPayload = itemsToDownload.map((it) => ({
+        url: it.url,
+        filename: `${it.title || 'media'}_${it.id}.mp4`,
+        referer: profileResult?.url,
+      }))
+      await downloadZipArchive(zipPayload, `Profile_${profileResult?.name || 'Media'}`)
+      onShowToast?.(`Đã tải file ZIP (${itemsToDownload.length} tệp)!`)
+    } catch (err) {
+      onShowToast?.(err.message || 'Lỗi khi tạo file ZIP')
+    } finally {
+      setIsZipDownloading(false)
+    }
+  }
+
+  return (
+    <div className="downloader-pane">
+      {/* Header khu vực Tải theo tài khoản */}
+      <div className="pane-header">
+        <h2 className="pane-title">Tải theo tài khoản</h2>
+        <div className="pane-toggle-group">
           <button
             type="button"
-            className={`filter-btn ${mediaTypeFilter === 'all' ? 'active' : ''}`}
+            className={`pane-toggle-btn ${mediaTypeFilter === 'all' ? 'active' : ''}`}
             onClick={() => setMediaTypeFilter('all')}
-            title="Tất cả video và ảnh"
           >
             Tất cả
           </button>
           <button
             type="button"
-            className={`filter-btn ${mediaTypeFilter === 'video' ? 'active' : ''}`}
+            className={`pane-toggle-btn ${mediaTypeFilter === 'video' ? 'active' : ''}`}
             onClick={() => setMediaTypeFilter('video')}
-            title="Chỉ lấy video"
           >
-            <IconVideo className="w-3.5 h-3.5" /> Video
+            <IconVideo className="w-3.5 h-3.5" />
+            <span>Video</span>
           </button>
           <button
             type="button"
-            className={`filter-btn ${mediaTypeFilter === 'image' ? 'active' : ''}`}
+            className={`pane-toggle-btn ${mediaTypeFilter === 'image' ? 'active' : ''}`}
             onClick={() => setMediaTypeFilter('image')}
-            title="Chỉ lấy ảnh"
           >
-            <IconImage className="w-3.5 h-3.5" /> Ảnh
+            <IconImage className="w-3.5 h-3.5" />
+            <span>Ảnh</span>
           </button>
         </div>
       </div>
 
-      {/* Thân nhập liệu */}
-      <div className="panel-card-body">
-        <form onSubmit={handleStartCrawl} className="form-stack">
-          {/* Ô nhập @username hoặc URL tài khoản */}
-          <div className="input-with-actions">
+      {/* Form nhập liệu */}
+      <div className="pane-input-section">
+        <form onSubmit={handleStartCrawl} className="pane-form">
+          <div className="input-group">
             <input
               type="text"
-              className="clean-input"
-              placeholder="Nhập @username hoặc URL tài khoản (TikTok, Instagram, YouTube, Pinterest, X)..."
+              className="pane-input"
+              placeholder="Nhập @username hoặc link profile TikTok, Instagram, YouTube..."
               value={accountInput}
               onChange={(e) => setAccountInput(e.target.value)}
-              disabled={isCrawling || isGlobalLoading}
+              disabled={isCrawling}
             />
             {accountInput ? (
               <button
                 type="button"
-                className="icon-tool-btn"
+                className="input-inline-btn"
                 onClick={() => setAccountInput('')}
-                title="Xóa"
+                title="Xóa tài khoản"
               >
-                <IconClose className="w-4 h-4" />
+                <IconClose className="w-3.5 h-3.5" />
               </button>
             ) : (
               <button
                 type="button"
-                className="icon-tool-btn"
+                className="input-inline-btn"
                 onClick={handlePaste}
                 title="Dán từ bộ nhớ tạm"
               >
-                <IconPaste className="w-4 h-4" />
+                <IconPaste className="w-3.5 h-3.5" />
               </button>
             )}
           </div>
 
-          {/* Cấu hình số lượng & Khoảng tải */}
-          <div className="config-grid-row">
-            <div className="limit-selector-container">
-              <span className="control-label">Số lượng quét:</span>
-              <div className="limit-buttons">
-                {['10', '20', '50', 'range'].map((val) => (
-                  <button
-                    key={val}
-                    type="button"
-                    className={`limit-btn ${crawlLimit === val ? 'active' : ''}`}
-                    onClick={() => setCrawlLimit(val)}
-                  >
-                    {val === 'range' ? 'Khoảng tuỳ chọn' : `${val} tệp`}
-                  </button>
-                ))}
-              </div>
+          <div className="pane-control-row">
+            <div className="pills-group">
+              <span className="control-label-text">Số lượng:</span>
+              {['20', '50', 'all', 'range'].map((lim) => (
+                <button
+                  key={lim}
+                  type="button"
+                  className={`minimal-pill ${crawlLimit === lim ? 'active' : ''}`}
+                  onClick={() => setCrawlLimit(lim)}
+                >
+                  {lim === 'all' ? 'Tất cả' : lim === 'range' ? 'Khoảng' : lim}
+                </button>
+              ))}
+
+              {crawlLimit === 'range' && (
+                <div className="range-box-inline">
+                  <input
+                    type="number"
+                    className="range-input-clean"
+                    value={rangeFrom}
+                    onChange={(e) => setRangeFrom(e.target.value)}
+                    min="1"
+                  />
+                  <span>-</span>
+                  <input
+                    type="number"
+                    className="range-input-clean"
+                    value={rangeTo}
+                    onChange={(e) => setRangeTo(e.target.value)}
+                    min="1"
+                  />
+                </div>
+              )}
             </div>
-
-            {/* Nếu chọn khoảng Range */}
-            {crawlLimit === 'range' && (
-              <div className="range-inputs-container">
-                <span className="control-label">Từ tệp:</span>
-                <input
-                  type="number"
-                  min={1}
-                  className="clean-input-small"
-                  value={rangeFrom}
-                  onChange={(e) => setRangeFrom(e.target.value)}
-                />
-                <span className="control-label">Đến:</span>
-                <input
-                  type="number"
-                  min={1}
-                  className="clean-input-small"
-                  value={rangeTo}
-                  onChange={(e) => setRangeTo(e.target.value)}
-                />
-              </div>
-            )}
-          </div>
-
-          {/* Thanh tiến trình khi đang quét */}
-          {isCrawling && (
-            <div className="progress-inline-card">
-              <div className="progress-label-row">
-                <span>{statusText || 'Đang quét dữ liệu...'}</span>
-                <span>{crawlProgress}%</span>
-              </div>
-              <div className="progress-track">
-                <div className="progress-fill" style={{ width: `${crawlProgress}%` }} />
-              </div>
-            </div>
-          )}
-
-          {/* Nút hành động quét */}
-          <div className="action-row">
-            <span className="action-hint">
-              {detected ? `Đã nhận diện: ${detected.toUpperCase()}` : 'Hỗ trợ quét Profile, Kênh, Shorts, Reels'}
-            </span>
 
             <button
               type="submit"
-              className="primary-action-btn emerald-btn"
-              disabled={!accountInput.trim() || isCrawling || isGlobalLoading}
+              className="pane-submit-btn"
+              disabled={isCrawling || !accountInput.trim()}
             >
               {isCrawling ? (
                 <>
-                  <span className="clean-spinner" />
-                  <span>Đang quét tài khoản...</span>
+                  <span className="minimal-spinner" />
+                  <span>Đang quét... {crawlProgress}%</span>
                 </>
               ) : (
                 <>
-                  <IconSparkles className="w-4 h-4" />
-                  <span>Bắt đầu quét tài khoản</span>
+                  <IconVideo className="w-3.5 h-3.5" />
+                  <span>Quét tài khoản</span>
                 </>
               )}
             </button>
           </div>
+
+          {statusText && (
+            <div className="status-progress-line">
+              <span className="validation-hint">{statusText}</span>
+              {crawlProgress > 0 && (
+                <div className="progress-track-small">
+                  <div className="progress-fill" style={{ width: `${crawlProgress}%` }} />
+                </div>
+              )}
+            </div>
+          )}
         </form>
+      </div>
+
+      {/* Khu vực hiển thị kết quả Profile (Scrollable) */}
+      <div className="pane-results-container">
+        {profileResult && (
+          <div className="result-content-wrap">
+            {/* Header hồ sơ tài khoản */}
+            <div className="profile-summary-row">
+              <div className="profile-info-block">
+                {profileResult.avatar && (
+                  <img
+                    src={buildProxyImageUrl(profileResult.avatar)}
+                    alt=""
+                    className="profile-avatar-img"
+                    onError={(e) => {
+                      e.target.style.display = 'none'
+                    }}
+                  />
+                )}
+                <div>
+                  <h3 className="profile-name-title">
+                    {profileResult.name || accountInput}
+                  </h3>
+                  <p className="profile-sub-meta">
+                    {profileResult.platform?.toUpperCase()} • {profileMediaList.length} tệp phương tiện
+                  </p>
+                </div>
+              </div>
+
+              <div className="profile-top-actions">
+                <button
+                  type="button"
+                  className="minimal-small-btn"
+                  onClick={handleToggleSelectAllProfile}
+                >
+                  {selectedProfileCount === profileMediaList.length ? 'Bỏ chọn' : 'Chọn tất cả'}
+                </button>
+                {selectedProfileCount > 0 && (
+                  <button
+                    type="button"
+                    className="minimal-small-btn"
+                    onClick={handleDownloadProfileZip}
+                    disabled={isZipDownloading}
+                  >
+                    <IconZip className="w-3 h-3" />
+                    <span>Tải ZIP ({selectedProfileCount})</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="icon-close-small"
+                  onClick={() => setProfileResult(null)}
+                  title="Đóng kết quả"
+                >
+                  <IconClose className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Tiến trình tải Native */}
+            {nativeProgress && (
+              <div className="download-progress-bar-wrap">
+                <div className="progress-info-line">
+                  <span>Đang tải xuống: {nativeProgress.percent}%</span>
+                  <span>{nativeProgress.speed || ''}</span>
+                </div>
+                <div className="progress-track">
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${Math.min(100, Math.max(0, nativeProgress.percent || 0))}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Lưới tệp video/ảnh của tài khoản */}
+            <div className="profile-grid">
+              {profileMediaList.map((item) => {
+                const isSelected = Boolean(selectedBatchIds[item.id])
+                const isItemDownloading = downloadingId === item.id
+
+                return (
+                  <div
+                    key={item.id}
+                    className={`profile-grid-item ${isSelected ? 'is-selected' : ''}`}
+                    onClick={() =>
+                      setSelectedBatchIds((prev) => ({
+                        ...prev,
+                        [item.id]: !prev[item.id],
+                      }))
+                    }
+                  >
+                    <div className="profile-item-thumb-box">
+                      <img
+                        src={buildProxyImageUrl(item.thumb || item.url)}
+                        alt=""
+                        className="profile-item-thumb"
+                      />
+                      {item.duration && (
+                        <span className="duration-tag">{item.duration}</span>
+                      )}
+                      <input
+                        type="checkbox"
+                        className="profile-item-checkbox"
+                        checked={isSelected}
+                        onChange={() => {}}
+                      />
+                    </div>
+
+                    <div className="profile-item-details">
+                      <span className="profile-item-title" title={item.title}>
+                        {item.title || 'Phương tiện'}
+                      </span>
+                      <div className="profile-item-footer">
+                        <span className="item-quality-pill">{item.quality || 'HD'}</span>
+                        <button
+                          type="button"
+                          className="profile-download-btn"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleDownloadProfileItem(item)
+                          }}
+                          disabled={isItemDownloading}
+                          title="Tải video này"
+                        >
+                          {isItemDownloading ? (
+                            <span className="minimal-spinner" />
+                          ) : (
+                            <IconDownload className="w-3 h-3" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Trạng thái trống tối giản */}
+        {!profileResult && (
+          <div className="pane-empty-state">
+            <p className="empty-subtle-hint">
+              Nhập tài khoản hoặc kênh mạng xã hội để quét hàng loạt video và hình ảnh
+            </p>
+          </div>
+        )}
       </div>
     </div>
   )

@@ -2,7 +2,6 @@ import { useState } from 'react'
 import SystemHeader from './components/SystemHeader'
 import LinkDownloader from './components/LinkDownloader'
 import AccountDownloader from './components/AccountDownloader'
-import MediaWorkspace from './components/MediaWorkspace'
 import DownloadHistoryModal from './components/DownloadHistoryModal'
 import CookieManager from './components/CookieManager'
 import './App.css'
@@ -12,34 +11,9 @@ function App() {
   const [isCookieManagerOpen, setIsCookieManagerOpen] = useState(false)
   const [toastMessage, setToastMessage] = useState('')
 
-  // State quản lý dữ liệu phương tiện
-  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState('link') // 'link' | 'account' | 'batch'
-  const [singleMedia, setSingleMedia] = useState(null)
-  const [batchMedias, setBatchMedias] = useState([])
-  const [profileResult, setProfileResult] = useState(null)
-  const isGlobalLoading = false
-
   const showToast = (msg) => {
     setToastMessage(msg)
-    setTimeout(() => setToastMessage(''), 3500)
-  }
-
-  // Khi bóc tách 1 link thành công
-  const handleMediaExtracted = (mediaData) => {
-    setSingleMedia(mediaData)
-    setActiveWorkspaceTab('link')
-  }
-
-  // Khi bóc tách nhiều link thành công
-  const handleBatchExtracted = (items) => {
-    setBatchMedias(items)
-    setActiveWorkspaceTab('batch')
-  }
-
-  // Khi quét tài khoản thành công
-  const handleProfileCrawled = (profileData) => {
-    setProfileResult(profileData)
-    setActiveWorkspaceTab('account')
+    setTimeout(() => setToastMessage(''), 3200)
   }
 
   return (
@@ -48,36 +22,23 @@ function App() {
       <SystemHeader
         onOpenHistory={() => setIsHistoryOpen(true)}
         onOpenCookies={() => setIsCookieManagerOpen(true)}
+        onShowToast={showToast}
       />
 
-      {/* Vùng làm việc chính: Tối ưu màn hình Laptop 15" */}
-      <main className="desktop-main-workspace">
-        {/* Nửa trên: Chia đôi 2 cột (Trái: Link Downloader, Phải: Account Downloader) */}
-        <div className="workspace-top-split">
-          <LinkDownloader
-            onMediaExtracted={handleMediaExtracted}
-            onBatchExtracted={handleBatchExtracted}
-            isGlobalLoading={isGlobalLoading}
-            onShowToast={showToast}
-          />
-          <AccountDownloader
-            onProfileCrawled={handleProfileCrawled}
-            isGlobalLoading={isGlobalLoading}
-            onShowToast={showToast}
-          />
-        </div>
+      {/* Vùng làm việc chính: 2 cột chia đôi đối xứng bằng 1 thanh dọc | ở giữa */}
+      <main className="desktop-workspace-split">
+        {/* Nửa trái: Tải theo liên kết */}
+        <section className="workspace-column column-left">
+          <LinkDownloader onShowToast={showToast} />
+        </section>
 
-        {/* Nửa dưới: Toàn màn hình xem trước thumbnail/video và tải về */}
-        <div className="workspace-bottom-results">
-          <MediaWorkspace
-            activeTab={activeWorkspaceTab}
-            onTabChange={setActiveWorkspaceTab}
-            singleMedia={singleMedia}
-            batchMedias={batchMedias}
-            profileResult={profileResult}
-            onShowToast={showToast}
-          />
-        </div>
+        {/* Thanh dọc | phân chia chính giữa */}
+        <div className="workspace-divider-vertical" />
+
+        {/* Nửa phải: Tải theo tài khoản */}
+        <section className="workspace-column column-right">
+          <AccountDownloader onShowToast={showToast} />
+        </section>
       </main>
 
       {/* Floating Toast Notification */}
