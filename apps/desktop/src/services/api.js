@@ -178,6 +178,15 @@ export async function resolveShortUrl(url, expectedPlatform = null) {
 // 4. Native Downloads (Video / Audio / Thumbnail / Subtitle)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Sinh mã tác vụ duy nhất cho mỗi lần tải, để thanh tiến trình của tác vụ này
+ * không bị sự kiện của tác vụ khác ghi đè khi tải song song nhiều tệp.
+ */
+export function createTaskId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
+  return `task_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+}
+
 export async function startNativeDownload({
   url,
   formatId,
@@ -191,6 +200,15 @@ export async function startNativeDownload({
   endTime = null,
   isMute = false,
   sponsorBlock = false,
+  embedSubs = false,
+  embedThumbnail = false,
+  embedMetadata = false,
+  splitChapters = false,
+  concurrentFragments = null,
+  videoFormat = null,
+  proxy = null,
+  useAria2c = false,
+  taskId = null,
 }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
   const customDir = destDir || getCustomDownloadDir() || null
@@ -210,6 +228,16 @@ export async function startNativeDownload({
       end_time: endTime || null,
       is_mute: Boolean(isMute),
       sponsor_block: Boolean(sponsorBlock),
+      // Các tuỳ chọn dưới đây trước kia bị bỏ rơi tại đây nên bật ở UI cũng không có tác dụng
+      embed_subs: Boolean(embedSubs),
+      embed_thumbnail: Boolean(embedThumbnail),
+      embed_metadata: Boolean(embedMetadata),
+      split_chapters: Boolean(splitChapters),
+      concurrent_fragments: concurrentFragments ? Number(concurrentFragments) : null,
+      video_format: videoFormat || null,
+      proxy: proxy || null,
+      use_aria2c: Boolean(useAria2c),
+      task_id: taskId || null,
     },
   })
 }
@@ -267,11 +295,15 @@ export async function openDownloadFolder(filePath) {
 }
 
 /**
- * Lắng nghe tiến trình % tải xuống từ Rust Core
+ * Lắng nghe tiến trình % tải xuống từ Rust Core.
+ * Truyền `taskId` để chỉ nhận sự kiện của đúng tác vụ đó — nếu không, mọi tệp
+ * đang tải song song sẽ cùng ghi vào một thanh tiến trình.
  */
-export function onDownloadProgress(callback) {
+export function onDownloadProgress(callback, taskId = null) {
   return listen('download-progress', (event) => {
-    callback?.(event.payload)
+    const payload = event.payload
+    if (taskId && payload?.id && payload.id !== taskId) return
+    callback?.(payload)
   })
 }
 
@@ -390,7 +422,7 @@ export async function downloadDirectFile({ url, filename, referer, destDir }) {
 /**
  * Tải album nhiều ảnh hoặc đóng gói thành file ZIP native trên máy
  */
-export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, asZip = false }) {
+export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, asZip = false, taskId = null }) {
   const customDir = destDir || getCustomDownloadDir() || null
   return await invoke('download_album_batch', {
     items: items.map((it) => ({
@@ -402,6 +434,7 @@ export async function downloadAlbumBatch({ items, albumName = 'Album_Media', des
     destDir: customDir,
     asZip: Boolean(asZip),
     deviceId: getDeviceId(),
+    taskId: taskId || null,
   })
 }
 
@@ -409,13 +442,14 @@ export async function downloadAlbumBatch({ items, albumName = 'Album_Media', des
  * ZIP download: Trong Tauri dùng Native Rust (nhanh, chống 403, lưu trực tiếp ổ cứng).
  * Nếu chạy web thuần thì fallback sang JSZip.
  */
-export async function downloadZipArchive(items, zipName = 'Album_Media', onProgress) {
+export async function downloadZipArchive(items, zipName = 'Album_Media', onProgress, taskId = null) {
   if (isTauri()) {
-    onProgress?.({ receivedBytes: 1, total: items.length })
+    onProgress?.({ receivedBytes: 0, total: items.length })
     const res = await downloadAlbumBatch({
       items,
       albumName: zipName,
       asZip: true,
+      taskId,
     })
     onProgress?.({ receivedBytes: items.length, total: items.length })
     return res

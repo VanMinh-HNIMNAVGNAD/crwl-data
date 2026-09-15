@@ -1135,6 +1135,17 @@ body {
   display: block;
 }
 
+.progress-saved-path {
+  display: block;
+  max-width: 100%;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--accent-emerald);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .progress-card-close-btn {
   background: transparent;
   border: none;
@@ -1170,6 +1181,39 @@ body {
 
 .progress-bar-fill.done-fill {
   background: linear-gradient(90deg, var(--accent-emerald) 0%, #34d399 100%);
+}
+
+/* Trạng thái không đo được tiến độ (đang lấy metadata, đang ghép tệp):
+   vệt sáng chạy qua để báo "vẫn đang làm việc" thay vì giả một con số phần trăm. */
+@keyframes crwl-indeterminate-sheen {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+
+.progress-bar-fill.is-indeterminate,
+.progress-fill.is-indeterminate {
+  position: relative;
+  overflow: hidden;
+  /* Chưa đo được tiến độ thì phủ kín rãnh để vệt sáng có chỗ chạy */
+  width: 100% !important;
+  background: var(--bg-input);
+}
+
+.progress-bar-fill.is-indeterminate::after,
+.progress-fill.is-indeterminate::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 35%;
+  background: linear-gradient(90deg, transparent, rgba(96, 165, 250, 0.85), transparent);
+  animation: crwl-indeterminate-sheen 1.1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-bar-fill.is-indeterminate::after,
+  .progress-fill.is-indeterminate::after {
+    animation: none;
+  }
 }
 
 .progress-metrics-grid {

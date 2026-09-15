@@ -17,6 +17,7 @@ import {
   resolveShortUrl,
   isTauri,
   startNativeDownload,
+  createTaskId,
   downloadThumbnail,
   downloadSubtitle,
   downloadZipArchive,
@@ -272,20 +273,27 @@ export default function LinkDownloader({ onShowToast }) {
       }
     }
 
+    const taskId = createTaskId()
     setDownloadStartTime(Date.now())
     setDownloadTaskTitle(singleMedia.title || stream.quality || 'Video')
-    setNativeProgress({ percent: 0, speed: '', eta: 'Khởi tạo luồng tải...', status: 'downloading' })
+    setNativeProgress({
+      id: taskId,
+      percent: 0,
+      speed: '',
+      eta: '',
+      status: 'preparing',
+      phase: 'Đang chuẩn bị tải...',
+    })
 
+    let unlisten = null
     try {
       const isAudioOnly = stream.streamType === 'audio'
       const isMute = stream.streamType === 'mute'
       onShowToast?.(`Đang tải: ${stream.quality || 'tệp'}`)
 
-      let unlisten = null
       try {
-        unlisten = await onDownloadProgress((payload) => {
-          setNativeProgress(payload)
-        })
+        // Chỉ nhận sự kiện của đúng tác vụ này
+        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
       } catch (e) {
         console.warn('Cannot attach progress listener:', e)
       }
@@ -304,21 +312,38 @@ export default function LinkDownloader({ onShowToast }) {
         embedThumbnail: embedMetadata,
         concurrentFragments: accelerate ? 8 : 1,
         videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
+        taskId,
       })
 
-      if (typeof unlisten === 'function') unlisten()
-
-      if (res && res.file_name) {
-        setNativeProgress({ percent: 100, speed: '', eta: '00:00', status: 'completed' })
-        onShowToast?.(`Đã tải xong: ${res.file_name}`)
+      if (res?.success) {
+        setNativeProgress({
+          id: taskId,
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'completed',
+          phase: 'Hoàn tất',
+          filePath: res.file_path,
+          fileName: res.file_name,
+        })
+        onShowToast?.(`Đã tải xong: ${res.file_path || res.file_name || 'tệp'}`)
       }
     } catch (err) {
-      setNativeProgress({ percent: 0, speed: '', eta: '', status: 'error' })
+      setNativeProgress({
+        id: taskId,
+        percent: 0,
+        speed: '',
+        eta: '',
+        status: 'error',
+        phase: 'Tải thất bại',
+        message: err.message,
+      })
       onShowToast?.(err.message || 'Lỗi khi tải stream')
     } finally {
-      setTimeout(() => {
-        setDownloadingId(null)
-      }, 2000)
+      // Gỡ listener trong mọi trường hợp — trước đây khi tải lỗi listener bị rò rỉ,
+      // tích lũy dần và làm thanh tiến trình nhảy loạn ở các lần tải sau.
+      if (typeof unlisten === 'function') unlisten()
+      setDownloadingId(null)
     }
   }
 
@@ -423,15 +448,31 @@ export default function LinkDownloader({ onShowToast }) {
       }
     }
 
+    const taskId = createTaskId()
     setIsZipDownloading(true)
     setDownloadStartTime(Date.now())
     setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} ảnh`)
-    setNativeProgress({ percent: 15, speed: '', eta: 'Đang tải ảnh...', status: 'downloading' })
+    setNativeProgress({
+      id: taskId,
+      percent: 0,
+      speed: '',
+      eta: '',
+      status: 'preparing',
+      phase: `Chuẩn bị tải ${itemsToDownload.length} ảnh...`,
+    })
 
+    let unlisten = null
     try {
+      try {
+        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+      } catch (e) {
+        console.warn('Cannot attach progress listener:', e)
+      }
+
       const itemsPayload = itemsToDownload.map((img) => ({
         url: img.url,
-        filename: `${img.title || 'image'}.${img.ext || 'jpg'}`,
+        // Rust tự bổ sung đúng đuôi tệp theo URL thật, không ép cứng .jpg nữa
+        filename: img.title || 'image',
         referer: singleMedia?.originalUrl,
       }))
       const res = await downloadAlbumBatch({
@@ -439,13 +480,32 @@ export default function LinkDownloader({ onShowToast }) {
         albumName: `${singleMedia?.title || 'Album'}_Media`,
         destDir: targetDir,
         asZip: asZip,
+        taskId,
       })
-      setNativeProgress({ percent: 100, speed: '', eta: '00:00', status: 'completed' })
-      onShowToast?.(res?.message || `Đã tải xong ${itemsToDownload.length} ảnh!`)
+      setNativeProgress({
+        id: taskId,
+        percent: 100,
+        speed: '',
+        eta: '',
+        status: 'completed',
+        phase: 'Hoàn tất',
+        filePath: res?.file_path,
+        fileName: res?.file_name,
+      })
+      onShowToast?.(res?.message || (res?.file_path ? `Đã lưu tại: ${res.file_path}` : `Đã tải xong ${itemsToDownload.length} ảnh!`))
     } catch (err) {
-      setNativeProgress({ percent: 0, speed: '', eta: '', status: 'error' })
+      setNativeProgress({
+        id: taskId,
+        percent: 0,
+        speed: '',
+        eta: '',
+        status: 'error',
+        phase: 'Tải thất bại',
+        message: err.message,
+      })
       onShowToast?.(err.message || 'Lỗi khi tải album')
     } finally {
+      if (typeof unlisten === 'function') unlisten()
       setIsZipDownloading(false)
     }
   }

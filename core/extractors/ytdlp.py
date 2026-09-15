@@ -124,11 +124,19 @@ class YtDlpExtractor(BaseExtractor):
         browser: Optional[str] = None,
         from_item: Optional[int] = None,
         to_item: Optional[int] = None,
-        timeout: int = 45,
+        timeout: Optional[int] = None,
     ) -> ProfileCrawlResult:
         """Quét playlist / channel / profile bằng --flat-playlist"""
         if not self.is_available():
             raise RuntimeError("yt-dlp binary không được tìm thấy trên hệ thống.")
+
+        # Kênh/playlist lớn cần nhiều thời gian hơn mốc cố định 45s trước đây
+        if timeout is None:
+            if from_item and to_item and to_item >= from_item:
+                count = to_item - from_item + 1
+            else:
+                count = limit
+            timeout = 540 if not count or count <= 0 else max(90, min(540, 60 + int(count * 1.2)))
 
         args, tmp_cookie = self.get_base_args(allow_playlist=True, browser=browser, target_url=url)
         if from_item and to_item and to_item >= from_item:

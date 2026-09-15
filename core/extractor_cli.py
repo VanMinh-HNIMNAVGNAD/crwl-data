@@ -24,6 +24,8 @@ import sys
 import json
 import argparse
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure package root is in sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,71 +37,98 @@ from core.dispatcher import MediaDispatcher
 from core.resolver.url_resolver import UrlResolver
 
 
+# Nhiều luồng cùng ghi stdout sẽ làm hỏng giao thức JSON-per-line, nên cần khóa.
+_STDOUT_LOCK = threading.Lock()
+
+# Số request bóc tách chạy song song tối đa. Mỗi request tự sinh tiến trình
+# yt-dlp/gallery-dl riêng nên cần chặn trên để không làm nghẽn máy.
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("CRWL_MAX_WORKERS", "4"))
+
+
 def output_json(data: dict, pretty: bool = False) -> None:
     indent = 2 if pretty else None
-    print(json.dumps(data, ensure_ascii=False, indent=indent))
-    sys.stdout.flush()
+    payload = json.dumps(data, ensure_ascii=False, indent=indent)
+    with _STDOUT_LOCK:
+        sys.stdout.write(payload + "\n")
+        sys.stdout.flush()
+
+
+def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict) -> dict:
+    """Xử lý một request IPC, luôn trả về dict response (không ném exception)."""
+    req_id = req.get("id")
+    action = (req.get("action") or "extract").lower()
+    url = (req.get("url") or "").strip()
+
+    if not url:
+        return {"id": req_id, "success": False, "error": "Missing 'url' parameter"}
+
+    try:
+        if action == "extract":
+            res = dispatcher.extract(url, browser=req.get("browser"))
+            return {"id": req_id, "success": True, "data": res.to_dict()}
+
+        if action == "crawl":
+            limit = int(req.get("limit", 50) or 0)
+            media_type = req.get("media_type") or req.get("mediaType") or "all"
+            range_start = req.get("range_start") or req.get("rangeStart")
+            range_end = req.get("range_end") or req.get("rangeEnd")
+            res = dispatcher.crawl_profile(
+                url,
+                limit=limit,
+                media_type=media_type,
+                platform_hint=req.get("platform"),
+                browser=req.get("browser"),
+                range_start=int(range_start) if range_start else None,
+                range_end=int(range_end) if range_end else None,
+            )
+            return {"id": req_id, "success": True, "data": res.to_dict()}
+
+        if action == "resolve":
+            expected = req.get("expected") or req.get("expectedPlatform")
+            res = resolver.resolve_url(url, expected_platform=expected)
+            return {"id": req_id, "success": True, "data": res.to_dict()}
+
+        return {"id": req_id, "success": False, "error": f"Unknown action: '{action}'"}
+    except Exception as e:
+        sys.stderr.write(f"[Sidecar:ERROR] Request {req_id} failed: {e}\n")
+        sys.stderr.flush()
+        return {"id": req_id, "success": False, "error": str(e)}
 
 
 def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None:
-    """Chế độ Sidecar IPC: Đọc JSON qua stdin, xử lý và in JSON qua stdout"""
-    sys.stderr.write("[Sidecar] Extractor CLI worker started in IPC mode (stdin/stdout)\n")
+    """Chế độ Sidecar IPC: đọc JSON qua stdin, xử lý SONG SONG, in JSON qua stdout.
+
+    Trước đây mỗi request chạy tuần tự trong vòng lặp đọc stdin, nên khi UI gửi
+    nhiều liên kết cùng lúc thì các request sau phải xếp hàng và bị Rust timeout.
+    """
+    sys.stderr.write(
+        f"[Sidecar] Extractor CLI worker started (IPC mode, {MAX_CONCURRENT_REQUESTS} luồng song song)\n"
+    )
     sys.stderr.flush()
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    pool = ThreadPoolExecutor(
+        max_workers=MAX_CONCURRENT_REQUESTS,
+        thread_name_prefix="crwl-req",
+    )
 
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as e:
-            output_json({"success": False, "error": f"Invalid JSON input: {e}"})
-            continue
+    def process(raw_req: dict) -> None:
+        output_json(handle_request(dispatcher, resolver, raw_req))
 
-        req_id = req.get("id")
-        action = req.get("action", "extract").lower()
-        url = req.get("url", "").strip()
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
 
-        if not url:
-            resp = {"id": req_id, "success": False, "error": "Missing 'url' parameter"}
-            output_json(resp)
-            continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError as e:
+                output_json({"success": False, "error": f"Invalid JSON input: {e}"})
+                continue
 
-        try:
-            if action == "extract":
-                browser = req.get("browser")
-                res = dispatcher.extract(url, browser=browser)
-                resp = {"id": req_id, "success": True, "data": res.to_dict()}
-            elif action == "crawl":
-                limit = int(req.get("limit", 50))
-                media_type = req.get("media_type") or req.get("mediaType") or "all"
-                platform = req.get("platform")
-                browser = req.get("browser")
-                range_start = req.get("range_start") or req.get("rangeStart")
-                range_end = req.get("range_end") or req.get("rangeEnd")
-                res = dispatcher.crawl_profile(
-                    url,
-                    limit=limit,
-                    media_type=media_type,
-                    platform_hint=platform,
-                    browser=browser,
-                    range_start=int(range_start) if range_start else None,
-                    range_end=int(range_end) if range_end else None,
-                )
-                resp = {"id": req_id, "success": True, "data": res.to_dict()}
-            elif action == "resolve":
-                expected = req.get("expected") or req.get("expectedPlatform")
-                res = resolver.resolve_url(url, expected_platform=expected)
-                resp = {"id": req_id, "success": True, "data": res.to_dict()}
-            else:
-                resp = {"id": req_id, "success": False, "error": f"Unknown action: '{action}'"}
-
-            output_json(resp)
-        except Exception as e:
-            sys.stderr.write(f"[Sidecar:ERROR] Request {req_id} failed: {e}\n")
-            sys.stderr.flush()
-            output_json({"id": req_id, "success": False, "error": str(e)})
+            pool.submit(process, req)
+    finally:
+        pool.shutdown(wait=True)
 
 
 def main() -> None:

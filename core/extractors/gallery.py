@@ -74,6 +74,11 @@ class GalleryDlExtractor(BaseExtractor):
             raise RuntimeError(f"gallery-dl extract thất bại: {stderr.strip() or f'Exit code {code}'}")
 
         raw_entries = self._parse_json(stdout)
+
+        auth_reason = self._detect_auth_error(raw_entries, stderr)
+        if auth_reason:
+            raise RuntimeError(self._login_required_message(url, auth_reason))
+
         if not raw_entries:
             raise ValueError("Không tìm thấy dữ liệu phương tiện từ liên kết qua gallery-dl.")
 
@@ -87,11 +92,17 @@ class GalleryDlExtractor(BaseExtractor):
         browser: Optional[str] = None,
         range_start: Optional[int] = None,
         range_end: Optional[int] = None,
-        timeout: int = 60,
+        timeout: Optional[int] = None,
+        _depth: int = 0,
     ) -> ProfileCrawlResult:
         """Quét profile / channel / subreddit / board"""
         if not self.is_available():
             raise RuntimeError("gallery-dl binary không được tìm thấy trên hệ thống.")
+
+        # Quét càng nhiều bài thì càng cần nhiều thời gian; một mốc cố định khiến
+        # lựa chọn "Tất cả" luôn chết vì timeout.
+        if timeout is None:
+            timeout = self._timeout_for(limit, range_start, range_end)
 
         args, tmp_cookie = self.get_base_args(target_url=profile_url, browser=browser)
         if range_start and range_end and range_end >= range_start:
@@ -117,18 +128,11 @@ class GalleryDlExtractor(BaseExtractor):
 
         raw_entries = self._parse_json(stdout)
 
-        # Kiểm tra lỗi yêu cầu xác thực / cookies
-        auth_err = False
-        if any(isinstance(x, list) and len(x) >= 2 and x[0] == -1 and isinstance(x[1], dict) and "Auth" in str(x[1]) for x in (raw_entries or [])):
-            auth_err = True
-        if "AuthRequired" in stderr or "authenticated cookies needed" in stderr or "401 Unauthorized" in stderr or "KeyError: 'username'" in stderr:
-            auth_err = True
-
-        if auth_err:
-            raise RuntimeError(
-                f"Tài khoản hoặc trang này yêu cầu đăng nhập ({profile_url}). "
-                f"Vui lòng đăng nhập tài khoản trên trình duyệt (Firefox / Edge) hoặc chọn đúng trình duyệt trên thanh tiêu đề để sử dụng Cookies."
-            )
+        # gallery-dl -j báo lỗi qua entry [-1, {...}] trên STDOUT (không phải stderr),
+        # nên phải soi cả hai nguồn mới nhận ra được trường hợp thiếu cookie đăng nhập.
+        auth_reason = self._detect_auth_error(raw_entries, stderr)
+        if auth_reason:
+            raise RuntimeError(self._login_required_message(profile_url, auth_reason))
 
         # Kiểm tra nếu gallery-dl trả về thông điệp Message.Queue (code 6) mà chưa bóc tách media (code 3)
         has_media = any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in (raw_entries or []))
@@ -137,6 +141,10 @@ class GalleryDlExtractor(BaseExtractor):
             if isinstance(x, list) and len(x) >= 2 and x[0] == 6 and isinstance(x[1], str) and x[1] != profile_url
         ]
         if not has_media and queued_urls:
+            if _depth >= 3:
+                raise RuntimeError(
+                    f"gallery-dl chuyển tiếp URL quá nhiều lần mà không ra media: {profile_url}"
+                )
             child_url = queued_urls[0]
             self.log(f"gallery-dl chuyển tiếp URL con ({range_spec or 'all'}): {child_url}")
             return self.crawl_profile(
@@ -147,9 +155,14 @@ class GalleryDlExtractor(BaseExtractor):
                 range_start=range_start,
                 range_end=range_end,
                 timeout=timeout,
+                _depth=_depth + 1,
             )
 
         if not raw_entries:
+            if code == -1 and "Timeout" in (stderr or ""):
+                raise RuntimeError(
+                    f"Quét quá thời gian {timeout}s. Hãy giảm số lượng cần quét hoặc chọn 'Khoảng' nhỏ hơn."
+                )
             if code != 0:
                 raise RuntimeError(f"gallery-dl crawl thất bại: {stderr.strip() or f'Exit code {code}'}")
             return ProfileCrawlResult(
@@ -354,6 +367,73 @@ class GalleryDlExtractor(BaseExtractor):
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _timeout_for(limit: int, range_start: Optional[int], range_end: Optional[int]) -> int:
+        """Ước lượng thời gian chờ theo số lượng mục cần quét (giây)."""
+        if range_start and range_end and range_end >= range_start:
+            count = range_end - range_start + 1
+        elif limit and limit > 0:
+            count = limit
+        else:
+            count = 0  # 0 = quét toàn bộ
+        if count <= 0:
+            return 540
+        # ~1.5s cho mỗi mục, kẹp trong khoảng 90s..540s
+        return max(90, min(540, 60 + int(count * 1.5)))
+
+    # Dấu hiệu gallery-dl gặp lỗi do thiếu cookie đăng nhập.
+    # 'username' KeyError là cách Instagram báo "chưa đăng nhập" khi bóc tách profile.
+    _AUTH_SIGNATURES = (
+        "authrequired", "authenticationerror", "authorizationerror",
+        "authentication required", "authenticated cookies needed",
+        "login required", "please login", "must be logged in",
+        "401 unauthorized", "403 forbidden", "http 401", "http 403",
+        "keyerror: 'username'", "'username'",
+        "account is private", "private account",
+    )
+
+    @classmethod
+    def _detect_auth_error(cls, raw_entries: Optional[List[Any]], stderr: str) -> Optional[str]:
+        """Trả về mô tả lỗi nếu gallery-dl thất bại vì thiếu quyền đăng nhập."""
+        haystacks: List[str] = []
+
+        for x in (raw_entries or []):
+            if isinstance(x, list) and len(x) >= 2 and x[0] == -1:
+                haystacks.append(str(x[1]))
+
+        if stderr:
+            haystacks.append(stderr)
+
+        for text in haystacks:
+            low = text.lower()
+            if any(sig in low for sig in cls._AUTH_SIGNATURES):
+                return text.strip()[:200]
+        return None
+
+    @staticmethod
+    def _login_required_message(target_url: str, reason: str) -> str:
+        lower = (target_url or "").lower()
+        if "instagram.com" in lower or "instagr.am" in lower:
+            name, tab = "Instagram", "Instagram"
+        elif "facebook.com" in lower or "fb.com" in lower or "fb.watch" in lower:
+            name, tab = "Facebook", "Facebook"
+        elif "threads.net" in lower:
+            name, tab = "Threads", "Threads"
+        elif "x.com" in lower or "twitter.com" in lower:
+            name, tab = "X (Twitter)", "Twitter"
+        elif "reddit.com" in lower or "redd.it" in lower:
+            name, tab = "Reddit", "Reddit"
+        elif "tiktok.com" in lower:
+            name, tab = "TikTok", "TikTok"
+        else:
+            name, tab = "Trang này", "nền tảng tương ứng"
+        return (
+            f"{name} yêu cầu đăng nhập để xem nội dung này. "
+            f"Hãy đăng nhập {name} trên Firefox/Edge rồi thử lại, "
+            f"hoặc mở Cookie Manager (🍪) → tab {tab} và dán cookie từ trình duyệt. "
+            f"(Chi tiết: {reason})"
+        )
 
     @staticmethod
     def _parse_json(stdout_data: str) -> Optional[List[Any]]:

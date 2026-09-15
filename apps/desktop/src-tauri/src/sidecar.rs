@@ -251,13 +251,36 @@ impl SidecarManager {
         *lock = Some(SidecarInner { tx, _child: child });
     }
 
-    /// Gửi request IPC tới Python worker và đợi response (timeout 30s)
+    /// Thời gian chờ tối đa theo loại request.
+    /// Quét profile (nhất là khi chọn "Tất cả") có thể mất vài phút, không thể
+    /// dùng chung một mốc 55s với việc giải mã link rút gọn.
+    fn timeout_for(payload: &Value) -> Duration {
+        let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("extract");
+        match action {
+            "resolve" => Duration::from_secs(30),
+            "crawl" => {
+                let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(50);
+                // limit = 0 nghĩa là "Tất cả" → cho thời gian rộng nhất
+                if limit == 0 {
+                    Duration::from_secs(600)
+                } else if limit > 100 {
+                    Duration::from_secs(420)
+                } else {
+                    Duration::from_secs(240)
+                }
+            }
+            _ => Duration::from_secs(150),
+        }
+    }
+
+    /// Gửi request IPC tới Python worker và đợi response
     async fn send_request(&self, payload: Value) -> Result<Value, String> {
         let req_id = next_req_id();
         let mut payload = payload;
         payload["id"] = Value::String(req_id.clone());
 
         let line = serde_json::to_string(&payload).map_err(|e| format!("Serialize error: {e}"))?;
+
 
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -275,10 +298,14 @@ impl SidecarManager {
             }
         }
 
-        match tokio::time::timeout(Duration::from_secs(55), reply_rx).await {
+        let wait_for = Self::timeout_for(&payload);
+        match tokio::time::timeout(wait_for, reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("Sidecar reply channel đóng bất ngờ".to_string()),
-            Err(_) => Err("Timeout: Python worker không phản hồi sau 55 giây. Vui lòng thử lại.".to_string()),
+            Err(_) => Err(format!(
+                "Timeout: máy chủ bóc tách không phản hồi sau {} giây. Hãy giảm số lượng cần quét rồi thử lại.",
+                wait_for.as_secs()
+            )),
         }
     }
 

@@ -269,20 +269,24 @@ pub async fn download_direct_file(
 
 #[tauri::command]
 pub async fn download_album_batch(
+    app: AppHandle,
     state: State<'_, AppState>,
     items: Vec<DirectFileItem>,
     album_name: Option<String>,
     dest_dir: Option<String>,
     as_zip: Option<bool>,
     device_id: Option<String>,
+    task_id: Option<String>,
 ) -> Result<DownloadResult, String> {
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
     DownloaderService::download_album_batch(
+        app,
         items,
         album_name.as_deref(),
         dest_dir.as_deref(),
         as_zip.unwrap_or(false),
         &dev_id,
+        task_id,
         Arc::clone(&state.db),
     ).await
 }

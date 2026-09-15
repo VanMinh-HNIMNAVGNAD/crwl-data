@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use log::info;
+use log::{info, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::binary_manager::BinaryManager;
 use crate::cookies::CookieService;
@@ -51,14 +52,47 @@ pub struct DownloadOptions {
     pub proxy: Option<String>,
     #[serde(alias = "videoFormat")]
     pub video_format: Option<String>,
+    /// Mã định danh riêng của tác vụ tải — UI dùng để lọc đúng sự kiện tiến trình
+    /// của mình khi có nhiều tệp tải song song.
+    #[serde(default, alias = "taskId")]
+    pub task_id: Option<String>,
+    /// Bật bộ tải ngoài aria2c. Mặc định TẮT vì aria2c nuốt toàn bộ output tiến
+    /// trình của yt-dlp, khiến thanh tiến trình đứng im suốt lúc tải.
+    #[serde(default, alias = "useAria2c")]
+    pub use_aria2c: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DownloadProgressPayload {
+    /// Trùng với `task_id` của request — UI chỉ nhận sự kiện của tác vụ mình gửi.
+    pub id: String,
     pub percent: f64,
     pub speed: String,
     pub eta: String,
+    /// preparing | downloading | processing | completed | error
     pub status: String,
+    /// Mô tả bước đang chạy để UI hiển thị đúng thay vì đoán theo phần trăm
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl DownloadProgressPayload {
+    fn new(id: &str, percent: f64, status: &str, phase: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            percent,
+            speed: String::new(),
+            eta: String::new(),
+            status: status.to_string(),
+            phase: phase.to_string(),
+            file_path: None,
+            message: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,23 +240,37 @@ impl DownloaderService {
         cmd.arg("-o").arg(&output_template);
         cmd.arg("--no-playlist");
         cmd.arg("--newline");
-        cmd.arg("--progress-template")
-            .arg("download-progress:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s");
+        cmd.arg("--progress-template").arg(
+            "download-progress:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.format_id)s",
+        );
+        // In ra đường dẫn cuối cùng sau khi merge/post-process để UI luôn biết file đã lưu ở đâu.
+        cmd.arg("--print").arg("after_move:filepath");
+        // `--print` ngầm bật `--quiet`, khiến yt-dlp NUỐT toàn bộ dòng tiến trình và
+        // dòng "[download] Destination:". Đó là lý do thanh tiến trình đứng im rồi
+        // nhảy phịch lên 100%. Hai cờ dưới đây bật lại các dòng đó.
+        cmd.arg("--no-quiet");
+        cmd.arg("--progress");
 
         // Tự động dùng Node.js runtime cho YouTube n-sig challenge nếu có
         if let Some(node_path) = BinaryManager::find_binary("node") {
             cmd.arg("--js-runtimes").arg(format!("node:{}", node_path.to_string_lossy()));
         }
 
-        // Tăng tốc tải đa luồng song song (-N 8)
-        let frags = opts.concurrent_fragments.unwrap_or(8);
+        // Tải song song nhiều mảnh (HLS/DASH) — giữ trong khoảng an toàn
+        let frags = opts.concurrent_fragments.unwrap_or(8).clamp(1, 16);
         cmd.arg("-N").arg(frags.to_string());
 
-        // Sử dụng aria2c làm downloader ngoài nếu đã cài đặt
-        if BinaryManager::has_binary("aria2c") {
-            info!("Phát hiện aria2c: Kích hoạt bộ tải ngoài tăng tốc đa luồng");
-            cmd.arg("--downloader").arg("aria2c");
-            cmd.arg("--downloader-args").arg("aria2c:-s 16 -x 16 -k 1M -j 16");
+        // aria2c chỉ bật khi người dùng yêu cầu: nó không xuất tiến trình theo
+        // --progress-template, nên thanh tiến trình sẽ đứng im 0% tới lúc tải xong.
+        if opts.use_aria2c {
+            if BinaryManager::has_binary("aria2c") {
+                info!("Bật bộ tải ngoài aria2c theo yêu cầu (thanh tiến trình sẽ không chi tiết)");
+                cmd.arg("--downloader").arg("aria2c");
+                cmd.arg("--downloader-args")
+                    .arg("aria2c:-s 16 -x 16 -k 1M --summary-interval=1");
+            } else {
+                warn!("Đã yêu cầu aria2c nhưng chưa cài trên máy — dùng bộ tải mặc định");
+            }
         }
 
         // Cắt clip theo mốc thời gian (Trimmer)
@@ -396,69 +444,214 @@ impl DownloaderService {
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        info!("Bắt đầu tải tệp với yt-dlp: {}", opts.url);
+        // Mã tác vụ: UI lọc sự kiện tiến trình theo mã này nên nhiều tệp tải
+        // song song không còn ghi đè lên nhau trên cùng một thanh tiến trình.
+        let task_id = opts
+            .task_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        info!("Bắt đầu tải tệp với yt-dlp [{task_id}]: {}", opts.url);
         let mut child = cmd.spawn().map_err(|e| format!("Không thể khởi chạy yt-dlp: {e}"))?;
 
         let stdout = child.stdout.take().ok_or("Không thể đọc stdout của yt-dlp")?;
-        let mut reader = BufReader::new(stdout).lines();
+        let stderr = child.stderr.take().ok_or("Không thể đọc stderr của yt-dlp")?;
 
+        // stderr PHẢI được đọc song song. Trước đây ống stderr được mở nhưng không
+        // ai đọc: yt-dlp ghi đầy bộ đệm ~64KB rồi bị chặn vĩnh viễn — đây là
+        // nguyên nhân các luồng tải "đứng hình" và cuối cùng báo lỗi.
+        let stderr_lines: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let stderr_sink = Arc::clone(&stderr_lines);
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let mut buf = stderr_sink.lock().await;
+                // Chỉ giữ phần cuối để thông báo lỗi ngắn gọn và không phình bộ nhớ
+                if buf.len() >= 60 {
+                    buf.remove(0);
+                }
+                buf.push(trimmed);
+            }
+        });
+
+        let mut reader = BufReader::new(stdout).lines();
         let percent_regex = Regex::new(r"([\d\.]+)%").map_err(|e| e.to_string())?;
-        let mut last_percent = 0.0;
+
+        // yt-dlp in "Downloading N format(s): 137+140" trước khi tải, nhờ đó biết
+        // chính xác sẽ có mấy lượt tải để quy đổi ra phần trăm tổng thể.
+        let formats_regex = Regex::new(r"Downloading \d+ format\(s\): (\S+)").map_err(|e| e.to_string())?;
+
+        let progress_emit = |payload: DownloadProgressPayload| {
+            let _ = app_handle.emit("download-progress", payload);
+        };
+
+        progress_emit(DownloadProgressPayload::new(
+            &task_id,
+            0.0,
+            "preparing",
+            "Đang lấy thông tin tệp...",
+        ));
+
+        // Phần trăm chỉ đi tiến, không bao giờ lùi: trước đây mỗi luồng (video rồi
+        // audio) đều chạy 0→100% nên thanh tiến trình tụt về 0 giữa chừng.
+        let mut overall_percent = 0.0_f64;
+        let mut expected_passes = 1usize;
+        let mut pass_index = 0usize;
+        let mut current_format: Option<String> = None;
         let mut downloaded_file_path: Option<String> = None;
+        let mut printed_final_path: Option<String> = None;
+
+        // Tối đa 96% dành cho giai đoạn tải, 4% còn lại cho ghép/hậu xử lý
+        const DOWNLOAD_SHARE: f64 = 96.0;
 
         while let Ok(Some(line)) = reader.next_line().await {
-            if line.starts_with("download-progress:") {
-                let parts: Vec<&str> = line["download-progress:".len()..].split('|').collect();
-                if !parts.is_empty() {
-                    let percent_str = parts[0].trim();
-                    let speed = parts.get(1).unwrap_or(&"").trim().to_string();
-                    let eta = parts.get(2).unwrap_or(&"").trim().to_string();
-
-                    let percent = if let Some(caps) = percent_regex.captures(percent_str) {
-                        caps.get(1).and_then(|m| m.as_str().parse::<f64>().ok()).unwrap_or(last_percent)
+            if let Some(rest) = line.strip_prefix("download-progress:") {
+                let parts: Vec<&str> = rest.split('|').collect();
+                let percent_str = parts.first().copied().unwrap_or("").trim();
+                // yt-dlp trả "Unknown B/s" / "Unknown" lúc mới khởi động — đừng
+                // hiển thị nguyên văn, để UI tự rơi về dấu "--".
+                let clean = |v: &str| {
+                    let t = v.trim();
+                    if t.is_empty() || t.starts_with("Unknown") || t == "N/A" || t == "NA" {
+                        String::new()
                     } else {
-                        last_percent
-                    };
+                        t.to_string()
+                    }
+                };
+                let speed = clean(parts.get(1).copied().unwrap_or(""));
+                let eta = clean(parts.get(2).copied().unwrap_or(""));
+                let format_id = parts.get(3).copied().unwrap_or("").trim().to_string();
 
-                    last_percent = percent;
-                    let payload = DownloadProgressPayload {
-                        percent,
-                        speed,
-                        eta,
-                        status: "downloading".to_string(),
-                    };
-                    let _ = app_handle.emit("download-progress", payload);
+                // Đổi format_id nghĩa là yt-dlp đã chuyển sang lượt tải kế tiếp
+                if !format_id.is_empty() && format_id != "NA" {
+                    match current_format {
+                        Some(ref f) if f == &format_id => {}
+                        Some(_) => {
+                            pass_index = (pass_index + 1).min(expected_passes.saturating_sub(1));
+                            current_format = Some(format_id.clone());
+                        }
+                        None => current_format = Some(format_id.clone()),
+                    }
                 }
-            } else if line.contains("[download] Destination:") || line.contains("[Merger] Merging formats into") || line.contains("[ExtractAudio] Destination:") {
-                // Ghi nhận tên file video/audio
-                if let Some(pos) = line.find(':') {
-                    let path = line[pos + 1..].trim().trim_matches('"').to_string();
-                    downloaded_file_path = Some(path);
-                }
-            } else if line.contains("Writing video thumbnail") || line.contains("Writing video subtitles to:") || line.contains("[Thumbnails] Writing thumbnail to:") {
-                // Ghi nhận tên file thumbnail hoặc subtitle
-                if let Some(pos) = line.rfind(':') {
-                    let path = line[pos + 1..].trim().trim_matches('"').to_string();
+
+                let pass_percent = percent_regex
+                    .captures(percent_str)
+                    .and_then(|c| c.get(1))
+                    .and_then(|m| m.as_str().parse::<f64>().ok())
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 100.0);
+
+                let raw = Self::weighted_percent(pass_index, expected_passes, pass_percent);
+                overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
+
+                let phase = if expected_passes > 1 {
+                    format!("Đang tải luồng {}/{}", pass_index + 1, expected_passes)
+                } else {
+                    "Đang tải dữ liệu".to_string()
+                };
+
+                progress_emit(DownloadProgressPayload {
+                    id: task_id.clone(),
+                    percent: overall_percent,
+                    speed,
+                    eta,
+                    status: "downloading".to_string(),
+                    phase,
+                    file_path: None,
+                    message: None,
+                });
+                continue;
+            }
+
+            if let Some(n) = Self::parse_expected_passes(&formats_regex, &line) {
+                expected_passes = n;
+                pass_index = 0;
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("[download] Destination: ") {
+                downloaded_file_path = Some(rest.trim().trim_matches('"').to_string());
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("[ExtractAudio] Destination: ") {
+                downloaded_file_path = Some(rest.trim().trim_matches('"').to_string());
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("[Merger] Merging formats into ") {
+                downloaded_file_path = Some(rest.trim().trim_matches('"').to_string());
+                overall_percent = overall_percent.max(DOWNLOAD_SHARE);
+                progress_emit(DownloadProgressPayload::new(
+                    &task_id,
+                    overall_percent,
+                    "processing",
+                    "Đang ghép hình và tiếng qua FFmpeg...",
+                ));
+                continue;
+            }
+
+            // Các bước hậu xử lý còn lại — báo đúng trạng thái thay vì đoán theo %
+            if let Some(phase) = Self::postprocess_phase(&line) {
+                overall_percent = overall_percent.max(DOWNLOAD_SHARE);
+                progress_emit(DownloadProgressPayload::new(
+                    &task_id,
+                    overall_percent,
+                    "processing",
+                    phase,
+                ));
+                continue;
+            }
+
+            if line.contains("Writing video thumbnail")
+                || line.contains("Writing video subtitles to:")
+                || line.contains("[Thumbnails] Writing thumbnail to:")
+            {
+                if let Some(pos) = line.rfind(": ") {
+                    let path = line[pos + 2..].trim().trim_matches('"').to_string();
                     if !path.is_empty() {
                         downloaded_file_path = Some(path);
                     }
                 }
+                continue;
+            }
+
+            // Dòng trần còn lại là kết quả của `--print after_move:filepath`,
+            // tức đường dẫn cuối cùng sau khi đã merge/remux xong.
+            let candidate = line.trim().trim_matches('"');
+            if !candidate.is_empty() && Path::new(candidate).is_absolute() {
+                printed_final_path = Some(candidate.to_string());
             }
         }
 
         let status = child.wait().await.map_err(|e| format!("Lỗi chờ yt-dlp: {e}"))?;
+        let _ = stderr_task.await;
+        let collected_stderr = stderr_lines.lock().await.clone();
 
         if !status.success() {
-            let err_msg = "Tiến trình tải thất bại qua yt-dlp".to_string();
-            let _ = app_handle.emit(
-                "download-progress",
-                DownloadProgressPayload {
-                    percent: last_percent,
-                    speed: "".to_string(),
-                    eta: "".to_string(),
-                    status: "error".to_string(),
-                },
-            );
+            // Báo đúng nguyên nhân từ yt-dlp thay vì một câu chung chung
+            let detail = Self::summarize_ytdlp_error(&collected_stderr);
+            let err_msg = if detail.is_empty() {
+                format!("Tải thất bại (yt-dlp kết thúc với mã {})", status.code().unwrap_or(-1))
+            } else {
+                detail
+            };
+
+            progress_emit(DownloadProgressPayload {
+                id: task_id.clone(),
+                percent: overall_percent,
+                speed: String::new(),
+                eta: String::new(),
+                status: "error".to_string(),
+                phase: "Tải thất bại".to_string(),
+                file_path: None,
+                message: Some(err_msg.clone()),
+            });
 
             // Ghi nhận lỗi vào DB
             db.record_download_history(
@@ -475,22 +668,28 @@ impl DownloaderService {
             return Err(err_msg);
         }
 
-        // Báo cáo hoàn tất
-        let _ = app_handle.emit(
-            "download-progress",
-            DownloadProgressPayload {
-                percent: 100.0,
-                speed: "".to_string(),
-                eta: "00:00".to_string(),
-                status: "completed".to_string(),
-            },
-        );
-
-        let final_path = downloaded_file_path.unwrap_or_else(|| dest_folder.to_string_lossy().to_string());
+        // `after_move:filepath` là đường dẫn chuẩn nhất; chỉ lùi về tên file tạm
+        // khi yt-dlp không in ra (ví dụ khi dùng --skip-download).
+        let final_path = printed_final_path
+            .or(downloaded_file_path)
+            .unwrap_or_else(|| dest_folder.to_string_lossy().to_string());
         let file_name = Path::new(&final_path)
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "media_download".to_string());
+        let file_size = std::fs::metadata(&final_path).map(|m| m.len() as i64).ok();
+
+        // Chỉ báo hoàn tất sau khi tiến trình đã kết thúc thành công và có đường dẫn
+        progress_emit(DownloadProgressPayload {
+            id: task_id.clone(),
+            percent: 100.0,
+            speed: String::new(),
+            eta: String::new(),
+            status: "completed".to_string(),
+            phase: "Hoàn tất".to_string(),
+            file_path: Some(final_path.clone()),
+            message: None,
+        });
 
         // Ghi nhận lịch sử tải thành công vào database PostgreSQL
         db.record_download_history(
@@ -498,7 +697,7 @@ impl DownloaderService {
             opts.title.as_deref().unwrap_or(&file_name),
             &file_name,
             "auto",
-            None,
+            file_size,
             None,
             "success",
             None,
@@ -510,6 +709,83 @@ impl DownloaderService {
             file_name: Some(file_name),
             message: "Tải xuống thành công và lưu trực tiếp vào máy tính!".to_string(),
         })
+    }
+
+    /// Đọc dòng `[info] ...: Downloading N format(s): 137+140` để biết yt-dlp sẽ
+    /// chạy mấy lượt tải. Nhờ đó phần trăm tổng thể phản ánh đúng thực tế thay vì
+    /// đoán mò từ tuỳ chọn định dạng.
+    fn parse_expected_passes(re: &Regex, line: &str) -> Option<usize> {
+        let spec = re.captures(line)?.get(1)?.as_str();
+        Some(spec.split('+').filter(|s| !s.is_empty()).count().max(1))
+    }
+
+    /// Quy đổi phần trăm của một lượt tải thành phần trăm tổng thể.
+    ///
+    /// yt-dlp tải video rồi tải audio, mỗi lượt chạy 0→100%. Nếu đưa thẳng lên UI
+    /// thì thanh tiến trình đầy rồi tụt về 0. Hàm này trải các lượt lên một dải
+    /// chung 0..DOWNLOAD_SHARE, phần còn lại dành cho bước ghép tệp.
+    fn weighted_percent(pass_index: usize, expected_passes: usize, pass_percent: f64) -> f64 {
+        const DOWNLOAD_SHARE: f64 = 96.0;
+        let passes = expected_passes.max(1) as f64;
+        let index = (pass_index as f64).min(passes - 1.0);
+        let fraction = pass_percent.clamp(0.0, 100.0) / 100.0;
+        ((index + fraction) / passes * DOWNLOAD_SHARE).clamp(0.0, DOWNLOAD_SHARE)
+    }
+
+    /// Nhận diện bước hậu xử lý của yt-dlp để UI hiển thị đúng việc đang chạy
+    fn postprocess_phase(line: &str) -> Option<&'static str> {
+        const PHASES: &[(&str, &str)] = &[
+            ("[ExtractAudio]", "Đang tách âm thanh..."),
+            ("[VideoConvertor]", "Đang chuyển đổi định dạng video..."),
+            ("[VideoRemuxer]", "Đang đóng gói lại container..."),
+            ("[EmbedThumbnail]", "Đang nhúng ảnh bìa..."),
+            ("[Metadata]", "Đang ghi metadata..."),
+            ("[EmbedSubtitle]", "Đang nhúng phụ đề..."),
+            ("[SponsorBlock]", "Đang xử lý SponsorBlock..."),
+            ("[ModifyChapters]", "Đang cắt bỏ đoạn được đánh dấu..."),
+            ("[SplitChapters]", "Đang tách theo chương..."),
+            ("[FixupM3u8]", "Đang sửa luồng M3U8..."),
+            ("[FixupM4a]", "Đang sửa container M4A..."),
+            ("[Fixup", "Đang sửa lỗi container..."),
+        ];
+        PHASES
+            .iter()
+            .find(|(prefix, _)| line.starts_with(prefix))
+            .map(|(_, phase)| *phase)
+    }
+
+    /// Rút gọn stderr của yt-dlp thành một thông báo lỗi người dùng hiểu được
+    fn summarize_ytdlp_error(stderr_lines: &[String]) -> String {
+        let error_line = stderr_lines
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("ERROR:") || l.contains("ERROR:"))
+            .or_else(|| stderr_lines.last());
+
+        let raw = match error_line {
+            Some(l) => l.trim_start_matches("ERROR:").trim().to_string(),
+            None => return String::new(),
+        };
+
+        let lower = raw.to_lowercase();
+        if lower.contains("login") || lower.contains("sign in") || lower.contains("cookies")
+            || lower.contains("private") || lower.contains("403") || lower.contains("401")
+        {
+            return format!(
+                "Nội dung yêu cầu đăng nhập hoặc bị chặn. Hãy mở Cookie Manager (🍪) \
+                 để lưu cookie cho nền tảng này rồi thử lại. (Chi tiết: {raw})"
+            );
+        }
+        if lower.contains("ffmpeg") {
+            return format!("Thiếu hoặc lỗi ffmpeg khi ghép tệp. (Chi tiết: {raw})");
+        }
+        if lower.contains("unsupported url") || lower.contains("no video formats") {
+            return format!("Liên kết này không có luồng tải được. (Chi tiết: {raw})");
+        }
+        if raw.len() > 300 {
+            return format!("{}...", &raw[..300]);
+        }
+        raw
     }
 
     /// Lấy Referer header chuẩn cho URL để chống chặn 403 Forbidden
@@ -560,35 +836,28 @@ impl DownloaderService {
             let _ = tokio::fs::create_dir_all(&dest_folder).await;
         }
 
+        let ext = Self::guess_extension(url);
         let clean_name = file_name
-            .map(|f| f.replace(['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>'], "_").trim().to_string())
+            .map(|f| Self::sanitize_file_name(f, ""))
             .filter(|f| !f.is_empty())
-            .unwrap_or_else(|| format!("photo_{}.jpg", chrono::Utc::now().timestamp()));
+            .map(|f| {
+                if Path::new(&f).extension().is_some() {
+                    f
+                } else {
+                    format!("{f}.{ext}")
+                }
+            })
+            .unwrap_or_else(|| format!("media_{}.{ext}", chrono::Utc::now().timestamp()));
 
         let target_path = dest_folder.join(&clean_name);
         let referer_header = Self::get_referer_for_url(url, referer);
-        let user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-        info!("Đang tải tệp ảnh trực tiếp qua curl: {url} -> {:?}", target_path);
-        let status = Command::new("curl")
-            .arg("-s")
-            .arg("-L")
-            .arg("-f")
-            .arg("--retry")
-            .arg("2")
-            .arg("-A")
-            .arg(user_agent)
-            .arg("-e")
-            .arg(&referer_header)
-            .arg(url)
-            .arg("-o")
-            .arg(&target_path)
-            .status()
-            .await
-            .map_err(|e| format!("Không thể khởi chạy curl: {e}"))?;
-
-        if !status.success() {
-            return Err("Tải tệp ảnh trực tiếp thất bại qua curl".to_string());
+        info!("Đang tải tệp trực tiếp qua curl: {url} -> {:?}", target_path);
+        if !Self::curl_to_file(url, &referer_header, &target_path).await {
+            return Err(
+                "Tải tệp thất bại — liên kết có thể đã hết hạn hoặc bị chặn. Hãy quét lại rồi thử."
+                    .to_string(),
+            );
         }
 
         let file_size = target_path.metadata().map(|m| m.len() as i64).ok();
@@ -615,11 +884,13 @@ impl DownloaderService {
 
     /// Tải album nhiều ảnh hoặc đóng gói thành file ZIP
     pub async fn download_album_batch(
+        app_handle: AppHandle,
         items: Vec<DirectFileItem>,
         album_name: Option<&str>,
         dest_dir: Option<&str>,
         as_zip: bool,
         device_id: &str,
+        task_id: Option<String>,
         db: Arc<Database>,
     ) -> Result<DownloadResult, String> {
         let base_dest = dest_dir
@@ -627,56 +898,115 @@ impl DownloaderService {
             .unwrap_or_else(Self::get_default_download_dir);
 
         let raw_title = album_name.unwrap_or("Album_Media");
-        let clean_title = raw_title.replace(['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>'], "_").trim().to_string();
+        let clean_title = Self::sanitize_file_name(raw_title, "Album_Media");
         let target_dir = base_dest.join(&clean_title);
 
         if !target_dir.exists() {
-            let _ = tokio::fs::create_dir_all(&target_dir).await;
+            tokio::fs::create_dir_all(&target_dir)
+                .await
+                .map_err(|e| format!("Không tạo được thư mục album: {e}"))?;
         }
 
-        let user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+        let task_id = task_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let total = items.len();
+        if total == 0 {
+            return Err("Danh sách tệp cần tải đang trống".to_string());
+        }
+
+        let emit = |percent: f64, status: &str, phase: String, file_path: Option<String>| {
+            let _ = app_handle.emit(
+                "download-progress",
+                DownloadProgressPayload {
+                    id: task_id.clone(),
+                    percent,
+                    speed: String::new(),
+                    eta: String::new(),
+                    status: status.to_string(),
+                    phase,
+                    file_path,
+                    message: None,
+                },
+            );
+        };
+
+        emit(0.0, "downloading", format!("Chuẩn bị tải {total} tệp..."), None);
+
+        // Tải song song có giới hạn. Trước đây các tệp tải tuần tự nên một album
+        // vài chục ảnh mất rất lâu và không hề có phản hồi tiến trình.
+        const MAX_PARALLEL: usize = 5;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(total);
+
+        for (idx, item) in items.into_iter().enumerate() {
+            let permit_src = Arc::clone(&semaphore);
+            let counter = Arc::clone(&completed);
+            let dir = target_dir.clone();
+            let album = clean_title.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _permit = match permit_src.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return None,
+                };
+
+                let ext = Self::guess_extension(&item.url);
+                let raw_fname = item.filename.as_deref().unwrap_or("");
+                let fname = if raw_fname.trim().is_empty() {
+                    format!("{album}_{:03}.{ext}", idx + 1)
+                } else {
+                    let safe = Self::sanitize_file_name(raw_fname, &format!("media_{}", idx + 1));
+                    // Chỉ bổ sung đuôi khi tên chưa có — không nối chồng thành "anh.jpg.heic"
+                    if Path::new(&safe).extension().is_some() {
+                        safe
+                    } else {
+                        format!("{safe}.{ext}")
+                    }
+                };
+
+                let dest_file = dir.join(&fname);
+                let referer_header = Self::get_referer_for_url(&item.url, item.referer.as_deref());
+
+                let ok = Self::curl_to_file(&item.url, &referer_header, &dest_file).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if ok {
+                    Some(dest_file)
+                } else {
+                    warn!("Không tải được tệp album: {}", item.url);
+                    None
+                }
+            }));
+        }
+
         let mut downloaded_files = Vec::new();
-
-        for (idx, item) in items.iter().enumerate() {
-            let ext = if item.url.contains(".png") { "png" } else if item.url.contains(".webp") { "webp" } else { "jpg" };
-            let raw_fname = item.filename.as_deref().unwrap_or("");
-            let fname = if !raw_fname.is_empty() {
-                raw_fname.replace(['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>'], "_")
-            } else {
-                format!("{clean_title}_{}.{ext}", idx + 1)
-            };
-
-            let dest_file = target_dir.join(&fname);
-            let referer_header = Self::get_referer_for_url(&item.url, item.referer.as_deref());
-
-            let ok = Command::new("curl")
-                .arg("-s")
-                .arg("-L")
-                .arg("-f")
-                .arg("--retry")
-                .arg("2")
-                .arg("-A")
-                .arg(user_agent)
-                .arg("-e")
-                .arg(&referer_header)
-                .arg(&item.url)
-                .arg("-o")
-                .arg(&dest_file)
-                .status()
-                .await
-                .map(|s| s.success())
-                .unwrap_or(false);
-
-            if ok {
-                downloaded_files.push(dest_file);
+        for handle in handles {
+            if let Ok(Some(path)) = handle.await {
+                downloaded_files.push(path);
             }
+            let done = completed.load(std::sync::atomic::Ordering::SeqCst);
+            let percent = (done as f64 / total as f64) * if as_zip { 90.0 } else { 100.0 };
+            emit(
+                percent,
+                "downloading",
+                format!("Đã tải {done}/{total} tệp"),
+                None,
+            );
         }
 
         if downloaded_files.is_empty() {
-            return Err("Không tải được tệp nào từ album".to_string());
+            emit(0.0, "error", "Không tải được tệp nào".to_string(), None);
+            return Err(format!(
+                "Không tải được tệp nào trong {total} tệp. Liên kết có thể đã hết hạn — hãy quét lại tài khoản."
+            ));
         }
 
+        let failed = total - downloaded_files.len();
+
         if as_zip {
+            emit(93.0, "processing", "Đang nén thành tệp ZIP...".to_string(), None);
             let zip_filename = format!("{clean_title}.zip");
             let zip_path = base_dest.join(&zip_filename);
             let py_code = r#"
@@ -716,14 +1046,17 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
                         None,
                     ).await;
 
+                    emit(100.0, "completed", "Hoàn tất".to_string(), Some(zip_str.clone()));
+
                     return Ok(DownloadResult {
                         success: true,
                         file_path: Some(zip_str),
                         file_name: Some(zip_filename),
-                        message: format!("Đã đóng gói {} tệp vào file ZIP!", downloaded_files.len()),
+                        message: Self::batch_summary(downloaded_files.len(), failed, "vào tệp ZIP"),
                     });
                 }
             }
+            warn!("Nén ZIP thất bại — giữ nguyên thư mục ảnh đã tải");
         }
 
         let dir_str = target_dir.to_string_lossy().to_string();
@@ -738,12 +1071,95 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
             None,
         ).await;
 
+        emit(100.0, "completed", "Hoàn tất".to_string(), Some(dir_str.clone()));
+
         Ok(DownloadResult {
             success: true,
             file_path: Some(dir_str),
             file_name: Some(clean_title),
-            message: format!("Đã tải thành công {} tệp vào thư mục album!", downloaded_files.len()),
+            message: Self::batch_summary(downloaded_files.len(), failed, "vào thư mục album"),
         })
+    }
+
+    fn batch_summary(ok: usize, failed: usize, where_to: &str) -> String {
+        if failed > 0 {
+            format!("Đã tải {ok} tệp {where_to}, {failed} tệp thất bại.")
+        } else {
+            format!("Đã tải thành công {ok} tệp {where_to}!")
+        }
+    }
+
+    /// Loại bỏ ký tự không hợp lệ trong tên tệp trên Linux
+    fn sanitize_file_name(raw: &str, fallback: &str) -> String {
+        let cleaned: String = raw
+            .replace(['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>', '\n', '\r', '\t'], "_")
+            .trim()
+            .trim_matches('.')
+            .chars()
+            .take(120)
+            .collect();
+        if cleaned.is_empty() {
+            fallback.to_string()
+        } else {
+            cleaned
+        }
+    }
+
+    /// Đoán phần mở rộng THẬT của tệp sẽ nhận được.
+    ///
+    /// CDN của Instagram/Facebook hay phục vụ URL đuôi `.heic` nhưng kèm tham số
+    /// `stp=dst-jpg`, và thứ trả về là JPEG. Đặt tên theo đuôi URL sẽ tạo ra tệp
+    /// `.heic` mà máy không mở được, nên phải ưu tiên chỉ dẫn `dst-<fmt>`.
+    fn guess_extension(url: &str) -> &'static str {
+        let lower = url.to_lowercase();
+        let mut split = lower.splitn(2, '?');
+        let path = split.next().unwrap_or("");
+        let query = split.next().unwrap_or("");
+
+        for (marker, ext) in [("dst-jpg", "jpg"), ("dst-png", "png"), ("dst-webp", "webp")] {
+            if query.contains(marker) {
+                return ext;
+            }
+        }
+
+        const KNOWN: &[(&str, &str)] = &[
+            (".mp4", "mp4"), (".webm", "webm"), (".mov", "mov"), (".m4v", "m4v"),
+            (".mp3", "mp3"), (".m4a", "m4a"), (".png", "png"), (".webp", "webp"),
+            (".gif", "gif"), (".heic", "heic"), (".jpeg", "jpg"), (".jpg", "jpg"),
+        ];
+        KNOWN
+            .iter()
+            .find(|(suffix, _)| path.ends_with(suffix))
+            .map(|(_, ext)| *ext)
+            .unwrap_or("jpg")
+    }
+
+    /// Tải 1 URL về đúng đường dẫn bằng curl, trả về true nếu tệp có nội dung
+    async fn curl_to_file(url: &str, referer: &str, dest: &Path) -> bool {
+        const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+        let ok = Command::new("curl")
+            .arg("-sSL")
+            .arg("-f")
+            .arg("--retry").arg("2")
+            .arg("--retry-delay").arg("1")
+            .arg("--connect-timeout").arg("20")
+            .arg("--max-time").arg("300")
+            .arg("-A").arg(USER_AGENT)
+            .arg("-e").arg(referer)
+            .arg(url)
+            .arg("-o").arg(dest)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        // curl -f vẫn có thể để lại tệp 0 byte khi kết nối đứt giữa chừng
+        if ok && std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false) {
+            true
+        } else {
+            let _ = std::fs::remove_file(dest);
+            false
+        }
     }
 }
 
@@ -752,4 +1168,93 @@ pub struct DirectFileItem {
     pub url: String,
     pub filename: Option<String>,
     pub referer: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DownloaderService as D;
+
+    #[test]
+    fn single_pass_maps_to_full_download_share() {
+        assert_eq!(D::weighted_percent(0, 1, 0.0), 0.0);
+        assert_eq!(D::weighted_percent(0, 1, 50.0), 48.0);
+        assert_eq!(D::weighted_percent(0, 1, 100.0), 96.0);
+    }
+
+    #[test]
+    fn two_passes_never_reach_full_before_the_second_one() {
+        // Lượt 1 xong chỉ mới là nửa đường — không được nhảy lên 100%
+        assert_eq!(D::weighted_percent(0, 2, 100.0), 48.0);
+        assert_eq!(D::weighted_percent(1, 2, 0.0), 48.0);
+        assert_eq!(D::weighted_percent(1, 2, 100.0), 96.0);
+    }
+
+    #[test]
+    fn progress_is_monotonic_across_a_two_pass_download() {
+        let script = [(0, 0.0), (0, 40.0), (0, 100.0), (1, 0.0), (1, 30.0), (1, 100.0)];
+        let mut last = 0.0;
+        for (pass, pct) in script {
+            let now = D::weighted_percent(pass, 2, pct);
+            assert!(now >= last, "tiến trình bị tụt: {last} -> {now}");
+            last = now;
+        }
+        assert_eq!(last, 96.0);
+    }
+
+    #[test]
+    fn out_of_range_inputs_stay_clamped() {
+        assert_eq!(D::weighted_percent(0, 0, 200.0), 96.0);
+        assert_eq!(D::weighted_percent(9, 2, -5.0), 48.0);
+    }
+
+    #[test]
+    fn expected_passes_are_read_from_the_yt_dlp_info_line() {
+        let re = regex::Regex::new(r"Downloading \d+ format\(s\): (\S+)").unwrap();
+        assert_eq!(D::parse_expected_passes(&re, "[info] abc: Downloading 1 format(s): mp4"), Some(1));
+        assert_eq!(D::parse_expected_passes(&re, "[info] abc: Downloading 1 format(s): 137+140"), Some(2));
+        assert_eq!(D::parse_expected_passes(&re, "[info] abc: Downloading 1 format(s): hls-1080+hls-audio"), Some(2));
+        assert_eq!(D::parse_expected_passes(&re, "[download] Destination: /tmp/a.mp4"), None);
+    }
+
+    #[test]
+    fn postprocess_lines_are_recognised() {
+        assert_eq!(
+            D::postprocess_phase("[VideoRemuxer] Remuxing video from mp4 to mkv; Destination: /tmp/a.mkv"),
+            Some("Đang đóng gói lại container...")
+        );
+        assert_eq!(D::postprocess_phase("[ExtractAudio] Destination: /tmp/a.mp3"), Some("Đang tách âm thanh..."));
+        assert_eq!(D::postprocess_phase("[download] Destination: /tmp/a.mp4"), None);
+        assert_eq!(D::postprocess_phase("/tmp/a.mkv"), None);
+    }
+
+    #[test]
+    fn login_errors_get_an_actionable_message() {
+        let msg = D::summarize_ytdlp_error(&[
+            "[debug] something".to_string(),
+            "ERROR: [instagram] Requested content is not available, rate-limit reached or login required".to_string(),
+        ]);
+        assert!(msg.contains("Cookie Manager"), "thiếu hướng dẫn: {msg}");
+    }
+
+    #[test]
+    fn empty_stderr_gives_empty_summary() {
+        assert_eq!(D::summarize_ytdlp_error(&[]), "");
+    }
+
+    #[test]
+    fn extension_follows_the_real_url_not_a_hardcoded_guess() {
+        assert_eq!(D::guess_extension("https://cdn/x/video.mp4?token=abc&x=1"), "mp4");
+        // CDN Instagram tra ve JPEG du URL co duoi .heic
+        assert_eq!(D::guess_extension("https://cdn/x/photo.heic?stp=dst-jpg_e35_tt6"), "jpg");
+        assert_eq!(D::guess_extension("https://cdn/x/photo.heic"), "heic");
+        assert_eq!(D::guess_extension("https://cdn/x/photo.JPEG"), "jpg");
+        assert_eq!(D::guess_extension("https://cdn/x/nostem"), "jpg");
+    }
+
+    #[test]
+    fn file_names_are_stripped_of_path_separators() {
+        assert_eq!(D::sanitize_file_name("a/b:c*d", "fb"), "a_b_c_d");
+        assert_eq!(D::sanitize_file_name("   ", "fb"), "fb");
+        assert_eq!(D::sanitize_file_name("....", "fb"), "fb");
+    }
 }

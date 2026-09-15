@@ -11,6 +11,8 @@ import { detectPlatform } from '../constants'
 import {
   crawlProfile,
   startNativeDownload,
+  createTaskId,
+  downloadDirectFile,
   downloadZipArchive,
   downloadAlbumBatch,
   onDownloadProgress,
@@ -28,8 +30,8 @@ export default function AccountDownloader({ onShowToast }) {
   const [rangeFrom, setRangeFrom] = useState('1')
   const [rangeTo, setRangeTo] = useState('20')
   const [isCrawling, setIsCrawling] = useState(false)
-  const [crawlProgress, setCrawlProgress] = useState(0)
   const [statusText, setStatusText] = useState('')
+  const [elapsedCrawl, setElapsedCrawl] = useState(0)
 
   // Kết quả quét tài khoản
   const [profileResult, setProfileResult] = useState(null)
@@ -57,7 +59,6 @@ export default function AccountDownloader({ onShowToast }) {
     setNativeProgress(null)
     setDownloadStartTime(null)
     setDownloadTaskTitle('')
-    setCrawlProgress(0)
     setStatusText('')
     setDownloadingId(null)
     setIsZipDownloading(false)
@@ -89,18 +90,15 @@ export default function AccountDownloader({ onShowToast }) {
     }
 
     setIsCrawling(true)
-    setCrawlProgress(15)
+    setElapsedCrawl(0)
     setStatusText('Đang kết nối tài khoản...')
 
-    const progressTimer = setInterval(() => {
-      setCrawlProgress((prev) => {
-        if (prev < 45) return prev + 8
-        if (prev < 75) return prev + 4
-        if (prev < 88) return prev + 2
-        if (prev < 95) return prev + 1
-        return prev
-      })
-    }, 400)
+    // Không có cách nào biết trước tổng số bài viết, nên hiển thị thời gian đã
+    // trôi qua (số liệu thật) thay vì một thanh phần trăm tự bịa.
+    const startedAt = Date.now()
+    const elapsedTimer = setInterval(() => {
+      setElapsedCrawl(Math.floor((Date.now() - startedAt) / 1000))
+    }, 1000)
 
     try {
       const isRange = crawlLimit === 'range'
@@ -128,9 +126,6 @@ export default function AccountDownloader({ onShowToast }) {
         rangeEnd: endNum,
       })
 
-      clearInterval(progressTimer)
-      setCrawlProgress(100)
-
       if (resultData && resultData.media && resultData.media.length > 0) {
         setProfileResult(resultData)
         setSelectedBatchIds({})
@@ -139,11 +134,10 @@ export default function AccountDownloader({ onShowToast }) {
         onShowToast?.('Không tìm thấy tệp phương tiện công khai nào từ tài khoản này.')
       }
     } catch (err) {
-      clearInterval(progressTimer)
       onShowToast?.(err.message || 'Lỗi khi quét tài khoản!')
     } finally {
+      clearInterval(elapsedTimer)
       setIsCrawling(false)
-      setCrawlProgress(0)
       setStatusText('')
     }
   }
@@ -166,40 +160,73 @@ export default function AccountDownloader({ onShowToast }) {
       }
     }
 
+    const taskId = createTaskId()
+    const isImage = item.type === 'image'
     setDownloadStartTime(Date.now())
     setDownloadTaskTitle(item.title || 'Tệp tải xuống')
-    setNativeProgress({ percent: 0, speed: '', eta: 'Khởi tạo luồng tải...', status: 'downloading' })
+    setNativeProgress({
+      id: taskId,
+      percent: 0,
+      speed: '',
+      eta: '',
+      status: 'preparing',
+      phase: 'Đang chuẩn bị tải...',
+    })
 
+    let unlisten = null
     try {
-      onShowToast?.(`Bắt đầu tải: ${item.title?.slice(0, 30) || 'video'}...`)
-      let unlisten = null
-      try {
-        unlisten = await onDownloadProgress((payload) => {
-          setNativeProgress(payload)
+      onShowToast?.(`Bắt đầu tải: ${item.title?.slice(0, 30) || (isImage ? 'ảnh' : 'video')}...`)
+
+      let res
+      if (isImage) {
+        // Ảnh là liên kết CDN trực tiếp — tải thẳng, không cần cho qua yt-dlp
+        res = await downloadDirectFile({
+          url: item.url,
+          filename: item.title || 'image',
+          referer: profileResult?.url,
+          destDir: targetDir,
         })
-      } catch (e) {
-        console.warn('Cannot attach progress listener:', e)
+      } else {
+        try {
+          unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+        } catch (e) {
+          console.warn('Cannot attach progress listener:', e)
+        }
+        res = await startNativeDownload({
+          url: item.url,
+          title: item.title,
+          destDir: targetDir,
+          taskId,
+        })
       }
 
-      const res = await startNativeDownload({
-        url: item.url,
-        title: item.title,
-        destDir: targetDir,
-      })
-
-      if (typeof unlisten === 'function') unlisten()
-
-      if (res?.file_name) {
-        setNativeProgress({ percent: 100, speed: '', eta: '00:00', status: 'completed' })
-        onShowToast?.(`Đã lưu: ${res.file_name}`)
+      if (res?.success) {
+        setNativeProgress({
+          id: taskId,
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'completed',
+          phase: 'Hoàn tất',
+          filePath: res.file_path,
+          fileName: res.file_name,
+        })
+        onShowToast?.(`Đã lưu tại: ${res.file_path || res.file_name || 'tệp'}`)
       }
     } catch (err) {
-      setNativeProgress({ percent: 0, speed: '', eta: '', status: 'error' })
-      onShowToast?.(err.message || 'Lỗi khi tải video')
+      setNativeProgress({
+        id: taskId,
+        percent: 0,
+        speed: '',
+        eta: '',
+        status: 'error',
+        phase: 'Tải thất bại',
+        message: err.message,
+      })
+      onShowToast?.(err.message || 'Lỗi khi tải tệp')
     } finally {
-      setTimeout(() => {
-        setDownloadingId(null)
-      }, 2000)
+      if (typeof unlisten === 'function') unlisten()
+      setDownloadingId(null)
     }
   }
 
@@ -237,15 +264,31 @@ export default function AccountDownloader({ onShowToast }) {
       }
     }
 
+    const taskId = createTaskId()
     setIsZipDownloading(true)
     setDownloadStartTime(Date.now())
     setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} tệp`)
-    setNativeProgress({ percent: 15, speed: '', eta: 'Đang chuẩn bị...', status: 'downloading' })
+    setNativeProgress({
+      id: taskId,
+      percent: 0,
+      speed: '',
+      eta: '',
+      status: 'preparing',
+      phase: `Chuẩn bị tải ${itemsToDownload.length} tệp...`,
+    })
 
+    let unlisten = null
     try {
+      try {
+        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+      } catch (e) {
+        console.warn('Cannot attach progress listener:', e)
+      }
+
       const zipPayload = itemsToDownload.map((it) => ({
         url: it.url,
-        filename: `${it.title || 'media'}_${it.id}.mp4`,
+        // Đuôi tệp do Rust suy ra từ URL thật — ảnh không còn bị đặt tên .mp4
+        filename: `${it.title || 'media'}_${it.id}`,
         referer: profileResult?.url,
       }))
       const res = await downloadAlbumBatch({
@@ -253,13 +296,32 @@ export default function AccountDownloader({ onShowToast }) {
         albumName: `Profile_${profileResult?.name || 'Media'}`,
         destDir: targetDir,
         asZip: asZip,
+        taskId,
       })
-      setNativeProgress({ percent: 100, speed: '', eta: '00:00', status: 'completed' })
-      onShowToast?.(res?.message || `Đã tải thành công (${itemsToDownload.length} tệp)!`)
+      setNativeProgress({
+        id: taskId,
+        percent: 100,
+        speed: '',
+        eta: '',
+        status: 'completed',
+        phase: 'Hoàn tất',
+        filePath: res?.file_path,
+        fileName: res?.file_name,
+      })
+      onShowToast?.(res?.message || (res?.file_path ? `Đã lưu tại: ${res.file_path}` : `Đã tải thành công (${itemsToDownload.length} tệp)!`))
     } catch (err) {
-      setNativeProgress({ percent: 0, speed: '', eta: '', status: 'error' })
+      setNativeProgress({
+        id: taskId,
+        percent: 0,
+        speed: '',
+        eta: '',
+        status: 'error',
+        phase: 'Tải thất bại',
+        message: err.message,
+      })
       onShowToast?.(err.message || 'Lỗi khi tải danh sách')
     } finally {
+      if (typeof unlisten === 'function') unlisten()
       setIsZipDownloading(false)
     }
   }
@@ -314,7 +376,6 @@ export default function AccountDownloader({ onShowToast }) {
                   setNativeProgress(null)
                   setDownloadStartTime(null)
                   setDownloadTaskTitle('')
-                  setCrawlProgress(0)
                   setStatusText('')
                 }
               }}
@@ -419,7 +480,7 @@ export default function AccountDownloader({ onShowToast }) {
               {isCrawling ? (
                 <>
                   <span className="minimal-spinner" />
-                  <span>Đang quét... {crawlProgress}%</span>
+                  <span>Đang quét... {elapsedCrawl}s</span>
                 </>
               ) : (
                 <>
@@ -433,9 +494,9 @@ export default function AccountDownloader({ onShowToast }) {
           {statusText && (
             <div className="status-progress-line">
               <span className="validation-hint">{statusText}</span>
-              {crawlProgress > 0 && (
+              {isCrawling && (
                 <div className="progress-track-small">
-                  <div className="progress-fill" style={{ width: `${crawlProgress}%` }} />
+                  <div className="progress-fill is-indeterminate" />
                 </div>
               )}
             </div>

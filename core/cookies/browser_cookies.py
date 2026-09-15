@@ -28,6 +28,55 @@ except ImportError:
     HAS_SECRETSTORAGE = False
 
 
+# Các hậu tố TLD 2 cấp phổ biến (co.uk, com.vn...) — cần giữ 3 nhãn thay vì 2
+_MULTI_PART_TLDS = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "co.jp", "or.jp", "ne.jp",
+    "com.vn", "net.vn", "org.vn", "edu.vn", "gov.vn",
+    "com.br", "com.au", "com.cn", "com.tw", "com.hk", "com.sg",
+    "com.mx", "com.ar", "com.tr", "co.kr", "co.in", "co.id", "co.th",
+}
+
+
+def registrable_domain(host: Optional[str]) -> Optional[str]:
+    """Rút gọn hostname về domain đăng ký được.
+
+    www.instagram.com -> instagram.com ; m.facebook.com -> facebook.com
+    Cookie đăng nhập hầu như luôn nằm trên domain gốc (.instagram.com), nên nếu
+    lọc theo hostname đầy đủ thì sẽ vứt mất sessionid/csrftoken.
+    """
+    if not host:
+        return None
+    h = host.strip().lower().lstrip(".")
+    if not h or h.replace(".", "").isdigit():  # IP literal
+        return h or None
+    parts = [p for p in h.split(".") if p]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    if ".".join(parts[-2:]) in _MULTI_PART_TLDS and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+# Tên cookie chứng minh phiên đăng nhập của từng nền tảng — dùng để cảnh báo sớm
+# thay vì để extractor chạy rồi thất bại với lỗi khó hiểu.
+_SESSION_COOKIE_NAMES = {
+    "instagram.com": {"sessionid", "ds_user_id"},
+    "facebook.com": {"c_user", "xs"},
+    "threads.net": {"sessionid", "ds_user_id"},
+    "x.com": {"auth_token", "ct0"},
+    "twitter.com": {"auth_token", "ct0"},
+    "reddit.com": {"reddit_session", "token_v2"},
+    "tiktok.com": {"sessionid", "sessionid_ss"},
+    "pinterest.com": {"_pinterest_sess"},
+    "youtube.com": {"SID", "__Secure-3PSID"},
+}
+
+
+def _host_matches(host: str, base_domain: str) -> bool:
+    h = host.strip().lower().lstrip(".")
+    return h == base_domain or h.endswith("." + base_domain)
+
+
 class BrowserCookieExporter:
     """Trích xuất cookies từ trình duyệt trên Linux"""
 
@@ -143,11 +192,22 @@ class BrowserCookieExporter:
         return None
 
     def extract_chromium_cookies(self, browser: str) -> List[Tuple[str, str, str, str, int, str, str]]:
-        db_paths = self.get_chromium_cookie_db_paths(browser)
-        if not db_paths:
-            return []
+        """Gộp cookies từ TẤT CẢ profile của trình duyệt (Default, Profile 1, ...).
 
-        db_path = db_paths[0]
+        Trước đây chỉ đọc profile đầu tiên do glob trả về — nếu người dùng đăng nhập
+        ở profile khác thì coi như không có cookie.
+        """
+        merged: Dict[Tuple[str, str, str], Tuple[str, str, str, str, int, str, str]] = {}
+        for db_path in self.get_chromium_cookie_db_paths(browser):
+            for row in self._read_chromium_db(browser, db_path):
+                key = (row[0], row[2], row[5])  # host, path, name
+                prev = merged.get(key)
+                # Ưu tiên bản ghi có giá trị thật (giải mã thành công) và hạn xa hơn
+                if prev is None or (not prev[6] and row[6]) or (row[6] and row[4] > prev[4]):
+                    merged[key] = row
+        return list(merged.values())
+
+    def _read_chromium_db(self, browser: str, db_path: str) -> List[Tuple[str, str, str, str, int, str, str]]:
         cookies_out = []
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -196,11 +256,17 @@ class BrowserCookieExporter:
         return cookies_out
 
     def extract_firefox_cookies(self) -> List[Tuple[str, str, str, str, int, str, str]]:
-        db_paths = self.get_firefox_cookie_db_paths()
-        if not db_paths:
-            return []
+        """Gộp cookies từ tất cả profile Firefox (mặc định, snap, flatpak)."""
+        merged: Dict[Tuple[str, str, str], Tuple[str, str, str, str, int, str, str]] = {}
+        for db_path in self.get_firefox_cookie_db_paths():
+            for row in self._read_firefox_db(db_path):
+                key = (row[0], row[2], row[5])
+                prev = merged.get(key)
+                if prev is None or (not prev[6] and row[6]) or (row[6] and row[4] > prev[4]):
+                    merged[key] = row
+        return list(merged.values())
 
-        db_path = db_paths[0]
+    def _read_firefox_db(self, db_path: str) -> List[Tuple[str, str, str, str, int, str, str]]:
         cookies_out = []
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -234,7 +300,7 @@ class BrowserCookieExporter:
     def find_best_browser(self, domain_filter: Optional[str] = None) -> Optional[str]:
         """Tự động tìm trình duyệt phù hợp nhất có chứa cookies cho domain"""
         candidates = ["firefox", "edge", "chrome", "brave", "chromium"]
-        clean_d = domain_filter.lower().lstrip(".") if domain_filter else None
+        clean_d = registrable_domain(domain_filter)
 
         # 1. Ưu tiên trình duyệt thực sự có cookies cho domain chỉ định
         if clean_d:
@@ -281,13 +347,13 @@ class BrowserCookieExporter:
             "",
         ]
 
-        filter_clean = domain_filter.lower().lstrip(".") if domain_filter else None
+        # Luôn lọc theo domain gốc (instagram.com) chứ không phải hostname đầy đủ
+        # (www.instagram.com), nếu không sẽ loại mất toàn bộ cookie .instagram.com.
+        filter_clean = registrable_domain(domain_filter) if domain_filter else None
 
         for host, domain_flag, path, sec_flag, exp_unix, name, val in raw_cookies:
-            if filter_clean:
-                h = host.lower().lstrip(".")
-                if h != filter_clean and not h.endswith("." + filter_clean):
-                    continue
+            if filter_clean and not _host_matches(host, filter_clean):
+                continue
             lines.append(f"{host}\t{domain_flag}\t{path}\t{sec_flag}\t{exp_unix}\t{name}\t{val}")
 
         return "\n".join(lines) + "\n"
@@ -374,21 +440,35 @@ def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str]
             return output_path
 
         # Ưu tiên 2: trích xuất từ trình duyệt hệ thống
-        # Chỉ khi browser được chỉ định rõ ràng (không phải auto/None)
-        # Với auto/None, chỉ dùng nếu có >= 5 cookies có giá trị cho đúng domain
         exporter = BrowserCookieExporter()
         target_browser = browser if (browser and browser != "auto") else "auto"
         content = exporter.export_cookies_netscape(target_browser, domain)
 
-        data_lines = [l for l in content.splitlines() if l and not l.startswith("#") and "\t" in l]
-        min_required = 2 if (browser and browser not in ("auto", "")) else 5
+        # Chỉ đếm cookie có GIÁ TRỊ thật — cookie rỗng là dấu hiệu giải mã thất bại.
+        data_lines = [
+            l for l in content.splitlines()
+            if l and not l.startswith("#") and l.count("\t") >= 6 and l.rsplit("\t", 1)[-1].strip()
+        ]
 
-        if not data_lines or len(data_lines) < min_required:
+        if not data_lines:
             sys.stderr.write(
-                f"[Cookies] Bỏ qua cookies browser (chỉ có {len(data_lines)} dòng, cần ít nhất {min_required}). "
-                f"Hãy lưu cookie thủ công qua Cookie Manager.\n"
+                f"[Cookies] Không tìm thấy cookie hợp lệ cho domain '{domain or 'bất kỳ'}'. "
+                f"Hãy đăng nhập trên trình duyệt hoặc dán cookie thủ công qua Cookie Manager.\n"
             )
             return None
+
+        if domain:
+            base = registrable_domain(domain)
+            session_names = _SESSION_COOKIE_NAMES.get(base, set())
+            if session_names:
+                found = {l.split("\t")[5] for l in data_lines}
+                if not (found & session_names):
+                    sys.stderr.write(
+                        f"[Cookies] Tìm thấy {len(data_lines)} cookie cho {base} nhưng THIẾU cookie đăng nhập "
+                        f"({', '.join(sorted(session_names))}). Nội dung riêng tư có thể sẽ không tải được.\n"
+                    )
+                else:
+                    sys.stderr.write(f"[Cookies] Dùng {len(data_lines)} cookie đã đăng nhập của {base}\n")
 
         if not output_path:
             fd, tmp_file = tempfile.mkstemp(prefix="cookies_", suffix=".txt")
