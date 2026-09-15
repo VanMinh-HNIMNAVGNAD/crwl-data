@@ -207,6 +207,7 @@ export async function startNativeDownload({
   concurrentFragments = null,
   videoFormat = null,
   proxy = null,
+  referer = null,
   useAria2c = false,
   taskId = null,
 }) {
@@ -236,6 +237,7 @@ export async function startNativeDownload({
       concurrent_fragments: concurrentFragments ? Number(concurrentFragments) : null,
       video_format: videoFormat || null,
       proxy: proxy || null,
+      referer: referer || null,
       use_aria2c: Boolean(useAria2c),
       task_id: taskId || null,
     },

@@ -299,10 +299,11 @@ export default function LinkDownloader({ onShowToast }) {
       }
 
       const res = await startNativeDownload({
-        url: singleMedia.originalUrl,
-        formatId: stream.formatId,
+        url: stream.url || singleMedia.originalUrl,
+        formatId: stream.url ? null : stream.formatId,
         isAudio: isAudioOnly,
         isMute: isMute,
+        referer: stream.url ? singleMedia.originalUrl : undefined,
         startTime: trimStart || undefined,
         endTime: trimEnd || undefined,
         title: singleMedia.title,

@@ -50,6 +50,8 @@ pub struct DownloadOptions {
     pub concurrent_fragments: Option<u32>,
     #[serde(alias = "proxy")]
     pub proxy: Option<String>,
+    #[serde(alias = "referer")]
+    pub referer: Option<String>,
     #[serde(alias = "videoFormat")]
     pub video_format: Option<String>,
     /// Mã định danh riêng của tác vụ tải — UI dùng để lọc đúng sự kiện tiến trình
@@ -304,6 +306,12 @@ impl DownloaderService {
         if let Some(ref proxy) = opts.proxy {
             if !proxy.trim().is_empty() {
                 cmd.arg("--proxy").arg(proxy.trim());
+            }
+        }
+
+        if let Some(ref referer) = opts.referer {
+            if !referer.trim().is_empty() {
+                cmd.arg("--referer").arg(referer.trim());
             }
         }
 

@@ -16,10 +16,12 @@ Không hỗ trợ (hardware DRM):
 - Token-based streams hết hạn ngay khi load (< 1s)
 """
 
+import os
 import re
 import sys
 import time
 from typing import Optional, List, Dict, Any
+from urllib.parse import urljoin
 from .base import BaseExtractor
 from ..models import StreamFormat, MediaImage
 from ..cookies.browser_cookies import get_browser_cookies_txt
@@ -192,6 +194,30 @@ class PlaywrightStreamSniffer(BaseExtractor):
                 # Bắt tất cả requests
                 page = context.new_page()
 
+                def add_candidate(url: str, source: str) -> None:
+                    if not url or url.startswith(("blob:", "data:", "javascript:")):
+                        return
+                    if self._is_media_url(url) and url not in captured_urls:
+                        captured_urls.append(url)
+                        self.log(f"[Sniffer] Bắt qua {source}: {url[:120]}")
+
+                def inspect_payload(payload: str, base_url: str, source: str) -> None:
+                    if not payload or len(payload) > 4_000_000:
+                        return
+                    # JSON/HTML thường giữ URL tuyệt đối hoặc URL tương đối của
+                    # manifest trong các thuộc tính file/src/source/playlist.
+                    absolute_urls = re.findall(r'https?://[^\s"\'<>\\]+', payload)
+                    relative_urls = re.findall(
+                        r'["\']([^"\']+(?:\.m3u8|\.mpd|/manifest|/playlist|/hls/|/dash/)[^"\']*)["\']',
+                        payload,
+                        re.IGNORECASE,
+                    )
+                    for candidate in absolute_urls + relative_urls:
+                        add_candidate(urljoin(base_url, candidate).rstrip('\\'), source)
+
+                    if '#EXTM3U' in payload or '<MPD' in payload:
+                        add_candidate(base_url, f'{source} manifest')
+
                 def on_request(request):
                     url = request.url
                     rtype = request.resource_type
@@ -201,8 +227,9 @@ class PlaywrightStreamSniffer(BaseExtractor):
                             if url not in captured_urls:
                                 captured_urls.append(url)
                                 self.log(f"[Sniffer] Bắt được: [{rtype}] {url[:120]}")
-                        # Iframe player
-                        if rtype == "document" and self._is_embed_player(url) and url != page_url:
+                        # Thu mọi document iframe; nhiều player không dùng URL
+                        # có chữ embed/player nên không thể lọc bằng hostname.
+                        if rtype == "document" and url != page_url:
                             if url not in iframe_urls:
                                 iframe_urls.append(url)
 
@@ -214,10 +241,13 @@ class PlaywrightStreamSniffer(BaseExtractor):
                         if url not in captured_urls:
                             captured_urls.append(url)
                             self.log(f"[Sniffer] Bắt qua Content-Type: {ctype[:50]} — {url[:100]}")
-                    # JSON có thể chứa stream URL
-                    elif "application/json" in ctype and self._is_media_url(url):
-                        if url not in captured_urls:
-                            captured_urls.append(url)
+                    # Manifest có thể không có đuôi mở rộng nhưng vẫn khai báo
+                    # đúng Content-Type.
+                    elif "application/json" in ctype or "text/html" in ctype or "javascript" in ctype:
+                        try:
+                            inspect_payload(response.text(), url, f"response {ctype.split(';')[0]}")
+                        except Exception:
+                            pass
 
                 page.on("request", on_request)
                 page.on("response", on_response)
@@ -235,6 +265,28 @@ class PlaywrightStreamSniffer(BaseExtractor):
                 # Đợi để JS chạy và requests được phát
                 actual_wait = min(wait_ms, 12000)
                 page.wait_for_timeout(actual_wait)
+
+                # Player có thể được tạo động trong iframe và không xuất hiện
+                # trong HTML ban đầu. Đọc cả DOM media elements và resource
+                # timing để tìm manifest không có tên file quen thuộc.
+                for frame in page.frames:
+                    frame_url = frame.url
+                    if frame_url and frame_url != "about:blank" and frame_url != page_url:
+                        if frame_url not in iframe_urls:
+                            iframe_urls.append(frame_url)
+                    try:
+                        discovered = frame.evaluate(
+                            """() => ({
+                                media: Array.from(document.querySelectorAll('video, audio, source')).flatMap((el) => [el.src, el.currentSrc]).filter(Boolean),
+                                resources: performance.getEntriesByType('resource').map((entry) => entry.name)
+                            })"""
+                        )
+                        for media_url in (discovered or {}).get("media", []):
+                            add_candidate(media_url, "DOM media")
+                        for resource_url in (discovered or {}).get("resources", []):
+                            add_candidate(resource_url, "performance")
+                    except Exception:
+                        pass
 
                 # Bóc tách ảnh từ nội dung trang (ảnh chất lượng cao bài viết)
                 try:
@@ -260,15 +312,8 @@ class PlaywrightStreamSniffer(BaseExtractor):
                 except Exception:
                     pass
 
-                # Nếu chưa tìm được và có iframes, thử từng iframe
-                if not captured_urls and follow_iframes:
-                    frames = page.frames
-                    for frame in frames[1:]:  # bỏ main frame
-                        frame_url = frame.url
-                        if frame_url and frame_url != "about:blank":
-                            if frame_url not in iframe_urls:
-                                iframe_urls.append(frame_url)
-                            self.log(f"[Sniffer] Phát hiện iframe: {frame_url[:100]}")
+                for iframe_url in iframe_urls:
+                    self.log(f"[Sniffer] Phát hiện iframe: {iframe_url[:100]}")
 
                 browser.close()
 
