@@ -43,7 +43,7 @@ class GalleryDlExtractor(BaseExtractor):
                 import urllib.parse
                 try:
                     parsed = urllib.parse.urlparse(target_url)
-                    domain = parsed.netloc or None
+                    domain = (parsed.hostname or parsed.netloc or None)
                 except Exception:
                     pass
             exported = get_browser_cookies_txt(browser or "auto", domain=domain)

@@ -58,7 +58,7 @@ class YtDlpExtractor(BaseExtractor):
                 import urllib.parse
                 try:
                     parsed = urllib.parse.urlparse(target_url)
-                    domain = parsed.netloc or None
+                    domain = (parsed.hostname or parsed.netloc or None)
                 except Exception:
                     pass
             exported = get_browser_cookies_txt(browser or "auto", domain=domain)
@@ -79,16 +79,16 @@ class YtDlpExtractor(BaseExtractor):
         cmd = [self.binary_path] + args + ["--dump-json", url]
 
         self.log(f"yt-dlp extract: {url}")
-        code, stdout, stderr = self.run_process(cmd, timeout=timeout)
+        try:
+            code, stdout, stderr = self.run_process(cmd, timeout=timeout)
+        finally:
+            if tmp_cookie and os.path.exists(tmp_cookie):
+                try:
+                    os.remove(tmp_cookie)
+                except Exception:
+                    pass
 
-        if tmp_cookie and os.path.exists(tmp_cookie):
-            try:
-                os.remove(tmp_cookie)
-            except Exception:
-                pass
-
-        if code != 0 and not stdout.strip():
-            # Thử lại không dùng cookies nếu trước đó dùng cookies bị từ chối
+        if code != 0 or not stdout.strip():
             if browser and browser != "none":
                 self.warn("yt-dlp extract lỗi với cookies, đang thử lại không dùng cookies ('none')...")
                 return self.extract_metadata(url, browser="none", timeout=timeout)
@@ -102,11 +102,17 @@ class YtDlpExtractor(BaseExtractor):
                 break
 
         if not json_line:
+            if browser and browser != "none":
+                self.warn("yt-dlp không trả metadata hợp lệ với cookies, thử lại không cookie...")
+                return self.extract_metadata(url, browser="none", timeout=timeout)
             raise ValueError("Không tìm thấy dữ liệu JSON hợp lệ từ kết quả yt-dlp.")
 
         try:
             raw_data = json.loads(json_line)
         except json.JSONDecodeError as e:
+            if browser and browser != "none":
+                self.warn("yt-dlp trả JSON lỗi với cookies, thử lại không cookie...")
+                return self.extract_metadata(url, browser="none", timeout=timeout)
             raise ValueError(f"Lỗi parse JSON yt-dlp: {e}")
 
         return self._normalize_metadata(raw_data, url)

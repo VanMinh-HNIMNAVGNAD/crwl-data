@@ -39,24 +39,22 @@ class BrowserCookieExporter:
         candidates = []
         if browser in ("edge", "microsoft-edge"):
             base = os.path.join(self.home, ".config/microsoft-edge")
-            for profile in ("Default", "Profile 1", "Profile 2"):
-                candidates.append(os.path.join(base, profile, "Cookies"))
-                candidates.append(os.path.join(base, profile, "Network", "Cookies"))
         elif browser in ("chrome", "google-chrome"):
             base = os.path.join(self.home, ".config/google-chrome")
-            for profile in ("Default", "Profile 1", "Profile 2"):
-                candidates.append(os.path.join(base, profile, "Cookies"))
-                candidates.append(os.path.join(base, profile, "Network", "Cookies"))
         elif browser in ("brave", "brave-browser"):
             base = os.path.join(self.home, ".config/BraveSoftware/Brave-Browser")
-            for profile in ("Default", "Profile 1"):
-                candidates.append(os.path.join(base, profile, "Cookies"))
-                candidates.append(os.path.join(base, profile, "Network", "Cookies"))
         elif browser in ("chromium", "chromium-browser"):
             base = os.path.join(self.home, ".config/chromium")
-            for profile in ("Default", "Profile 1"):
-                candidates.append(os.path.join(base, profile, "Cookies"))
-                candidates.append(os.path.join(base, profile, "Network", "Cookies"))
+        else:
+            return []
+
+        # Profiles are user-created and Chromium moved the DB to Network/Cookies.
+        # Inspect both locations instead of assuming only the first few profiles.
+        for profile_dir in glob.glob(os.path.join(base, "*")):
+            if not os.path.isdir(profile_dir):
+                continue
+            candidates.append(os.path.join(profile_dir, "Cookies"))
+            candidates.append(os.path.join(profile_dir, "Network", "Cookies"))
 
         return [p for p in candidates if os.path.exists(p)]
 
@@ -107,7 +105,8 @@ class BrowserCookieExporter:
             return None
         try:
             cipher = Cipher(algorithms.AES(key), modes.CBC(b" " * 16), backend=default_backend())
-            dec = cipher.decryptor().update(ciphertext) + cipher.decryptor().finalize()
+            decryptor = cipher.decryptor()
+            dec = decryptor.update(ciphertext) + decryptor.finalize()
             dec = self.unpad_pkcs7(dec)
             if hash_prefix and len(dec) > 32:
                 try:
@@ -178,8 +177,11 @@ class BrowserCookieExporter:
                 cookie_val = val or ""
                 if enc and (enc.startswith(b"v10") or enc.startswith(b"v11")):
                     if key:
-                        is_v11 = enc.startswith(b"v11")
-                        dec = self.decrypt_aes_cbc(key, enc[3:], hash_prefix=is_v11)
+                        # Chromium cookie plaintext may contain a 32-byte host hash
+                        # (v10/v11). Try the modern layout first, then legacy.
+                        dec = self.decrypt_aes_cbc(key, enc[3:], hash_prefix=True)
+                        if dec is None:
+                            dec = self.decrypt_aes_cbc(key, enc[3:], hash_prefix=False)
                         if dec is not None:
                             cookie_val = dec
 
@@ -363,7 +365,13 @@ def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str]
         manual = _find_manual_cookie_file(domain)
         if manual:
             sys.stderr.write(f"[Cookies] Dùng file cookie thủ công: {manual}\n")
-            return manual
+            # Extractors remove temporary exports after each request. Copy manual
+            # cookies so a successful extraction never deletes the user's source.
+            if not output_path:
+                fd, output_path = tempfile.mkstemp(prefix="cookies_manual_", suffix=".txt")
+                os.close(fd)
+            shutil.copyfile(manual, output_path)
+            return output_path
 
         # Ưu tiên 2: trích xuất từ trình duyệt hệ thống
         # Chỉ khi browser được chỉ định rõ ràng (không phải auto/None)
