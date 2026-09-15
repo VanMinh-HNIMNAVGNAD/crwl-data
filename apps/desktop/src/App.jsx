@@ -12,10 +12,15 @@ function App() {
   const [isCookieManagerOpen, setIsCookieManagerOpen] = useState(false)
   const [isToolsOpen, setIsToolsOpen] = useState(false)
   const [toastMessage, setToastMessage] = useState('')
+  const [cookieRefreshKey, setCookieRefreshKey] = useState(0)
 
   const showToast = (msg) => {
     setToastMessage(msg)
     setTimeout(() => setToastMessage(''), 3200)
+  }
+
+  const handleCookieUpdated = () => {
+    setCookieRefreshKey((k) => k + 1)
   }
 
   return (
@@ -26,6 +31,7 @@ function App() {
         onOpenCookies={() => setIsCookieManagerOpen(true)}
         onOpenTools={() => setIsToolsOpen(true)}
         onShowToast={showToast}
+        cookieRefreshKey={cookieRefreshKey}
       />
 
       {/* Vùng làm việc chính: 2 cột chia đôi đối xứng bằng 1 thanh dọc | ở giữa */}
@@ -53,7 +59,11 @@ function App() {
 
       {/* Modals */}
       <DownloadHistoryModal isOpen={isHistoryOpen} onClose={() => setIsHistoryOpen(false)} />
-      <CookieManager isOpen={isCookieManagerOpen} onClose={() => setIsCookieManagerOpen(false)} />
+      <CookieManager
+        isOpen={isCookieManagerOpen}
+        onClose={() => setIsCookieManagerOpen(false)}
+        onCookieUpdated={handleCookieUpdated}
+      />
       <ToolsManagerModal isOpen={isToolsOpen} onClose={() => setIsToolsOpen(false)} onShowToast={showToast} />
     </div>
   )

@@ -4,12 +4,14 @@ import {
   IconInstagram,
   IconX,
   IconTikTok,
+  IconFacebook,
+  IconYouTube,
   IconReddit,
   IconSettings,
 } from './Icons'
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Platform configs (mirrored từ backend)
+// Platform configs
 // ─────────────────────────────────────────────────────────────────────────────
 
 const PLATFORMS = [
@@ -19,7 +21,6 @@ const PLATFORMS = [
     icon: IconInstagram,
     domain: 'instagram.com',
     color: '#e1306c',
-    gradientClass: 'ig-gradient',
     requiredKeys: ['sessionid'],
     optionalKeys: ['csrftoken', 'ds_user_id'],
     guide: [
@@ -27,10 +28,10 @@ const PLATFORMS = [
       { step: 2, text: 'Nhấn F12 → chọn tab "Application" (Chrome/Edge) hoặc "Storage" (Firefox)' },
       { step: 3, text: 'Bên trái: Cookies → https://www.instagram.com' },
       { step: 4, text: 'Tìm dòng "sessionid" → copy toàn bộ giá trị trong cột "Value"' },
-      { step: 5, text: 'Hoặc copy toàn bộ: nhấp phải vào tên Cookie → Copy all as cURL → lấy phần sau -H "Cookie:"' },
+      { step: 5, text: 'Hoặc copy toàn bộ cookie string (dạng key=val; key2=val2) / file Netscape / JSON đều được' },
     ],
     placeholder: 'sessionid=abc123def456...\ncsrftoken=xyz789...',
-    hint: 'Cần nhất: sessionid. Dán cả dòng "key=value; key2=value2" đều được.',
+    hint: 'Cần nhất: sessionid. Dán cả chuỗi "key=value; key2=value2" hoặc JSON Cookie-Editor đều được.',
   },
   {
     id: 'twitter',
@@ -38,7 +39,6 @@ const PLATFORMS = [
     icon: IconX,
     domain: 'x.com',
     color: '#1d9bf0',
-    gradientClass: 'x-gradient',
     requiredKeys: ['auth_token'],
     optionalKeys: ['ct0', 'guest_id'],
     guide: [
@@ -46,10 +46,10 @@ const PLATFORMS = [
       { step: 2, text: 'Nhấn F12 → chọn tab "Application" (Chrome/Edge) hoặc "Storage" (Firefox)' },
       { step: 3, text: 'Bên trái: Cookies → https://x.com' },
       { step: 4, text: 'Tìm "auth_token" và "ct0" → copy giá trị của cả hai' },
-      { step: 5, text: 'Dán vào ô bên dưới theo dạng: auth_token=VALUE; ct0=VALUE' },
+      { step: 5, text: 'Dán vào ô bên dưới: auth_token=VALUE; ct0=VALUE' },
     ],
     placeholder: 'auth_token=abc123...\nct0=def456...',
-    hint: 'Cần nhất: auth_token. Nên thêm ct0 để tránh bị khóa.',
+    hint: 'Cần nhất: auth_token. Nên kèm ct0 để tránh bị hạn chế.',
   },
   {
     id: 'tiktok',
@@ -57,16 +57,48 @@ const PLATFORMS = [
     icon: IconTikTok,
     domain: 'tiktok.com',
     color: '#fe2c55',
-    gradientClass: 'tt-gradient',
     requiredKeys: ['sessionid'],
     optionalKeys: ['s_v_web_id', 'ttwid'],
     guide: [
       { step: 1, text: 'Mở tiktok.com và đăng nhập tài khoản' },
       { step: 2, text: 'F12 → Application → Cookies → https://www.tiktok.com' },
-      { step: 3, text: 'Tìm và copy "sessionid"' },
+      { step: 3, text: 'Tìm và copy giá trị "sessionid"' },
     ],
     placeholder: 'sessionid=abc123...\ns_v_web_id=verify_...',
-    hint: 'Cần nhất: sessionid',
+    hint: 'Cần nhất: sessionid. Giúp tải các video riêng tư hoặc profile hạn chế.',
+  },
+  {
+    id: 'facebook',
+    name: 'Facebook',
+    icon: IconFacebook,
+    domain: 'facebook.com',
+    color: '#1877f2',
+    requiredKeys: ['c_user', 'xs'],
+    optionalKeys: ['fr', 'datr'],
+    guide: [
+      { step: 1, text: 'Mở facebook.com và đăng nhập' },
+      { step: 2, text: 'F12 → Application → Cookies → https://www.facebook.com' },
+      { step: 3, text: 'Tìm và copy 2 giá trị "c_user" và "xs"' },
+      { step: 4, text: 'Dán dạng: c_user=1000...; xs=2%3A...' },
+    ],
+    placeholder: 'c_user=1000...\nxs=2%3A...',
+    hint: 'Cần nhất: c_user và xs để tải bài viết trong Group kín hoặc Story riêng tư.',
+  },
+  {
+    id: 'youtube',
+    name: 'YouTube',
+    icon: IconYouTube,
+    domain: 'youtube.com',
+    color: '#ff0000',
+    requiredKeys: ['__Secure-3PSID'],
+    optionalKeys: ['LOGIN_INFO', 'SID'],
+    guide: [
+      { step: 1, text: 'Mở youtube.com và đăng nhập tài khoản Google' },
+      { step: 2, text: 'F12 → Application → Cookies → https://www.youtube.com' },
+      { step: 3, text: 'Copy chuỗi cookie hoặc xuất từ tiện ích Get cookies.txt / Cookie-Editor' },
+    ],
+    placeholder: '__Secure-3PSID=...\nLOGIN_INFO=...',
+    hint: 'Cần thiết để tải video 18+ (Age-restricted), Private hoặc video hội viên (Members-only).',
   },
   {
     id: 'reddit',
@@ -74,7 +106,6 @@ const PLATFORMS = [
     icon: IconReddit,
     domain: 'reddit.com',
     color: '#ff4500',
-    gradientClass: 'rd-gradient',
     requiredKeys: ['reddit_session'],
     optionalKeys: ['token_v2', 'csv'],
     guide: [
@@ -91,16 +122,15 @@ const PLATFORMS = [
     icon: IconSettings,
     domain: null,
     color: '#6366f1',
-    gradientClass: 'custom-gradient',
     requiredKeys: [],
     optionalKeys: [],
     guide: [
-      { step: 1, text: 'Nhập domain của website (ví dụ: pixiv.net, deviantart.com)' },
+      { step: 1, text: 'Nhập tên nền tảng hoặc domain website (ví dụ: threads, pixiv, bsky)' },
       { step: 2, text: 'F12 → Application → Cookies → chọn domain mong muốn' },
-      { step: 3, text: 'Copy toàn bộ cookie string và dán vào ô bên dưới' },
+      { step: 3, text: 'Copy toàn bộ cookie string hoặc JSON và dán vào ô bên dưới' },
     ],
     placeholder: 'key1=value1; key2=value2; ...',
-    hint: 'Hỗ trợ mọi website. Nhớ nhập đúng domain.',
+    hint: 'Hỗ trợ mọi website. Nhớ nhập đúng tên nền tảng hoặc domain.',
   },
 ]
 
@@ -108,14 +138,14 @@ const PLATFORMS = [
 // CookieManager Modal
 // ─────────────────────────────────────────────────────────────────────────────
 
-export default function CookieManager({ isOpen, onClose }) {
+export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
   const [activeTab, setActiveTab] = useState('instagram')
   const [cookieInputs, setCookieInputs] = useState({})
   const [customDomain, setCustomDomain] = useState('')
   const [saving, setSaving] = useState(false)
   const [toast, setToast] = useState(null) // { type: 'success'|'error', msg }
   const [status, setStatus] = useState(null)
-  const [confirmDelete, setConfirmDelete] = useState(null) // domain string
+  const [confirmDelete, setConfirmDelete] = useState(null) // platform string
   const modalRef = useRef(null)
 
   const showToast = (type, msg) => {
@@ -156,13 +186,11 @@ export default function CookieManager({ isOpen, onClose }) {
 
   if (!isOpen) return null
 
-  const activePlatform = PLATFORMS.find((p) => p.id === activeTab)
+  const activePlatform = PLATFORMS.find((p) => p.id === activeTab) || PLATFORMS[0]
 
   const getPlatformStatus = (platformId) => {
     if (!status?.platforms) return null
-    const domain = PLATFORMS.find((p) => p.id === platformId)?.domain
-    if (!domain) return null
-    return status.platforms.find((p) => p.domain === domain) || null
+    return status.platforms.find((p) => p.platform?.toLowerCase() === platformId.toLowerCase()) || null
   }
 
   const handleSave = async () => {
@@ -172,20 +200,24 @@ export default function CookieManager({ isOpen, onClose }) {
       return
     }
     if (activeTab === 'custom' && !customDomain.trim()) {
-      showToast('error', 'Vui lòng nhập domain cho cookie tùy chỉnh')
+      showToast('error', 'Vui lòng nhập tên nền tảng hoặc domain cho cookie tùy chỉnh')
       return
     }
 
     setSaving(true)
     try {
+      const platformKey = activeTab === 'custom'
+        ? customDomain.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_')
+        : activeTab
+
       const result = await savePlatformCookies(
-        activeTab,
+        platformKey,
         cookieStr,
-        activeTab === 'custom' ? customDomain.trim() : null,
       )
-      showToast('success', `✅ Đã lưu ${result.saved} cookies cho ${result.domain}`)
+      showToast('success', `✅ ${result.message || `Đã lưu ${result.cookie_count || 1} cookie cho ${result.platform}`}`)
       setCookieInputs((prev) => ({ ...prev, [activeTab]: '' }))
       await loadStatus()
+      if (onCookieUpdated) onCookieUpdated()
     } catch (err) {
       showToast('error', err.message || 'Lỗi khi lưu cookie')
     } finally {
@@ -193,16 +225,19 @@ export default function CookieManager({ isOpen, onClose }) {
     }
   }
 
-  const handleDelete = async (domain) => {
+  const handleDelete = async (platform) => {
     try {
-      await deletePlatformCookies(domain)
-      showToast('success', `🗑️ Đã xóa cookies của ${domain}`)
+      await deletePlatformCookies(platform)
+      showToast('success', `🗑️ Đã xóa cookies của ${platform}`)
       setConfirmDelete(null)
       await loadStatus()
+      if (onCookieUpdated) onCookieUpdated()
     } catch (err) {
-      showToast('error', err.message)
+      showToast('error', err.message || 'Lỗi khi xóa cookie')
     }
   }
+
+  const activeSavedPlatforms = status?.platforms?.filter((p) => p.has_cookies) || []
 
   return (
     <div className="cm-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
@@ -213,7 +248,7 @@ export default function CookieManager({ isOpen, onClose }) {
             <span className="cm-header-icon">🍪</span>
             <div>
               <h2 className="cm-title">Cookie Manager</h2>
-              <p className="cm-subtitle">Xác thực tài khoản để tải nội dung cần đăng nhập</p>
+              <p className="cm-subtitle">Lưu trữ Cookie thủ công — Luôn được ưu tiên khi tải nội dung yêu cầu đăng nhập</p>
             </div>
           </div>
           <button className="cm-close-btn" onClick={onClose} title="Đóng">✕</button>
@@ -227,26 +262,28 @@ export default function CookieManager({ isOpen, onClose }) {
         )}
 
         {/* Trạng thái đã lưu */}
-        {status?.platforms?.length > 0 && (
+        {activeSavedPlatforms.length > 0 && (
           <div className="cm-saved-section">
-            <p className="cm-saved-label">Cookie đang hoạt động:</p>
+            <p className="cm-saved-label">Cookie thủ công đang hoạt động (Ưu tiên số 1):</p>
             <div className="cm-saved-chips">
-              {status.platforms.map((p) => (
-                <div key={p.domain} className={`cm-saved-chip ${p.isValid ? 'valid' : 'invalid'}`}>
+              {activeSavedPlatforms.map((p) => (
+                <div key={p.platform} className="cm-saved-chip valid">
                   <span className="cm-chip-dot" />
-                  <span className="cm-chip-text">{p.domain}</span>
-                  <span className="cm-chip-count">{p.cookieNames.length} cookies</span>
-                  {confirmDelete === p.domain ? (
+                  <span className="cm-chip-text font-medium">{p.platform}</span>
+                  <span className="cm-chip-count">
+                    {p.size_bytes ? `${(p.size_bytes / 1024).toFixed(1)} KB` : 'Đã nạp'}
+                  </span>
+                  {confirmDelete === p.platform ? (
                     <div className="cm-confirm-delete">
                       <span>Xóa?</span>
-                      <button onClick={() => handleDelete(p.domain)} className="cm-confirm-yes">Có</button>
+                      <button onClick={() => handleDelete(p.platform)} className="cm-confirm-yes">Có</button>
                       <button onClick={() => setConfirmDelete(null)} className="cm-confirm-no">Không</button>
                     </div>
                   ) : (
                     <button
                       className="cm-chip-delete"
-                      onClick={() => setConfirmDelete(p.domain)}
-                      title={`Xóa cookie ${p.domain}`}
+                      onClick={() => setConfirmDelete(p.platform)}
+                      title={`Xóa cookie ${p.platform}`}
                     >✕</button>
                   )}
                 </div>
@@ -270,7 +307,7 @@ export default function CookieManager({ isOpen, onClose }) {
                   <Icon className="w-4 h-4" />
                 </span>
                 <span className="cm-tab-name">{p.name}</span>
-                {ps?.isValid && <span className="cm-tab-badge">✓</span>}
+                {ps?.has_cookies && <span className="cm-tab-badge">✓</span>}
               </button>
             )
           })}
@@ -294,7 +331,7 @@ export default function CookieManager({ isOpen, onClose }) {
           {/* Domain input (custom only) */}
           {activeTab === 'custom' && (
             <div className="cm-field">
-              <label className="cm-field-label">Domain (ví dụ: pixiv.net)</label>
+              <label className="cm-field-label">Tên nền tảng / Domain (ví dụ: threads, pixiv.net)</label>
               <input
                 type="text"
                 className="cm-input"
@@ -308,10 +345,10 @@ export default function CookieManager({ isOpen, onClose }) {
           {/* Cookie input */}
           <div className="cm-field">
             <label className="cm-field-label">
-              Dán cookie vào đây
+              Dán cookie vào đây (Hỗ trợ dạng key=value; hoặc JSON Cookie-Editor hoặc file Netscape)
               {activePlatform?.requiredKeys?.length > 0 && (
                 <span className="cm-required-hint">
-                  — Bắt buộc: <strong>{activePlatform.requiredKeys.join(', ')}</strong>
+                  — Khuyến nghị có: <strong>{activePlatform.requiredKeys.join(', ')}</strong>
                 </span>
               )}
             </label>
@@ -346,9 +383,6 @@ export default function CookieManager({ isOpen, onClose }) {
             </button>
             <button className="cm-cancel-btn" onClick={onClose}>Đóng</button>
           </div>
-
-          {/* Security note */}
-          
         </div>
       </div>
     </div>

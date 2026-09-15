@@ -10,7 +10,7 @@ import {
 import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings } from './Icons'
 import mediaLogo from '../assets/media-record-svgrepo-com.svg'
 
-export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools }) {
+export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools, cookieRefreshKey }) {
   const [browsersData, setBrowsersData] = useState(null)
   const [selectedBrowser, setSelectedBrowser] = useState(getActiveBrowser() || '')
   const [downloadDir, setDownloadDir] = useState('')
@@ -31,7 +31,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
     try {
       const [b, cs] = await Promise.all([getBrowsersList(), getCookieStatus()])
       if (b) setBrowsersData(b)
-      if (cs) setCookieCount(cs.platforms?.filter((p) => p.isValid).length || 0)
+      if (cs) setCookieCount(cs.platforms?.filter((p) => p.has_cookies).length || 0)
     } catch (err) {
       console.warn('Lỗi khi làm mới trình duyệt:', err)
     }
@@ -52,7 +52,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
             }
           }
         }
-        if (cs) setCookieCount(cs.platforms?.filter((p) => p.isValid).length || 0)
+        if (cs) setCookieCount(cs.platforms?.filter((p) => p.has_cookies).length || 0)
         if (defDir) setDownloadDir(defDir)
       })
       .catch((err) => {
@@ -61,7 +61,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
     return () => {
       active = false
     }
-  }, [selectedBrowser])
+  }, [selectedBrowser, cookieRefreshKey])
 
   const handleSelectFolder = async () => {
     try {
