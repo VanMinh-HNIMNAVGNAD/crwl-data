@@ -84,6 +84,38 @@ class MediaDispatcher(BaseExtractor):
     # Main Extract
     # ─────────────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_auth_error(err: Exception) -> bool:
+        """Kiểm tra xem lỗi có phải do yêu cầu đăng nhập không"""
+        msg = str(err).lower()
+        return any(k in msg for k in (
+            "login", "auth", "sign in", "unauthorized", "401",
+            "cookies needed", "logged in", "requires authentication",
+            "empty media response", "cannot parse data", "private",
+            "redirect to login", "not accessible", "403",
+            "yêu cầu đăng nhập", "cần đăng nhập",
+        ))
+
+    @staticmethod
+    def _make_login_error(platform_url: str) -> RuntimeError:
+        """Tạo thông báo lỗi đăng nhập thân thiện"""
+        if "facebook.com" in platform_url or "fb.watch" in platform_url:
+            name = "Facebook"
+        elif "instagram.com" in platform_url:
+            name = "Instagram"
+        elif "reddit.com" in platform_url or "redd.it" in platform_url:
+            name = "Reddit"
+        elif "tiktok.com" in platform_url:
+            name = "TikTok"
+        elif "x.com" in platform_url or "twitter.com" in platform_url:
+            name = "X (Twitter)"
+        else:
+            name = "nền tảng này"
+        return RuntimeError(
+            f"Nội dung {name} yêu cầu đăng nhập. "
+            f"Vui lòng vào Cookie Manager (🍪), chọn tab {name} và dán cookie từ trình duyệt."
+        )
+
     def extract(self, url: str, browser: Optional[str] = None) -> MediaMetadata:
         """Trích xuất thông tin media từ 1 liên kết duy nhất với cơ chế fallback tự động"""
         trimmed = url.strip()
@@ -113,6 +145,7 @@ class MediaDispatcher(BaseExtractor):
 
         # 3. Nền tảng video/audio -> ưu tiên yt-dlp
         if self.is_video_audio_platform(target_url):
+            is_fb = "facebook.com" in target_url or "fb.watch" in target_url or "fb.com" in target_url
             try:
                 self.log(f"Nền tảng Video/Audio -> yt-dlp: {target_url}")
                 # Với TikTok single video, ưu tiên chạy không cookies nếu không chỉ định rõ
@@ -128,12 +161,15 @@ class MediaDispatcher(BaseExtractor):
                         return self._enhance_metadata(res, target_url)
                     except Exception:
                         pass
-                # Fallback sang gallery-dl (cho Facebook post/album/photo, TikTok, Instagram, v.v.)
+                # Fallback sang gallery-dl
                 self.warn(f"Video yt-dlp thất bại ({yt_err}), đang thử gallery-dl fallback...")
                 try:
                     res = self.gallery.extract_gallery(target_url, browser=browser)
                     return self._enhance_metadata(res, target_url)
                 except Exception as gal_err:
+                    # Nếu cả 2 đều lỗi auth -> trả thông báo đăng nhập rõ ràng
+                    if is_fb and (self._is_auth_error(yt_err) or self._is_auth_error(gal_err)):
+                        raise self._make_login_error(target_url)
                     self.warn(f"gallery-dl fallback cũng thất bại ({gal_err}), web_scraper fallback...")
                     try:
                         res = self.web_scraper.extract(target_url)
@@ -145,12 +181,15 @@ class MediaDispatcher(BaseExtractor):
 
         # 4. Nền tảng gallery/album -> ưu tiên gallery-dl
         if self.is_gallery_platform(target_url):
+            is_instagram = "instagram.com" in target_url or "instagr.am" in target_url
+            is_reddit = "reddit.com" in target_url or "redd.it" in target_url
+            is_fb_gallery = "facebook.com" in target_url or "fb.com" in target_url
+            needs_auth = is_instagram or is_fb_gallery or is_reddit
             try:
                 self.log(f"Nền tảng Gallery -> gallery-dl: {target_url}")
                 res = self.gallery.extract_gallery(target_url, browser=browser)
 
                 # Đối với Reddit video, tăng cường formats từ yt-dlp nếu có
-                is_reddit = "reddit.com" in target_url or "redd.it" in target_url
                 if is_reddit and res.type == "video":
                     try:
                         yt_res = self.ytdlp.extract_metadata(target_url, browser=browser)
@@ -161,6 +200,16 @@ class MediaDispatcher(BaseExtractor):
 
                 return self._enhance_metadata(res, target_url)
             except Exception as gal_err:
+                # Nếu lỗi auth đối với platform yêu cầu đăng nhập -> trả thông báo rõ ràng
+                if needs_auth and self._is_auth_error(gal_err):
+                    # Thử yt-dlp trước khi báo lỗi
+                    try:
+                        res = self.ytdlp.extract_metadata(target_url, browser=browser)
+                        return self._enhance_metadata(res, target_url)
+                    except Exception as yt_err2:
+                        if self._is_auth_error(yt_err2):
+                            raise self._make_login_error(target_url)
+                        raise yt_err2
                 self.warn(f"gallery-dl thất bại ({gal_err}), yt-dlp fallback...")
                 try:
                     res = self.ytdlp.extract_metadata(target_url, browser=browser)

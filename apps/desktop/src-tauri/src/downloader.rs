@@ -148,7 +148,7 @@ impl DownloaderService {
         if lower.contains("tiktok.com") {
             return Some("tiktok");
         }
-        if lower.contains("facebook.com") || lower.contains("fb.watch") {
+        if lower.contains("facebook.com") || lower.contains("fb.watch") || lower.contains("fb.com") {
             return Some("facebook");
         }
         if lower.contains("twitter.com") || lower.contains("x.com") {
@@ -160,11 +160,20 @@ impl DownloaderService {
         if lower.contains("pinterest.com") || lower.contains("pin.it") {
             return Some("pinterest");
         }
+        if lower.contains("reddit.com") || lower.contains("redd.it") || lower.contains("v.redd.it") {
+            return Some("reddit");
+        }
         if lower.contains("threads.net") {
             return Some("threads");
         }
         if lower.contains("linkedin.com") {
             return Some("linkedin");
+        }
+        if lower.contains("bilibili.com") || lower.contains("b23.tv") {
+            return Some("bilibili");
+        }
+        if lower.contains("soundcloud.com") {
+            return Some("soundcloud");
         }
         None
     }
@@ -368,18 +377,18 @@ impl DownloaderService {
             cmd.arg("--split-chapters");
         }
 
-        // Cookies — ưu tiên: 1) file cookie đã lưu, 2) cookie-from-browser
-        if let Some(ref b) = opts.browser {
-            if !b.trim().is_empty() && b != "none" {
-                // Thử detect platform từ URL để dùng đúng cookie file
-                let platform = Self::detect_platform_from_url(&opts.url);
-                let cookie_file = platform
-                    .and_then(|p| CookieService::get_cookie_file_path(p));
+        // Cookies — ưu tiên: 1) file cookie thủ công đã lưu, 2) cookie-from-browser
+        {
+            // Luôn thử dùng file cookie thủ công theo platform (bất kể browser có được chọn hay không)
+            let platform = Self::detect_platform_from_url(&opts.url);
+            let manual_cookie = platform.and_then(|p| CookieService::get_cookie_file_path(p));
 
-                if let Some(ref cookie_path) = cookie_file {
-                    info!("Dùng cookie file đã lưu: {:?}", cookie_path);
-                    cmd.arg("--cookies").arg(cookie_path);
-                } else {
+            if let Some(ref cookie_path) = manual_cookie {
+                info!("Dùng cookie file thủ công đã lưu: {:?}", cookie_path);
+                cmd.arg("--cookies").arg(cookie_path);
+            } else if let Some(ref b) = opts.browser {
+                // Fallback: dùng cookie từ trình duyệt hệ thống nếu được chỉ định
+                if !b.trim().is_empty() && b != "none" {
                     cmd.arg("--cookies-from-browser").arg(b);
                 }
             }

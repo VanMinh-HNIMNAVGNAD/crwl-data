@@ -32,7 +32,9 @@ class GalleryDlExtractor(BaseExtractor):
         return self.binary_path is not None and os.path.exists(self.binary_path)
 
     def get_base_args(self, target_url: str = "", browser: Optional[str] = None) -> Tuple[List[str], Optional[str]]:
-        args = ["--sleep-request", "0"]
+        args = [
+            "--sleep-request", "0",
+        ]
         tmp_cookie_file = None
 
         if browser != "none":
@@ -51,7 +53,7 @@ class GalleryDlExtractor(BaseExtractor):
 
         return args, tmp_cookie_file
 
-    def extract_gallery(self, url: str, browser: Optional[str] = None, timeout: int = 60) -> MediaMetadata:
+    def extract_gallery(self, url: str, browser: Optional[str] = None, timeout: int = 30) -> MediaMetadata:
         """Trích xuất danh sách phương tiện (ảnh + video) từ bài viết/album đơn lẻ"""
         if not self.is_available():
             raise RuntimeError("gallery-dl binary không được tìm thấy trên hệ thống.")
@@ -85,7 +87,7 @@ class GalleryDlExtractor(BaseExtractor):
         browser: Optional[str] = None,
         range_start: Optional[int] = None,
         range_end: Optional[int] = None,
-        timeout: int = 120,
+        timeout: int = 60,
     ) -> ProfileCrawlResult:
         """Quét profile / channel / subreddit / board"""
         if not self.is_available():

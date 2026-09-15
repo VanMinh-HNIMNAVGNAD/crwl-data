@@ -36,6 +36,9 @@ class YtDlpExtractor(BaseExtractor):
         args = [
             "--no-warnings",
             "--ignore-errors",
+            "--socket-timeout", "15",   # Ngắt kết nối sau 15s idle (tránh treo vô thời hạn)
+            "--retries", "2",           # Chỉ thử lại 2 lần
+            "--fragment-retries", "2",
         ]
 
 
@@ -67,7 +70,7 @@ class YtDlpExtractor(BaseExtractor):
 
         return args, tmp_cookie_file
 
-    def extract_metadata(self, url: str, browser: Optional[str] = None, timeout: int = 45) -> MediaMetadata:
+    def extract_metadata(self, url: str, browser: Optional[str] = None, timeout: int = 30) -> MediaMetadata:
         """Trích xuất chi tiết metadata của 1 URL video/audio"""
         if not self.is_available():
             raise RuntimeError("yt-dlp binary không được tìm thấy trên hệ thống.")
@@ -115,7 +118,7 @@ class YtDlpExtractor(BaseExtractor):
         browser: Optional[str] = None,
         from_item: Optional[int] = None,
         to_item: Optional[int] = None,
-        timeout: int = 60,
+        timeout: int = 45,
     ) -> ProfileCrawlResult:
         """Quét playlist / channel / profile bằng --flat-playlist"""
         if not self.is_available():

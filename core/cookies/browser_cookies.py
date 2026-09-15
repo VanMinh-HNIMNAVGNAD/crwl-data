@@ -291,25 +291,97 @@ class BrowserCookieExporter:
         return "\n".join(lines) + "\n"
 
 
+# Ánh xạ domain → tên platform để tìm file cookie thủ công
+_DOMAIN_TO_PLATFORM = {
+    "facebook.com": "facebook",
+    "instagram.com": "instagram",
+    "reddit.com": "reddit",
+    "redd.it": "reddit",
+    "tiktok.com": "tiktok",
+    "x.com": "twitter",
+    "twitter.com": "twitter",
+    "youtube.com": "youtube",
+    "youtu.be": "youtube",
+    "pinterest.com": "pinterest",
+    "pin.it": "pinterest",
+    "threads.net": "threads",
+    "bilibili.com": "bilibili",
+    "soundcloud.com": "soundcloud",
+    "tumblr.com": "tumblr",
+    "pixiv.net": "pixiv",
+    "douyin.com": "douyin",
+    "linkedin.com": "linkedin",
+}
+
+
+def _find_manual_cookie_file(domain: Optional[str] = None) -> Optional[str]:
+    """Tìm file cookie thủ công trong ~/.config/crwl/cookies/ theo domain hoặc platform."""
+    home = os.path.expanduser("~")
+    cookies_dir = os.path.join(home, ".config", "crwl", "cookies")
+    if not os.path.isdir(cookies_dir):
+        return None
+
+    candidates: list = []
+
+    if domain:
+        d_clean = domain.lower().replace("www.", "").lstrip(".")
+        # Kiểm tra theo ánh xạ platform
+        for suffix, platform_name in _DOMAIN_TO_PLATFORM.items():
+            if d_clean == suffix or d_clean.endswith("." + suffix):
+                candidates.append(platform_name)
+                break
+        # Kiểm tra theo tên domain trực tiếp (vd: facebook, instagram)
+        domain_part = d_clean.split(".")[0]
+        if domain_part and domain_part not in candidates:
+            candidates.append(domain_part)
+        # Kiểm tra toàn bộ domain
+        if d_clean not in candidates:
+            candidates.append(d_clean)
+
+    # Kiểm tra lần lượt các ứng viên
+    for name in candidates:
+        path = os.path.join(cookies_dir, f"{name}.txt")
+        if os.path.isfile(path) and os.path.getsize(path) > 10:
+            return path
+
+    return None
+
+
 def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str] = None, output_path: Optional[str] = None) -> Optional[str]:
-    """Helper: lấy cookies file cho browser, trả về đường dẫn file cookies tạm"""
+    """Helper: lấy cookies file cho browser, trả về đường dẫn file cookies tạm.
+
+    Thứ tự ưu tiên:
+      1. File cookie thủ công trong ~/.config/crwl/cookies/<platform>.txt  (luôn ưu tiên số 1)
+      2. Trích xuất từ trình duyệt hệ thống (Chrome, Edge, Firefox, Brave)
+         — CHỈ dùng khi có ít nhất 3 cookie có giá trị thực để tránh cookie rỗng/sai
+    """
     if browser == "none":
         return None
-    try:
-        # Kiểm tra nếu có file cookie thủ công trong ~/.config/crwl/cookies/
-        if domain:
-            home = os.path.expanduser("~")
-            d_clean = domain.lower().replace("www.", "").lstrip(".")
-            for candidate_name in (d_clean.split(".")[0], d_clean):
-                manual_path = os.path.join(home, ".config/crwl/cookies", f"{candidate_name}.txt")
-                if os.path.isfile(manual_path) and os.path.getsize(manual_path) > 10:
-                    return manual_path
 
+    try:
+        # Ưu tiên 1: file cookie thủ công theo domain/platform
+        manual = _find_manual_cookie_file(domain)
+        if manual:
+            sys.stderr.write(f"[Cookies] Dùng file cookie thủ công: {manual}\n")
+            return manual
+
+        # Ưu tiên 2: trích xuất từ trình duyệt hệ thống
+        # Chỉ khi browser được chỉ định rõ ràng (không phải auto/None)
+        # Với auto/None, chỉ dùng nếu có >= 5 cookies có giá trị cho đúng domain
         exporter = BrowserCookieExporter()
         target_browser = browser if (browser and browser != "auto") else "auto"
         content = exporter.export_cookies_netscape(target_browser, domain)
-        if not content.strip() or len([l for l in content.splitlines() if l and not l.startswith("#")]) == 0:
+
+        data_lines = [l for l in content.splitlines() if l and not l.startswith("#") and "\t" in l]
+        min_required = 2 if (browser and browser not in ("auto", "")) else 5
+
+        if not data_lines or len(data_lines) < min_required:
+            sys.stderr.write(
+                f"[Cookies] Bỏ qua cookies browser (chỉ có {len(data_lines)} dòng, cần ít nhất {min_required}). "
+                f"Hãy lưu cookie thủ công qua Cookie Manager.\n"
+            )
             return None
+
         if not output_path:
             fd, tmp_file = tempfile.mkstemp(prefix="cookies_", suffix=".txt")
             os.close(fd)

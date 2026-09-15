@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import {
   IconDownload,
   IconClose,
@@ -51,6 +51,8 @@ export default function LinkDownloader({ onShowToast }) {
   const [selectedSubLang, setSelectedSubLang] = useState('')
   const [alwaysAskDir, setAlwaysAskDir] = useState(getAlwaysAskDownloadDir())
   const [isZipDownloading, setIsZipDownloading] = useState(false)
+  const cancelRef = useRef(false)         // dùng để hủy batch extract
+  const [isCancelling, setIsCancelling] = useState(false)
 
   // Trimmer tool state
   const [isTrimmerOpen, setIsTrimmerOpen] = useState(false)
@@ -168,18 +170,23 @@ export default function LinkDownloader({ onShowToast }) {
       return
     }
 
+    cancelRef.current = false
+    setIsCancelling(false)
     setIsLoading(true)
     try {
       const data = await extractMedia(targetUrl)
-      if (data) {
+      if (!cancelRef.current && data) {
         setSingleMedia(data)
         setBatchMedias([])
         onShowToast?.(`Đã trích xuất: ${data.title?.slice(0, 30) || 'Thành công'}...`)
       }
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi trích xuất liên kết')
+      if (!cancelRef.current) {
+        onShowToast?.(err.message || 'Lỗi khi trích xuất liên kết')
+      }
     } finally {
       setIsLoading(false)
+      setIsCancelling(false)
     }
   }
 
@@ -190,35 +197,59 @@ export default function LinkDownloader({ onShowToast }) {
       return
     }
 
+    cancelRef.current = false
+    setIsCancelling(false)
     setIsLoading(true)
     setBatchProgress({ current: 0, total: parsedBatchLinks.length, statusText: 'Đang bắt đầu...' })
 
     const results = []
+    const failedLinks = []
+
     for (let i = 0; i < parsedBatchLinks.length; i++) {
+      // Kiểm tra nếu đã hủy
+      if (cancelRef.current) {
+        setBatchProgress((prev) => ({ ...prev, statusText: `Đã hủy (${results.length} thành công)` }))
+        break
+      }
+
       const link = parsedBatchLinks[i]
+      const shortLink = link.length > 50 ? link.slice(0, 47) + '...' : link
       setBatchProgress({
         current: i + 1,
         total: parsedBatchLinks.length,
-        statusText: `Đang xử lý ${i + 1}/${parsedBatchLinks.length}...`,
+        statusText: `[${i + 1}/${parsedBatchLinks.length}] Đang giải mã: ${shortLink}`,
       })
+
       try {
         const item = await extractMedia(link)
-        if (item) results.push(item)
+        if (item && !cancelRef.current) results.push(item)
       } catch (err) {
-        console.warn(`Lỗi bóc tách ${link}:`, err)
+        const errMsg = err.message || ''
+        const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('55 giây')
+        console.warn(`[Batch] Lỗi ${isTimeout ? 'timeout' : 'bóc tách'} ${link}:`, errMsg)
+        failedLinks.push({ link, reason: isTimeout ? 'Timeout' : errMsg.slice(0, 60) })
       }
     }
 
     setIsLoading(false)
+    setIsCancelling(false)
     setBatchProgress({ current: 0, total: 0, statusText: '' })
 
     if (results.length > 0) {
       setBatchMedias(results)
       setSingleMedia(null)
-      onShowToast?.(`Giải mã thành công ${results.length}/${parsedBatchLinks.length} liên kết!`)
+      const failMsg = failedLinks.length > 0 ? ` (${failedLinks.length} lỗi/timeout)` : ''
+      onShowToast?.(`Giải mã thành công ${results.length}/${parsedBatchLinks.length} liên kết!${failMsg}`)
     } else {
-      onShowToast?.('Không thể giải mã các liên kết đã nhập.')
+      onShowToast?.('Không thể giải mã các liên kết đã nhập. Vui lòng kiểm tra lại liên kết.')
     }
+  }
+
+  // Hủy giải mã đang chạy
+  const handleCancelExtract = () => {
+    cancelRef.current = true
+    setIsCancelling(true)
+    onShowToast?.('Đang hủy giải mã...')
   }
 
   // Tải stream video/audio đơn
@@ -555,7 +586,7 @@ export default function LinkDownloader({ onShowToast }) {
                 {isLoading ? (
                   <>
                     <span className="minimal-spinner" />
-                    <span>Đang bóc tách...</span>
+                    <span>{isCancelling ? 'Đang hủy...' : 'Đang bóc tách...'}</span>
                   </>
                 ) : (
                   <>
@@ -564,6 +595,16 @@ export default function LinkDownloader({ onShowToast }) {
                   </>
                 )}
               </button>
+              {isLoading && !isCancelling && (
+                <button
+                  type="button"
+                  className="pane-cancel-btn"
+                  onClick={handleCancelExtract}
+                  title="Hủy giải mã đang chạy"
+                >
+                  ✕ Hủy
+                </button>
+              )}
             </div>
           </form>
         ) : (
@@ -621,7 +662,7 @@ export default function LinkDownloader({ onShowToast }) {
                 {isLoading ? (
                   <>
                     <span className="minimal-spinner" />
-                    <span>Đang tải hàng loạt...</span>
+                    <span>{isCancelling ? 'Đang hủy...' : `Đang tải hàng loạt...`}</span>
                   </>
                 ) : (
                   <>
@@ -630,6 +671,16 @@ export default function LinkDownloader({ onShowToast }) {
                   </>
                 )}
               </button>
+              {isLoading && !isCancelling && (
+                <button
+                  type="button"
+                  className="pane-cancel-btn"
+                  onClick={handleCancelExtract}
+                  title="Hủy giải mã đang chạy"
+                >
+                  ✕ Hủy
+                </button>
+              )}
             </div>
           </form>
         )}

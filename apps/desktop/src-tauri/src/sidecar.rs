@@ -275,10 +275,10 @@ impl SidecarManager {
             }
         }
 
-        match tokio::time::timeout(Duration::from_secs(90), reply_rx).await {
+        match tokio::time::timeout(Duration::from_secs(55), reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("Sidecar reply channel đóng bất ngờ".to_string()),
-            Err(_) => Err("Timeout: Python worker không phản hồi sau 90 giây".to_string()),
+            Err(_) => Err("Timeout: Python worker không phản hồi sau 55 giây. Vui lòng thử lại.".to_string()),
         }
     }
 
@@ -286,7 +286,8 @@ impl SidecarManager {
     pub async fn extract_media(&self, url: &str, browser: Option<&str>) -> Result<Value, String> {
         let mut payload = json!({ "action": "extract", "url": url });
         if let Some(b) = browser {
-            if !b.trim().is_empty() && b != "none" {
+            // Truyền xuống Python kể cả "none" — Python sẽ tự xử lý logic bỏ cookie
+            if !b.trim().is_empty() {
                 payload["browser"] = Value::String(b.to_string());
             }
         }
@@ -331,7 +332,8 @@ impl SidecarManager {
             }
         }
         if let Some(b) = browser {
-            if !b.is_empty() && b != "none" {
+            // Truyền xuống Python kể cả "none" — Python sẽ tự xử lý logic bỏ cookie
+            if !b.is_empty() {
                 payload["browser"] = Value::String(b.to_string());
             }
         }

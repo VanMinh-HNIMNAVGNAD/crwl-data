@@ -6,6 +6,7 @@ and stderr logging helpers.
 
 import os
 import sys
+import signal
 import shutil
 import subprocess
 from typing import List, Optional, Tuple, Dict, Any
@@ -64,24 +65,41 @@ class BaseExtractor:
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
     ) -> Tuple[int, str, str]:
-        """Thực thi tiến trình và thu thập kết quả với timeout"""
+        """Thực thi tiến trình và thu thập kết quả với timeout.
+
+        Dùng Popen + os.killpg để đảm bảo kill toàn bộ process group
+        (bao gồm child processes của yt-dlp/gallery-dl) khi timeout.
+        """
         merged_env = os.environ.copy()
         if env:
             merged_env.update(env)
 
         try:
-            proc = subprocess.run(
+            # start_new_session=True tạo process group riêng để có thể kill cả nhóm
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 cwd=cwd or self.project_root,
                 env=merged_env,
+                start_new_session=True,
             )
-            return proc.returncode, proc.stdout, proc.stderr
-        except subprocess.TimeoutExpired:
-            self.warn(f"Command timed out ({timeout}s): {' '.join(cmd[:4])}...")
-            return -1, "", f"Timeout after {timeout} seconds"
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+                return proc.returncode, stdout, stderr
+            except subprocess.TimeoutExpired:
+                self.warn(f"Command timed out ({timeout}s): {' '.join(cmd[:4])}...")
+                # Kill toàn bộ process group để không để zombie
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    proc.kill()
+                try:
+                    proc.communicate(timeout=3)
+                except Exception:
+                    pass
+                return -1, "", f"Timeout after {timeout} seconds"
         except Exception as e:
             self.error(f"Failed to run command: {e}")
             return -1, "", str(e)
