@@ -62,6 +62,8 @@ pub struct DownloadOptions {
     /// trình của yt-dlp, khiến thanh tiến trình đứng im suốt lúc tải.
     #[serde(default, alias = "useAria2c")]
     pub use_aria2c: bool,
+    #[serde(alias = "clientIp")]
+    pub client_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +82,9 @@ pub struct DownloadProgressPayload {
     pub file_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Báo cho UI biết tiến trình không xác định chính xác % (ví dụ: đang tải qua aria2c, hậu xử lý)
+    #[serde(default)]
+    pub is_indeterminate: bool,
 }
 
 impl DownloadProgressPayload {
@@ -93,6 +98,21 @@ impl DownloadProgressPayload {
             phase: phase.to_string(),
             file_path: None,
             message: None,
+            is_indeterminate: false,
+        }
+    }
+
+    pub fn indeterminate(id: &str, status: &str, phase: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            percent: 0.0,
+            speed: String::new(),
+            eta: String::new(),
+            status: status.to_string(),
+            phase: phase.to_string(),
+            file_path: None,
+            message: None,
+            is_indeterminate: true,
         }
     }
 }
@@ -498,12 +518,20 @@ impl DownloaderService {
             let _ = app_handle.emit("download-progress", payload);
         };
 
-        progress_emit(DownloadProgressPayload::new(
-            &task_id,
-            0.0,
-            "preparing",
-            "Đang lấy thông tin tệp...",
-        ));
+        if opts.use_aria2c {
+            progress_emit(DownloadProgressPayload::indeterminate(
+                &task_id,
+                "processing",
+                "Đang tải qua Aria2c (không hiển thị %)...",
+            ));
+        } else {
+            progress_emit(DownloadProgressPayload::new(
+                &task_id,
+                0.0,
+                "preparing",
+                "Đang lấy thông tin tệp...",
+            ));
+        }
 
         // Phần trăm chỉ đi tiến, không bao giờ lùi: trước đây mỗi luồng (video rồi
         // audio) đều chạy 0→100% nên thanh tiến trình tụt về 0 giữa chừng.
@@ -572,6 +600,7 @@ impl DownloaderService {
                     phase,
                     file_path: None,
                     message: None,
+                    is_indeterminate: false,
                 });
                 continue;
             }
@@ -595,24 +624,34 @@ impl DownloaderService {
             if let Some(rest) = line.strip_prefix("[Merger] Merging formats into ") {
                 downloaded_file_path = Some(rest.trim().trim_matches('"').to_string());
                 overall_percent = overall_percent.max(DOWNLOAD_SHARE);
-                progress_emit(DownloadProgressPayload::new(
-                    &task_id,
-                    overall_percent,
-                    "processing",
-                    "Đang ghép hình và tiếng qua FFmpeg...",
-                ));
+                progress_emit(DownloadProgressPayload {
+                    id: task_id.clone(),
+                    percent: overall_percent,
+                    speed: String::new(),
+                    eta: String::new(),
+                    status: "processing".to_string(),
+                    phase: "Đang ghép hình và tiếng qua FFmpeg...".to_string(),
+                    file_path: None,
+                    message: None,
+                    is_indeterminate: opts.use_aria2c,
+                });
                 continue;
             }
 
             // Các bước hậu xử lý còn lại — báo đúng trạng thái thay vì đoán theo %
             if let Some(phase) = Self::postprocess_phase(&line) {
                 overall_percent = overall_percent.max(DOWNLOAD_SHARE);
-                progress_emit(DownloadProgressPayload::new(
-                    &task_id,
-                    overall_percent,
-                    "processing",
-                    phase,
-                ));
+                progress_emit(DownloadProgressPayload {
+                    id: task_id.clone(),
+                    percent: overall_percent,
+                    speed: String::new(),
+                    eta: String::new(),
+                    status: "processing".to_string(),
+                    phase: phase.to_string(),
+                    file_path: None,
+                    message: None,
+                    is_indeterminate: opts.use_aria2c,
+                });
                 continue;
             }
 
@@ -659,6 +698,7 @@ impl DownloaderService {
                 phase: "Tải thất bại".to_string(),
                 file_path: None,
                 message: Some(err_msg.clone()),
+                is_indeterminate: false,
             });
 
             // Ghi nhận lỗi vào DB
@@ -671,6 +711,7 @@ impl DownloaderService {
                 None,
                 "failed",
                 Some(&err_msg),
+                opts.client_ip.as_deref(),
             ).await;
 
             return Err(err_msg);
@@ -697,6 +738,7 @@ impl DownloaderService {
             phase: "Hoàn tất".to_string(),
             file_path: Some(final_path.clone()),
             message: None,
+            is_indeterminate: false,
         });
 
         // Ghi nhận lịch sử tải thành công vào database PostgreSQL
@@ -709,6 +751,7 @@ impl DownloaderService {
             None,
             "success",
             None,
+            opts.client_ip.as_deref(),
         ).await;
 
         Ok(DownloadResult {
@@ -834,6 +877,7 @@ impl DownloaderService {
         referer: Option<&str>,
         dest_dir: Option<&str>,
         device_id: &str,
+        client_ip: Option<&str>,
         db: Arc<Database>,
     ) -> Result<DownloadResult, String> {
         let dest_folder = dest_dir
@@ -880,6 +924,7 @@ impl DownloaderService {
             None,
             "success",
             None,
+            client_ip,
         ).await;
 
         Ok(DownloadResult {
@@ -899,6 +944,7 @@ impl DownloaderService {
         as_zip: bool,
         device_id: &str,
         task_id: Option<String>,
+        client_ip: Option<&str>,
         db: Arc<Database>,
     ) -> Result<DownloadResult, String> {
         let base_dest = dest_dir
@@ -936,6 +982,7 @@ impl DownloaderService {
                     phase,
                     file_path,
                     message: None,
+                    is_indeterminate: false,
                 },
             );
         };
@@ -1017,26 +1064,21 @@ impl DownloaderService {
             emit(93.0, "processing", "Đang nén thành tệp ZIP...".to_string(), None);
             let zip_filename = format!("{clean_title}.zip");
             let zip_path = base_dest.join(&zip_filename);
-            let py_code = r#"
-import sys, os, zipfile
-zip_path = sys.argv[1]
-src_dir = sys.argv[2]
-with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
-    for f in os.listdir(src_dir):
-        fp = os.path.join(src_dir, f)
-        if os.path.isfile(fp):
-            zf.write(fp, arcname=f)
-"#;
-            let zip_status = Command::new("python3")
-                .arg("-c")
-                .arg(py_code)
-                .arg(&zip_path)
-                .arg(&target_dir)
-                .status()
-                .await;
 
-            if let Ok(st) = zip_status {
-                if st.success() {
+            let target_dir_clone = target_dir.clone();
+            let zip_path_clone = zip_path.clone();
+
+            let zip_status = tokio::task::spawn_blocking(move || {
+                let res = Self::compress_dir_to_zip(&target_dir_clone, &zip_path_clone);
+                if res.is_err() {
+                    let _ = std::fs::remove_file(&zip_path_clone);
+                }
+                res
+            })
+            .await;
+
+            match zip_status {
+                Ok(Ok(())) => {
                     let zip_size = zip_path.metadata().map(|m| m.len() as i64).ok();
                     let zip_str = zip_path.to_string_lossy().to_string();
 
@@ -1052,6 +1094,7 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
                         None,
                         "success",
                         None,
+                        client_ip,
                     ).await;
 
                     emit(100.0, "completed", "Hoàn tất".to_string(), Some(zip_str.clone()));
@@ -1063,8 +1106,13 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
                         message: Self::batch_summary(downloaded_files.len(), failed, "vào tệp ZIP"),
                     });
                 }
+                Ok(Err(err)) => {
+                    warn!("Nén ZIP thất bại: {err} — giữ nguyên thư mục ảnh đã tải");
+                }
+                Err(join_err) => {
+                    warn!("Tiến trình nén ZIP bị gián đoạn: {join_err} — giữ nguyên thư mục ảnh đã tải");
+                }
             }
-            warn!("Nén ZIP thất bại — giữ nguyên thư mục ảnh đã tải");
         }
 
         let dir_str = target_dir.to_string_lossy().to_string();
@@ -1077,6 +1125,7 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
             None,
             "success",
             None,
+            client_ip,
         ).await;
 
         emit(100.0, "completed", "Hoàn tất".to_string(), Some(dir_str.clone()));
@@ -1168,6 +1217,47 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
             let _ = std::fs::remove_file(dest);
             false
         }
+    }
+
+    /// Nén toàn bộ tệp và thư mục con trong `src_dir` thành tệp ZIP tại `zip_path` bằng crate native `zip`
+    pub fn compress_dir_to_zip(src_dir: &Path, zip_path: &Path) -> Result<(), String> {
+        let file = std::fs::File::create(zip_path)
+            .map_err(|e| format!("Không thể tạo tệp zip: {e}"))?;
+        let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        let walker = walkdir::WalkDir::new(src_dir);
+        for entry in walker.into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path == src_dir {
+                continue;
+            }
+
+            let relative_path = path
+                .strip_prefix(src_dir)
+                .map_err(|e| format!("Lỗi xác định đường dẫn tương đối: {e}"))?;
+
+            let path_str = relative_path.to_string_lossy().replace('\\', "/");
+            if path.is_dir() {
+                zip.add_directory(&path_str, options)
+                    .map_err(|e| format!("Lỗi thêm thư mục vào zip: {e}"))?;
+            } else if path.is_file() {
+                zip.start_file(&path_str, options)
+                    .map_err(|e| format!("Lỗi tạo mục tệp trong zip: {e}"))?;
+                let mut f = std::fs::File::open(path)
+                    .map_err(|e| format!("Không thể mở tệp {}: {e}", path.display()))?;
+                std::io::copy(&mut f, &mut zip)
+                    .map_err(|e| format!("Lỗi ghi dữ liệu vào zip: {e}"))?;
+            }
+        }
+
+        let mut writer = zip.finish()
+            .map_err(|e| format!("Lỗi hoàn tất tệp zip: {e}"))?;
+        std::io::Write::flush(&mut writer)
+            .map_err(|e| format!("Lỗi lưu tệp zip: {e}"))?;
+
+        Ok(())
     }
 }
 
@@ -1264,5 +1354,88 @@ mod tests {
         assert_eq!(D::sanitize_file_name("a/b:c*d", "fb"), "a_b_c_d");
         assert_eq!(D::sanitize_file_name("   ", "fb"), "fb");
         assert_eq!(D::sanitize_file_name("....", "fb"), "fb");
+    }
+
+    #[test]
+    fn compress_dir_to_zip_creates_valid_zip() {
+        use std::io::Read;
+
+        let temp_dir = std::env::temp_dir().join(format!("test_zip_dir_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file1_path = temp_dir.join("image1.jpg");
+        let sub_dir = temp_dir.join("subfolder");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let file2_path = sub_dir.join("image2.png");
+
+        std::fs::write(&file1_path, b"fake jpg content 12345").unwrap();
+        std::fs::write(&file2_path, b"fake png content in subfolder 67890").unwrap();
+
+        let zip_path = std::env::temp_dir().join(format!("test_album_{}.zip", uuid::Uuid::new_v4()));
+
+        let result = D::compress_dir_to_zip(&temp_dir, &zip_path);
+        assert!(result.is_ok(), "Nén zip phải thành công: {:?}", result.err());
+
+        // Kiểm tra đọc lại file ZIP
+        let zip_file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+
+        assert_eq!(archive.len(), 3); // image1.jpg, subfolder/, subfolder/image2.png
+
+        {
+            let mut file1 = archive.by_name("image1.jpg").unwrap();
+            let mut content1 = String::new();
+            file1.read_to_string(&mut content1).unwrap();
+            assert_eq!(content1, "fake jpg content 12345");
+        }
+
+        {
+            let mut file2 = archive.by_name("subfolder/image2.png").unwrap();
+            let mut content2 = String::new();
+            file2.read_to_string(&mut content2).unwrap();
+            assert_eq!(content2, "fake png content in subfolder 67890");
+        }
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn download_progress_payload_handles_indeterminate_and_aria2c() {
+        use super::DownloadProgressPayload;
+
+        let payload = DownloadProgressPayload {
+            id: "task-test".to_string(),
+            percent: 0.0,
+            speed: String::new(),
+            eta: String::new(),
+            status: "processing".to_string(),
+            phase: "Đang tải qua Aria2c (không hiển thị %)...".to_string(),
+            file_path: None,
+            message: None,
+            is_indeterminate: true,
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains(r#""isIndeterminate":true"#));
+        assert!(json.contains(r#""status":"processing""#));
+        assert!(json.contains(r#""phase":"Đang tải qua Aria2c (không hiển thị %)...""#));
+
+        let deserialized: DownloadProgressPayload = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.is_indeterminate);
+        assert_eq!(deserialized.status, "processing");
+        assert_eq!(deserialized.phase, "Đang tải qua Aria2c (không hiển thị %)...");
+
+        // Khi JSON không có cờ isIndeterminate, mặc định phải là false
+        let minimal_json = r#"{"id":"task-1","percent":45.5,"speed":"2MB/s","eta":"5s","status":"downloading","phase":"Đang tải"}"#;
+        let normal_p: DownloadProgressPayload = serde_json::from_str(minimal_json).unwrap();
+        assert!(!normal_p.is_indeterminate);
+        assert_eq!(normal_p.percent, 45.5);
+
+        // Kiểm tra helper constructor indeterminate
+        let ind_payload = DownloadProgressPayload::indeterminate("task-2", "processing", "Đang xử lý...");
+        assert!(ind_payload.is_indeterminate);
+        assert_eq!(ind_payload.percent, 0.0);
     }
 }

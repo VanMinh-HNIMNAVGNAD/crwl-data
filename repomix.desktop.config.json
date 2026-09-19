@@ -3,9 +3,10 @@
   "output": {
     "filePath": "repomix-desktop-output.xml",
     "style": "xml",
+    "headerText": "MODULE: DESKTOP APPLICATION (React 18 + Tauri 2 Rust Native Backend)\nIncludes frontend components, state management, styles, Tauri Rust commands, downloader, extractor, sidecar, system utilities, and configuration.",
     "removeComments": false,
     "removeEmptyLines": false,
-    "topFilesLength": 10,
+    "topFilesLength": 15,
     "showLineNumbers": false
   },
   "include": [
@@ -17,12 +18,28 @@
     "customPatterns": [
       "**/node_modules/**",
       "**/dist/**",
+      "**/target/**",
       "**/.env*",
+      "!apps/desktop/.env.example",
       "**/package-lock.json",
-      "**/pnpm-lock.yaml"
+      "**/pnpm-lock.yaml",
+      "**/Cargo.lock",
+      "**/*.lock",
+      "**/icons/*.png",
+      "**/icons/*.ico",
+      "**/icons/*.icns",
+      "**/*.png",
+      "**/*.ico",
+      "**/*.icns",
+      "**/*.jpg",
+      "**/*.jpeg",
+      "**/gen/**",
+      "**/repomix*",
+      "**/*.xml"
     ]
   },
   "security": {
-    "enableSecurityCheck": true
+    "enableSecurityCheck": false
   }
 }
+

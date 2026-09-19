@@ -21,14 +21,16 @@ pub async fn extract_media(
     url: String,
     browser: Option<String>,
     device_id: Option<String>,
+    client_ip: Option<String>,
 ) -> Result<Value, String> {
     let res = state.sidecar.extract_media(&url, browser.as_deref()).await?;
     let db = Arc::clone(&state.db);
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
     let url_clone = url.clone();
     let res_clone = res.clone();
+    let ip_clone = client_ip;
     tokio::spawn(async move {
-        db.record_single_extraction(&dev_id, &url_clone, &res_clone).await;
+        db.record_single_extraction(&dev_id, &url_clone, &res_clone, ip_clone.as_deref()).await;
     });
     Ok(res)
 }
@@ -44,6 +46,7 @@ pub async fn crawl_profile(
     range_start: Option<u32>,
     range_end: Option<u32>,
     device_id: Option<String>,
+    client_ip: Option<String>,
 ) -> Result<Value, String> {
     let res = state
         .sidecar
@@ -61,8 +64,9 @@ pub async fn crawl_profile(
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
     let url_clone = url.clone();
     let res_clone = res.clone();
+    let ip_clone = client_ip;
     tokio::spawn(async move {
-        db.record_profile_crawl(&dev_id, &url_clone, &res_clone).await;
+        db.record_profile_crawl(&dev_id, &url_clone, &res_clone, ip_clone.as_deref()).await;
     });
     Ok(res)
 }
@@ -255,6 +259,7 @@ pub async fn download_direct_file(
     referer: Option<String>,
     dest_dir: Option<String>,
     device_id: Option<String>,
+    client_ip: Option<String>,
 ) -> Result<DownloadResult, String> {
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
     DownloaderService::download_direct_file(
@@ -263,6 +268,7 @@ pub async fn download_direct_file(
         referer.as_deref(),
         dest_dir.as_deref(),
         &dev_id,
+        client_ip.as_deref(),
         Arc::clone(&state.db),
     ).await
 }
@@ -277,6 +283,7 @@ pub async fn download_album_batch(
     as_zip: Option<bool>,
     device_id: Option<String>,
     task_id: Option<String>,
+    client_ip: Option<String>,
 ) -> Result<DownloadResult, String> {
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
     DownloaderService::download_album_batch(
@@ -287,6 +294,7 @@ pub async fn download_album_batch(
         as_zip.unwrap_or(false),
         &dev_id,
         task_id,
+        client_ip.as_deref(),
         Arc::clone(&state.db),
     ).await
 }

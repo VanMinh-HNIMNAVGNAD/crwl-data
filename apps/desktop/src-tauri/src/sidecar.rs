@@ -31,6 +31,7 @@ fn next_req_id() -> String {
 struct SidecarInner {
     /// Kênh gửi (request_id, json_line, oneshot_reply_sender)
     tx: tokio::sync::mpsc::Sender<(String, String, oneshot::Sender<Result<Value, String>>)>,
+    pending: Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<Result<Value, String>>>>>,
     /// Handle của Python subprocess
     _child: Child,
 }
@@ -248,7 +249,11 @@ impl SidecarManager {
         });
 
         let mut lock = inner_arc.lock().await;
-        *lock = Some(SidecarInner { tx, _child: child });
+        *lock = Some(SidecarInner {
+            tx,
+            pending,
+            _child: child,
+        });
     }
 
     /// Thời gian chờ tối đa theo loại request.
@@ -288,7 +293,7 @@ impl SidecarManager {
             let lock = self.inner.lock().await;
             match lock.as_ref() {
                 Some(inner) => {
-                    inner.tx.send((req_id, line, reply_tx)).await.map_err(|_| {
+                    inner.tx.send((req_id.clone(), line, reply_tx)).await.map_err(|_| {
                         "Sidecar worker không phản hồi — có thể đã bị crash".to_string()
                     })?;
                 }
@@ -302,10 +307,17 @@ impl SidecarManager {
         match tokio::time::timeout(wait_for, reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("Sidecar reply channel đóng bất ngờ".to_string()),
-            Err(_) => Err(format!(
-                "Timeout: máy chủ bóc tách không phản hồi sau {} giây. Hãy giảm số lượng cần quét rồi thử lại.",
-                wait_for.as_secs()
-            )),
+            Err(_) => {
+                let lock = self.inner.lock().await;
+                if let Some(inner) = lock.as_ref() {
+                    let mut map = inner.pending.lock().await;
+                    map.remove(&req_id);
+                }
+                Err(format!(
+                    "Timeout: máy chủ bóc tách không phản hồi sau {} giây. Hãy giảm số lượng cần quét rồi thử lại.",
+                    wait_for.as_secs()
+                ))
+            }
         }
     }
 

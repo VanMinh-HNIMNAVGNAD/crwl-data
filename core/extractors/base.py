@@ -74,8 +74,14 @@ class BaseExtractor:
         if env:
             merged_env.update(env)
 
+        popen_kwargs: Dict[str, Any] = {}
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
         try:
-            # start_new_session=True tạo process group riêng để có thể kill cả nhóm
+            # Tạo process group riêng (CREATE_NEW_PROCESS_GROUP trên Windows, start_new_session trên POSIX) để kill cả nhóm khi timeout
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -83,18 +89,34 @@ class BaseExtractor:
                 text=True,
                 cwd=cwd or self.project_root,
                 env=merged_env,
-                start_new_session=True,
+                **popen_kwargs,
             )
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
                 return proc.returncode, stdout, stderr
             except subprocess.TimeoutExpired:
                 self.warn(f"Command timed out ({timeout}s): {' '.join(cmd[:4])}...")
-                # Kill toàn bộ process group để không để zombie
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    proc.kill()
+                # Kill toàn bộ process group / process tree để không để zombie
+                if sys.platform == "win32":
+                    try:
+                        # Trên Windows, dùng taskkill để kill cả cây tiến trình (/F ép buộc, /T kill tree)
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        proc.kill()
+                    except (ProcessLookupError, OSError):
+                        pass
+                else:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        proc.kill()
                 try:
                     proc.communicate(timeout=3)
                 except Exception:

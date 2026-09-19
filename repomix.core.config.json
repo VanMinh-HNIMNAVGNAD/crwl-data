@@ -1,0 +1,39 @@
+{
+  "$schema": "https://raw.githubusercontent.com/yamadashy/repomix/main/repomix.schema.json",
+  "output": {
+    "filePath": "repomix-core-output.xml",
+    "style": "xml",
+    "headerText": "MODULE: CRAWLER CORE & SCRIPTS (Python Extraction Engine, Resolvers, Cookies, Benchmarks & Docs)\nIncludes Python extraction framework (extractors, dispatcher, resolver, cookie manager, models, CLI), test & benchmark scripts, documentation, and root monorepo configs.",
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "topFilesLength": 15,
+    "showLineNumbers": false
+  },
+  "include": [
+    "core/**/*",
+    "scripts/**/*",
+    "docs/**/*",
+    "package.json",
+    "pnpm-workspace.yaml"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "**/__pycache__/**",
+      "**/*.py[cod]",
+      "**/.venv/**",
+      "**/venv/**",
+      "**/node_modules/**",
+      "**/.env*",
+      "**/benchmark_results.json",
+      "**/repomix*",
+      "**/*.xml",
+      "**/*.lock",
+      "**/pnpm-lock.yaml"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": false
+  }
+}

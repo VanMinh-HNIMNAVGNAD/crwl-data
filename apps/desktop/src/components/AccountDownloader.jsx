@@ -264,6 +264,9 @@ export default function AccountDownloader({ onShowToast }) {
       }
     }
 
+    const imageItems = itemsToDownload.filter((it) => it.type === 'image')
+    const videoItems = itemsToDownload.filter((it) => it.type === 'video')
+
     const taskId = createTaskId()
     setIsZipDownloading(true)
     setDownloadStartTime(Date.now())
@@ -279,36 +282,106 @@ export default function AccountDownloader({ onShowToast }) {
 
     let unlisten = null
     try {
-      try {
-        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
-      } catch (e) {
-        console.warn('Cannot attach progress listener:', e)
+      let albumRes = null
+      if (imageItems.length > 0) {
+        try {
+          unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+        } catch (e) {
+          console.warn('Cannot attach progress listener:', e)
+        }
+
+        const zipPayload = imageItems.map((it) => ({
+          url: it.url,
+          filename: `${it.title || 'media'}_${it.id}`,
+          referer: profileResult?.url,
+        }))
+        albumRes = await downloadAlbumBatch({
+          items: zipPayload,
+          albumName: `Profile_${profileResult?.name || 'Media'}`,
+          destDir: targetDir,
+          asZip: asZip,
+          taskId,
+        })
+
+        if (typeof unlisten === 'function') {
+          unlisten()
+          unlisten = null
+        }
+
+        if (videoItems.length === 0) {
+          setNativeProgress({
+            id: taskId,
+            percent: 100,
+            speed: '',
+            eta: '',
+            status: 'completed',
+            phase: 'Hoàn tất',
+            filePath: albumRes?.file_path,
+            fileName: albumRes?.file_name,
+          })
+          onShowToast?.(
+            albumRes?.message ||
+              (albumRes?.file_path
+                ? `Đã lưu tại: ${albumRes.file_path}`
+                : `Đã tải thành công (${itemsToDownload.length} tệp)!`)
+          )
+        }
       }
 
-      const zipPayload = itemsToDownload.map((it) => ({
-        url: it.url,
-        // Đuôi tệp do Rust suy ra từ URL thật — ảnh không còn bị đặt tên .mp4
-        filename: `${it.title || 'media'}_${it.id}`,
-        referer: profileResult?.url,
-      }))
-      const res = await downloadAlbumBatch({
-        items: zipPayload,
-        albumName: `Profile_${profileResult?.name || 'Media'}`,
-        destDir: targetDir,
-        asZip: asZip,
-        taskId,
-      })
-      setNativeProgress({
-        id: taskId,
-        percent: 100,
-        speed: '',
-        eta: '',
-        status: 'completed',
-        phase: 'Hoàn tất',
-        filePath: res?.file_path,
-        fileName: res?.file_name,
-      })
-      onShowToast?.(res?.message || (res?.file_path ? `Đã lưu tại: ${res.file_path}` : `Đã tải thành công (${itemsToDownload.length} tệp)!`))
+      if (videoItems.length > 0) {
+        let lastVideoRes = null
+        for (let i = 0; i < videoItems.length; i++) {
+          const item = videoItems[i]
+          const vidTaskId = `${taskId}_vid_${i}`
+
+          setNativeProgress({
+            id: vidTaskId,
+            percent: Math.round((i / videoItems.length) * 100),
+            speed: '',
+            eta: '',
+            status: 'downloading',
+            phase: `Đang tải video [${i + 1}/${videoItems.length}]...`,
+          })
+
+          try {
+            unlisten = await onDownloadProgress((payload) => {
+              setNativeProgress({
+                ...payload,
+                id: vidTaskId,
+                phase: `Đang tải video [${i + 1}/${videoItems.length}]...`,
+              })
+            }, vidTaskId)
+          } catch (e) {
+            console.warn('Cannot attach progress listener:', e)
+          }
+
+          try {
+            lastVideoRes = await startNativeDownload({
+              url: item.url,
+              title: item.title,
+              destDir: targetDir,
+              taskId: vidTaskId,
+            })
+          } finally {
+            if (typeof unlisten === 'function') {
+              unlisten()
+              unlisten = null
+            }
+          }
+        }
+
+        setNativeProgress({
+          id: taskId,
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'completed',
+          phase: 'Hoàn tất',
+          filePath: lastVideoRes?.file_path || targetDir,
+          fileName: lastVideoRes?.file_name,
+        })
+        onShowToast?.(`Đã tải thành công (${itemsToDownload.length} tệp)!`)
+      }
     } catch (err) {
       setNativeProgress({
         id: taskId,

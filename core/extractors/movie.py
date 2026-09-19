@@ -190,7 +190,7 @@ class MovieExtractor(BaseExtractor):
         for pattern, kind in STREAM_URL_PATTERNS:
             matches = re.findall(pattern, html, re.IGNORECASE)
             if matches and kind in ("hls", "dash", "mp4") and not found_stream:
-                candidate = matches[0].split('"')[0].split("'")[0].rstrip("\\")
+                candidate = matches[0].split('"')[0].split("'")[0].replace("\\/", "/").rstrip("\\")
                 if len(candidate) > 15:
                     found_stream = candidate
                     self.log(f"Tìm thấy [{kind.upper()}] qua HTML regex: {found_stream[:80]}")

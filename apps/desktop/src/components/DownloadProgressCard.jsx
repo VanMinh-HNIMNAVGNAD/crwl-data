@@ -11,18 +11,7 @@ function formatSeconds(secs) {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
 }
 
-export default function DownloadProgressCard({
-  progress,
-  title,
-  startTime,
-  onDismiss,
-  customStatusText,
-}) {
-  const status = progress?.status
-  const isDone = status === 'completed'
-  const isError = status === 'error'
-  const isFinished = isDone || isError
-
+export function Timer({ startTime, isFinished }) {
   const [elapsed, setElapsed] = useState(0)
   // Giữ lại tổng thời gian của lần tải vừa xong để không bị reset về 00:00
   const frozenRef = useRef(null)
@@ -47,12 +36,35 @@ export default function DownloadProgressCard({
     return () => clearInterval(interval)
   }, [startTime, isFinished])
 
+  return formatSeconds(elapsed)
+}
+
+export default function DownloadProgressCard({
+  progress,
+  title,
+  startTime,
+  onDismiss,
+  customStatusText,
+}) {
+  const status = progress?.status
+  const isDone = status === 'completed'
+  const isError = status === 'error'
+  const isFinished = isDone || isError
+
   if (!progress && !customStatusText) return null
 
   const percent = Math.min(100, Math.max(0, Number(progress?.percent) || 0))
   const savedPath = progress?.filePath || progress?.file_path
   const isPreparing = status === 'preparing'
   const isProcessing = status === 'processing'
+  const isIndeterminate =
+    !isFinished &&
+    Boolean(
+      progress?.isIndeterminate ||
+      progress?.is_indeterminate ||
+      isPreparing ||
+      isProcessing
+    )
 
   const statusText =
     customStatusText ||
@@ -106,7 +118,7 @@ export default function DownloadProgressCard({
       <div className="progress-bar-container">
         <div
           className={`progress-bar-fill ${isDone ? 'done-fill' : ''} ${
-            isPreparing || isProcessing ? 'is-indeterminate' : ''
+            isIndeterminate ? 'is-indeterminate' : ''
           }`}
           style={{ width: `${percent}%` }}
         />
@@ -116,7 +128,9 @@ export default function DownloadProgressCard({
       <div className="progress-metrics-grid">
         <div className="progress-metric-item">
           <span className="metric-label">Tiến trình</span>
-          <strong className="metric-value text-blue-400">{percent.toFixed(1)}%</strong>
+          <strong className="metric-value text-blue-400">
+            {isIndeterminate ? '--' : `${percent.toFixed(1)}%`}
+          </strong>
         </div>
 
         <div className="progress-metric-item">
@@ -126,7 +140,9 @@ export default function DownloadProgressCard({
 
         <div className="progress-metric-item">
           <span className="metric-label">{isDone ? 'Tổng thời gian' : 'Thời gian tải'}</span>
-          <strong className="metric-value">{formatSeconds(elapsed)}</strong>
+          <strong className="metric-value">
+            <Timer isFinished={isFinished} startTime={startTime} />
+          </strong>
         </div>
 
         <div className="progress-metric-item">

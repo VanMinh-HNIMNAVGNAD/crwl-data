@@ -222,6 +222,7 @@ impl Database {
         duration_ms: Option<i32>,
         status: &str,
         error_reason: Option<&str>,
+        client_ip: Option<&str>,
     ) -> Option<i64> {
         let pool = self.pool.as_ref()?;
         let user_id = self.get_or_create_user(device_id).await;
@@ -232,7 +233,7 @@ impl Database {
                 client_type, duration_ms, status, error_reason,
                 client_ip, device_id, browser_name, downloaded_at
             ) VALUES (
-                $1, $2, $3, $4, $5, 'desktop', $6, $7, $8, '127.0.0.1', $9, 'Tauri 2 / Linux Desktop', NOW()
+                $1, $2, $3, $4, $5, 'desktop', $6, $7, $8, $9, $10, 'Tauri 2 / Linux Desktop', NOW()
             ) RETURNING id;
         "#;
 
@@ -245,6 +246,7 @@ impl Database {
             .bind(duration_ms)
             .bind(status)
             .bind(error_reason)
+            .bind(client_ip)
             .bind(device_id)
             .fetch_one(pool)
             .await
@@ -371,6 +373,7 @@ impl Database {
         device_id: &str,
         original_url: &str,
         data: &serde_json::Value,
+        client_ip: Option<&str>,
     ) -> Option<(uuid::Uuid, uuid::Uuid)> {
         let pool = self.pool.as_ref()?;
         let user_id = self.get_or_create_user(device_id).await;
@@ -414,13 +417,14 @@ impl Database {
                 started_at, finished_at
             ) VALUES (
                 $1, $2, 'single', 'auto', 'ready', '{}'::jsonb,
-                1, 1, '127.0.0.1', $3, NOW(), NOW()
+                1, 1, $3, $4, NOW(), NOW()
             ) RETURNING id;
         "#;
 
         let job_id = match sqlx::query(job_query)
             .bind(user_id)
             .bind(title)
+            .bind(client_ip)
             .bind(device_id)
             .fetch_one(pool)
             .await
@@ -477,6 +481,7 @@ impl Database {
         device_id: &str,
         source_url: &str,
         data: &serde_json::Value,
+        client_ip: Option<&str>,
     ) -> Option<(uuid::Uuid, usize)> {
         let pool = self.pool.as_ref()?;
         let user_id = self.get_or_create_user(device_id).await;
@@ -499,7 +504,7 @@ impl Database {
                 started_at, finished_at
             ) VALUES (
                 $1, $2, 'profile', 'auto', 'ready', $3,
-                $4, $4, '127.0.0.1', $5, NOW(), NOW()
+                $4, $4, $5, $6, NOW(), NOW()
             ) RETURNING id;
         "#;
 
@@ -509,6 +514,7 @@ impl Database {
             .bind(&job_title)
             .bind(options)
             .bind(total_items)
+            .bind(client_ip)
             .bind(device_id)
             .fetch_one(pool)
             .await

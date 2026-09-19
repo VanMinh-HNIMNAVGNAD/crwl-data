@@ -6,6 +6,7 @@ Ported from MediaDispatcherService into standalone Python.
 """
 
 import os
+import time
 import urllib.request
 from typing import Optional
 from .base import BaseExtractor
@@ -69,7 +70,7 @@ class DirectImageExtractor(BaseExtractor):
         )
 
         return MediaMetadata(
-            id=str(int(os.times().system * 1000)),
+            id=str(int(time.time() * 1000)),
             platform="direct",
             title=f"{filename} (Hình ảnh trực tiếp)",
             author="Hình ảnh Web",
