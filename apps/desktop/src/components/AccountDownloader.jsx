@@ -711,7 +711,7 @@ export default function AccountDownloader({ onShowToast }) {
                         alt=""
                         className="profile-item-thumb"
                         onError={(e) => {
-                          e.target.style.opacity = '0.5'
+                          e.target.style.display = 'none'
                         }}
                       />
                       {item.duration && (

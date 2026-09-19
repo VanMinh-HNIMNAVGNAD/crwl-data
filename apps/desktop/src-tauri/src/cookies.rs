@@ -65,7 +65,7 @@ impl CookieService {
             "pinterest" => ".pinterest.com",
             "threads" => ".threads.net",
             "linkedin" => ".linkedin.com",
-            "pixiv" => ".pixiv.net",
+            "pixiv" | "pixiv_net" => ".pixiv.net",
             "reddit" => ".reddit.com",
             "bilibili" => ".bilibili.com",
             "douyin" => ".douyin.com",
@@ -85,7 +85,16 @@ impl CookieService {
             return (trimmed.to_string(), count);
         }
 
-        let default_domain = Self::platform_to_domain(platform);
+        let default_domain = if platform.contains('.') {
+            let p = platform.trim().to_lowercase();
+            if p.starts_with('.') {
+                p
+            } else {
+                format!(".{p}")
+            }
+        } else {
+            Self::platform_to_domain(platform).to_string()
+        };
         let expiry = (chrono::Utc::now().timestamp() + 30 * 86400).to_string();
 
         // 2. Định dạng JSON (từ extension Cookie-Editor hoặc EditThisCookie)
@@ -104,7 +113,7 @@ impl CookieService {
                         if name.is_empty() {
                             continue;
                         }
-                        let domain = obj.get("domain").and_then(|v| v.as_str()).unwrap_or(default_domain);
+                        let domain = obj.get("domain").and_then(|v| v.as_str()).unwrap_or(&default_domain);
                         let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("/");
                         let secure = if obj.get("secure").and_then(|v| v.as_bool()).unwrap_or(false) { "TRUE" } else { "FALSE" };
                         let item_exp = obj.get("expirationDate")
@@ -294,3 +303,48 @@ impl CookieService {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_convert_to_netscape_with_custom_domain_dot() {
+        let (output, count) = CookieService::convert_to_netscape("pixiv.net", "test=123");
+        assert_eq!(count, 1);
+        assert!(output.contains(".pixiv.net\tTRUE\t/\tFALSE\t"));
+        assert!(output.contains("\ttest\t123"));
+
+        let (output_leading_dot, count_dot) = CookieService::convert_to_netscape(".pixiv.net", "test=123");
+        assert_eq!(count_dot, 1);
+        assert!(output_leading_dot.contains(".pixiv.net\tTRUE\t/\tFALSE\t"));
+    }
+
+    #[test]
+    fn test_convert_to_netscape_with_platform_without_dot() {
+        let (output, count) = CookieService::convert_to_netscape("pixiv", "test=123");
+        assert_eq!(count, 1);
+        assert!(output.contains(".pixiv.net\tTRUE\t/\tFALSE\t"));
+
+        let (output_insta, count_insta) = CookieService::convert_to_netscape("instagram", "sessionid=abc");
+        assert_eq!(count_insta, 1);
+        assert!(output_insta.contains(".instagram.com\tTRUE\t/\tFALSE\t"));
+    }
+
+    #[test]
+    fn test_convert_to_netscape_json_custom_domain() {
+        let json = r#"[{"name": "session", "value": "xyz"}]"#;
+        let (output, count) = CookieService::convert_to_netscape("pixiv.net", json);
+        assert_eq!(count, 1);
+        assert!(output.contains(".pixiv.net\tTRUE\t/\tFALSE\t"));
+        assert!(output.contains("\tsession\txyz"));
+    }
+
+    #[test]
+    fn test_convert_to_netscape_fallback_social_com() {
+        let (output, count) = CookieService::convert_to_netscape("unknown_platform", "key=val");
+        assert_eq!(count, 1);
+        assert!(output.contains(".social.com\tTRUE\t/\tFALSE\t"));
+    }
+}
+

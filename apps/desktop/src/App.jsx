@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import SystemHeader from './components/SystemHeader'
 import LinkDownloader from './components/LinkDownloader'
 import AccountDownloader from './components/AccountDownloader'
@@ -13,10 +13,16 @@ function App() {
   const [isToolsOpen, setIsToolsOpen] = useState(false)
   const [toastMessage, setToastMessage] = useState('')
   const [cookieRefreshKey, setCookieRefreshKey] = useState(0)
+  const toastTimer = useRef(null)
 
   const showToast = (msg) => {
     setToastMessage(msg)
-    setTimeout(() => setToastMessage(''), 3200)
+    if (toastTimer.current) {
+      clearTimeout(toastTimer.current)
+    }
+    toastTimer.current = setTimeout(() => {
+      setToastMessage('')
+    }, 3000)
   }
 
   const handleCookieUpdated = () => {

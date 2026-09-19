@@ -147,10 +147,16 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
   const [status, setStatus] = useState(null)
   const [confirmDelete, setConfirmDelete] = useState(null) // platform string
   const modalRef = useRef(null)
+  const toastTimer = useRef(null)
 
   const showToast = (type, msg) => {
     setToast({ type, msg })
-    setTimeout(() => setToast(null), 3500)
+    if (toastTimer.current) {
+      clearTimeout(toastTimer.current)
+    }
+    toastTimer.current = setTimeout(() => {
+      setToast(null)
+    }, 3000)
   }
 
   const loadStatus = async () => {
@@ -207,7 +213,7 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
     setSaving(true)
     try {
       const platformKey = activeTab === 'custom'
-        ? customDomain.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_')
+        ? customDomain.trim().toLowerCase()
         : activeTab
 
       const result = await savePlatformCookies(

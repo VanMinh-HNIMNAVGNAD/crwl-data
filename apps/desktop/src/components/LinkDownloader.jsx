@@ -36,7 +36,6 @@ export default function LinkDownloader({ onShowToast }) {
   const [mode, setMode] = useState('single') // 'single' | 'batch'
   const [url, setUrl] = useState('')
   const [batchText, setBatchText] = useState('')
-  const [selectedFormat, setSelectedFormat] = useState('all')
   const [isLoading, setIsLoading] = useState(false)
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, statusText: '' })
 
@@ -625,8 +624,8 @@ export default function LinkDownloader({ onShowToast }) {
                   <button
                     key={f.id}
                     type="button"
-                    className={`minimal-pill ${selectedFormat === f.id ? 'active' : ''}`}
-                    onClick={() => setSelectedFormat(f.id)}
+                    className={`minimal-pill ${videoContainer === f.id ? 'active' : ''}`}
+                    onClick={() => setVideoContainer(f.id)}
                   >
                     {f.label}
                   </button>
@@ -1025,6 +1024,9 @@ export default function LinkDownloader({ onShowToast }) {
                         src={buildProxyImageUrl(img.thumb || img.url)}
                         alt=""
                         className="album-img"
+                        onError={(e) => {
+                          e.target.style.display = 'none'
+                        }}
                       />
                       <input
                         type="checkbox"
@@ -1178,6 +1180,9 @@ export default function LinkDownloader({ onShowToast }) {
                     src={buildProxyImageUrl(m.thumbnail || m.highResThumbnail)}
                     alt=""
                     className="batch-item-thumb"
+                    onError={(e) => {
+                      e.target.style.display = 'none'
+                    }}
                   />
                   <div className="batch-item-info">
                     <span className="batch-item-title" title={m.title}>

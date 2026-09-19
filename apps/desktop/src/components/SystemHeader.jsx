@@ -18,10 +18,16 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
   const [toastMsg, setToastMsg] = useState('')
   const [cookieCount, setCookieCount] = useState(0)
   const browserDropdownRef = useRef(null)
+  const toastTimer = useRef(null)
 
   const showToast = (msg) => {
     setToastMsg(msg)
-    setTimeout(() => setToastMsg(''), 3000)
+    if (toastTimer.current) {
+      clearTimeout(toastTimer.current)
+    }
+    toastTimer.current = setTimeout(() => {
+      setToastMsg('')
+    }, 3000)
   }
 
 
