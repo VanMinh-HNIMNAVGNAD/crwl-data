@@ -421,6 +421,9 @@ impl DownloaderService {
                 cmd.arg("--embed-thumbnail");
             } else if fid == "best" {
                 cmd.arg("-f").arg("bestvideo+bestaudio/best");
+            } else if fid.contains('+') || fid.contains('/') {
+                // Biểu thức chọn format phức tạp (như bestvideo[height<=1080]+bestaudio/best[height<=1080])
+                cmd.arg("-f").arg(fid);
             } else {
                 cmd.arg("-f").arg(format!("{fid}+bestaudio/bestvideo+bestaudio/{fid}/best"));
             }

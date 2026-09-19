@@ -15,23 +15,27 @@ export function Timer({ startTime, isFinished }) {
   const [elapsed, setElapsed] = useState(0)
   // Giữ lại tổng thời gian của lần tải vừa xong để không bị reset về 00:00
   const frozenRef = useRef(null)
+  const startRef = useRef(null)
 
   useEffect(() => {
-    if (!startTime) return undefined
-    // Đếm giờ chỉ chạy khi còn đang tải. Trước đây bộ đếm tiếp tục chạy cả sau
-    // khi đã báo hoàn tất, nên thời gian hiển thị cứ tăng vô nghĩa.
     if (isFinished) {
       if (frozenRef.current == null) {
-        frozenRef.current = Math.max(0, Math.floor((Date.now() - startTime) / 1000))
+        const start = startTime || startRef.current || Date.now()
+        frozenRef.current = Math.max(0, Math.floor((Date.now() - start) / 1000))
         setElapsed(frozenRef.current)
       }
       return undefined
     }
 
     frozenRef.current = null
-    setElapsed(Math.max(0, Math.floor((Date.now() - startTime) / 1000)))
+    if (!startRef.current) {
+      startRef.current = startTime || Date.now()
+    }
+    const start = startTime || startRef.current
+
+    setElapsed(Math.max(0, Math.floor((Date.now() - start) / 1000)))
     const interval = setInterval(() => {
-      setElapsed(Math.max(0, Math.floor((Date.now() - startTime) / 1000)))
+      setElapsed(Math.max(0, Math.floor((Date.now() - start) / 1000)))
     }, 1000)
     return () => clearInterval(interval)
   }, [startTime, isFinished])

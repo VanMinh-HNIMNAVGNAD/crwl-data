@@ -45,9 +45,9 @@ export default function LinkDownloader({ onShowToast }) {
   const [selectedImages, setSelectedImages] = useState({})
   const [downloadingId, setDownloadingId] = useState(null)
   const [nativeProgress, setNativeProgress] = useState(null)
-  const [downloadStartTime, setDownloadStartTime] = useState(null)
   const [downloadTaskTitle, setDownloadTaskTitle] = useState('')
-  const [selectedSubLang, setSelectedSubLang] = useState('')
+  const [userSelectedSubLang, setUserSelectedSubLang] = useState('')
+  const selectedSubLang = userSelectedSubLang || singleMedia?.subtitles?.[0]?.lang || ''
   const [alwaysAskDir, setAlwaysAskDir] = useState(getAlwaysAskDownloadDir())
   const [isZipDownloading, setIsZipDownloading] = useState(false)
   const cancelRef = useRef(false)         // dùng để hủy batch extract
@@ -143,11 +143,6 @@ export default function LinkDownloader({ onShowToast }) {
       ? asyncResolved.resolvedUrl
       : trimmedUrl
 
-  useEffect(() => {
-    if (singleMedia?.subtitles && singleMedia.subtitles.length > 0) {
-      setSelectedSubLang(singleMedia.subtitles[0].lang)
-    }
-  }, [singleMedia])
 
   const parsedBatchLinks = useMemo(() => {
     return batchText
@@ -286,7 +281,6 @@ export default function LinkDownloader({ onShowToast }) {
     }
 
     const taskId = createTaskId()
-    setDownloadStartTime(Date.now())
     setDownloadTaskTitle(media.title || stream.quality || 'Video')
     setNativeProgress({
       id: taskId,
@@ -310,12 +304,24 @@ export default function LinkDownloader({ onShowToast }) {
         console.warn('Cannot attach progress listener:', e)
       }
 
+      // Với các nền tảng mạng xã hội có extractor chuẩn, luôn dùng URL bài viết gốc + formatId
+      // để yt-dlp sử dụng đầy đủ cookies, referer và session đăng nhập, tránh lỗi 403 Forbidden.
+      const isDirectStreamOnly =
+        !media.originalUrl ||
+        media.platform === 'movie' ||
+        media.platform === 'generic' ||
+        stream.formatId?.startsWith('web_video_') ||
+        Boolean(stream.url && (stream.url.includes('.m3u8') || stream.url.includes('.mpd')))
+
+      const downloadUrl = isDirectStreamOnly && stream.url ? stream.url : (media.originalUrl || stream.url)
+      const downloadFormatId = isDirectStreamOnly && stream.url ? null : (stream.formatId || null)
+
       const res = await startNativeDownload({
-        url: stream.url || media.originalUrl,
-        formatId: stream.url ? null : stream.formatId,
+        url: downloadUrl,
+        formatId: downloadFormatId,
         isAudio: isAudioOnly,
         isMute: isMute,
-        referer: stream.url ? media.originalUrl : undefined,
+        referer: media.originalUrl || undefined,
         startTime: trimStart || undefined,
         endTime: trimEnd || undefined,
         title: media.title,
@@ -465,7 +471,6 @@ export default function LinkDownloader({ onShowToast }) {
 
     const taskId = createTaskId()
     setIsZipDownloading(true)
-    setDownloadStartTime(Date.now())
     setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} ảnh`)
     setNativeProgress({
       id: taskId,
@@ -542,7 +547,6 @@ export default function LinkDownloader({ onShowToast }) {
     setAsyncResolved(null)
     setSelectedImages({})
     setNativeProgress(null)
-    setDownloadStartTime(null)
     setDownloadTaskTitle('')
     setDownloadingId(null)
     setIsZipDownloading(false)
@@ -554,7 +558,6 @@ export default function LinkDownloader({ onShowToast }) {
     setBatchMedias([])
     setSelectedImages({})
     setNativeProgress(null)
-    setDownloadStartTime(null)
     setDownloadingId(null)
     setIsZipDownloading(false)
   }
@@ -607,7 +610,6 @@ export default function LinkDownloader({ onShowToast }) {
                     setBatchMedias([])
                     setSelectedImages({})
                     setNativeProgress(null)
-                    setDownloadStartTime(null)
                     setDownloadTaskTitle('')
                   }
                 }}
@@ -697,7 +699,6 @@ export default function LinkDownloader({ onShowToast }) {
                     setBatchMedias([])
                     setSelectedImages({})
                     setNativeProgress(null)
-                    setDownloadStartTime(null)
                   }
                 }}
                 disabled={isLoading}
@@ -853,6 +854,7 @@ export default function LinkDownloader({ onShowToast }) {
                   placeholder="00:00"
                   value={trimStart}
                   onChange={(e) => setTrimStart(e.target.value)}
+                  title="Thời điểm bắt đầu (vd: 00:10)"
                 />
                 <span>đến</span>
                 <input
@@ -861,7 +863,33 @@ export default function LinkDownloader({ onShowToast }) {
                   placeholder="00:30"
                   value={trimEnd}
                   onChange={(e) => setTrimEnd(e.target.value)}
+                  title="Thời điểm kết thúc (vd: 01:00)"
                 />
+                <div className="trimmer-presets">
+                  <button
+                    type="button"
+                    className="btn-trim-preset"
+                    onClick={() => { setTrimStart('00:00'); setTrimEnd('00:30') }}
+                  >
+                    30s đầu
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-trim-preset"
+                    onClick={() => { setTrimStart('00:00'); setTrimEnd('01:00') }}
+                  >
+                    1p đầu
+                  </button>
+                  {(trimStart || trimEnd) && (
+                    <button
+                      type="button"
+                      className="btn-trim-preset btn-trim-reset"
+                      onClick={() => { setTrimStart(''); setTrimEnd('') }}
+                    >
+                      Đặt lại
+                    </button>
+                  )}
+                </div>
               </div>
             )}
 
@@ -883,7 +911,7 @@ export default function LinkDownloader({ onShowToast }) {
                     checked={embedMetadata}
                     onChange={(e) => setEmbedMetadata(e.target.checked)}
                   />
-                  <span>Nhúng ID3 &amp; Thumbnail</span>
+                  <span>Nhúng Metadata</span>
                 </label>
 
                 <label className="checkbox-opt-label">
@@ -892,7 +920,7 @@ export default function LinkDownloader({ onShowToast }) {
                     checked={embedSubs}
                     onChange={(e) => setEmbedSubs(e.target.checked)}
                   />
-                  <span>Nhúng phụ đề</span>
+                  <span>Nhúng Phụ đề</span>
                 </label>
 
                 <label className="checkbox-opt-label">
@@ -907,30 +935,28 @@ export default function LinkDownloader({ onShowToast }) {
                   <span>Hỏi nơi lưu trữ trước khi tải</span>
                 </label>
 
-                <div className="container-select-group">
-                  <span>Định dạng:</span>
+                <div className="format-container-picker">
+                  <span className="picker-label">Định dạng file:</span>
                   <select
-                    className="container-select"
+                    className="minimal-select"
                     value={videoContainer}
                     onChange={(e) => setVideoContainer(e.target.value)}
                   >
-                    <option value="auto">Gốc / Mặc định</option>
-                    <option value="mp4">MP4 (Phổ biến)</option>
-                    <option value="mkv">MKV (Lossless)</option>
-                    <option value="mov">MOV (Apple/Pro)</option>
-                    <option value="webm">WEBM (Web)</option>
+                    <option value="auto">Mặc định (Khuyên dùng)</option>
+                    <option value="mp4">MP4 (Tương thích cao)</option>
+                    <option value="mkv">MKV (Chất lượng gốc)</option>
+                    <option value="webm">WebM (Nhẹ / Web)</option>
                     <option value="gif">GIF (Ảnh động)</option>
                   </select>
                 </div>
               </div>
             )}
 
-            {/* Mục hiển thị Tiến trình chi tiết (Tốc độ, Thời gian đã tải, Ước tính ETA) */}
+            {/* Thẻ hiển thị Tiến trình tải xuống */}
             {nativeProgress && (
               <DownloadProgressCard
                 progress={nativeProgress}
                 title={downloadTaskTitle}
-                startTime={downloadStartTime}
                 onDismiss={() => setNativeProgress(null)}
               />
             )}
@@ -961,7 +987,7 @@ export default function LinkDownloader({ onShowToast }) {
                     <select
                       className="sub-select-dropdown"
                       value={selectedSubLang}
-                      onChange={(e) => setSelectedSubLang(e.target.value)}
+                      onChange={(e) => setUserSelectedSubLang(e.target.value)}
                     >
                       {singleMedia.subtitles.map((sub) => (
                         <option key={sub.lang} value={sub.lang}>

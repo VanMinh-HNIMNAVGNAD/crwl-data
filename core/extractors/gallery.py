@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import time
 from typing import Optional, List, Dict, Any, Tuple
 from .base import BaseExtractor
 from ..models import (
@@ -274,7 +275,7 @@ class GalleryDlExtractor(BaseExtractor):
             platform = "x"
 
         return MediaMetadata(
-            id=str(int(os.times().system * 1000)),
+            id=str(abs(hash(original_url))) if original_url else str(int(time.time() * 1000)),
             platform=platform,
             title=images[0].title if is_single_video else f"{title} ({len(images)} tệp)",
             author=author,

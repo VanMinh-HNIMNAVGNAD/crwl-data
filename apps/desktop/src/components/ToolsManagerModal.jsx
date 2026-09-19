@@ -21,8 +21,20 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
   }
 
   useEffect(() => {
-    if (isOpen) {
-      fetchStatus()
+    if (!isOpen) return
+    let active = true
+    getBinaryStatus()
+      .then((data) => {
+        if (active && data) setToolsData(data)
+      })
+      .catch((err) => {
+        console.warn('Lỗi khi tải trạng thái công cụ:', err)
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
     }
   }, [isOpen])
 

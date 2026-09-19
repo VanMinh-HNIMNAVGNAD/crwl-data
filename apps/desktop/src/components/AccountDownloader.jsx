@@ -13,7 +13,6 @@ import {
   startNativeDownload,
   createTaskId,
   downloadDirectFile,
-  downloadZipArchive,
   downloadAlbumBatch,
   onDownloadProgress,
   buildProxyImageUrl,
@@ -38,7 +37,6 @@ export default function AccountDownloader({ onShowToast }) {
   const [selectedBatchIds, setSelectedBatchIds] = useState({})
   const [downloadingId, setDownloadingId] = useState(null)
   const [nativeProgress, setNativeProgress] = useState(null)
-  const [downloadStartTime, setDownloadStartTime] = useState(null)
   const [downloadTaskTitle, setDownloadTaskTitle] = useState('')
   const [isZipDownloading, setIsZipDownloading] = useState(false)
 
@@ -57,7 +55,6 @@ export default function AccountDownloader({ onShowToast }) {
     setProfileResult(null)
     setSelectedBatchIds({})
     setNativeProgress(null)
-    setDownloadStartTime(null)
     setDownloadTaskTitle('')
     setStatusText('')
     setDownloadingId(null)
@@ -162,7 +159,6 @@ export default function AccountDownloader({ onShowToast }) {
 
     const taskId = createTaskId()
     const isImage = item.type === 'image'
-    setDownloadStartTime(Date.now())
     setDownloadTaskTitle(item.title || 'Tệp tải xuống')
     setNativeProgress({
       id: taskId,
@@ -270,7 +266,6 @@ export default function AccountDownloader({ onShowToast }) {
 
     const taskId = createTaskId()
     setIsZipDownloading(true)
-    setDownloadStartTime(Date.now())
     setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} tệp`)
     setNativeProgress({
       id: taskId,
@@ -449,7 +444,6 @@ export default function AccountDownloader({ onShowToast }) {
                   setProfileResult(null)
                   setSelectedBatchIds({})
                   setNativeProgress(null)
-                  setDownloadStartTime(null)
                   setDownloadTaskTitle('')
                   setStatusText('')
                 }
@@ -685,7 +679,6 @@ export default function AccountDownloader({ onShowToast }) {
               <DownloadProgressCard
                 progress={nativeProgress}
                 title={downloadTaskTitle}
-                startTime={downloadStartTime}
                 onDismiss={() => setNativeProgress(null)}
               />
             )}

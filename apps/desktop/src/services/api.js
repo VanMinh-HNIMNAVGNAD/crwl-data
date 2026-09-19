@@ -37,18 +37,6 @@ export function getDeviceId() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Turnstile (Removed — bypassed permanently)
-// ─────────────────────────────────────────────────────────────────────────────
-
-export function setTurnstileToken() {}
-export function getTurnstileToken() {
-  return null
-}
-export async function verifyTurnstileTokenWithBackend() {
-  return { success: true, bypassed: true }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Browser & Download Directory preferences (localStorage)
 // ─────────────────────────────────────────────────────────────────────────────
 

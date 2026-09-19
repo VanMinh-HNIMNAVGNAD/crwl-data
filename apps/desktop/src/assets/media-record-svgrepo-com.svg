@@ -1,12 +1,15 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Media Downloader Logo with White Background for High Contrast -->
-<svg width="800px" height="800px" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" version="1.1" id="svg2">
-  <!-- Nền trắng tròn giúp làm nổi bật viền đen và tâm đỏ -->
-  <circle cx="8" cy="8" r="8" fill="#ffffff" id="bg-white" />
-  
-  <!-- Viền đen ngoài (Outer ring) -->
-  <path id="path828" d="M8 1a7 7 0 0 0-7 7 7 7 0 0 0 7 7 7 7 0 0 0 7-7 7 7 0 0 0-7-7zm0 1a6 6 0 0 1 6 6 6 6 0 0 1-6 6 6 6 0 0 1-6-6 6 6 0 0 1 6-6z" style="opacity:1;fill:#1e2024;fill-opacity:1;stroke:none;" />
-  
-  <!-- Tâm đỏ ghi hình (Center red record circle) -->
-  <circle r="3" cy="8" cx="8" id="path833" style="opacity:1;fill:#da4453;fill-opacity:1;stroke:none;" />
+<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="mediaGrad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#8b5cf6" />
+    </linearGradient>
+    <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#f87171" />
+      <stop offset="100%" stop-color="#ef4444" />
+    </radialGradient>
+  </defs>
+  <rect x="2" y="2" width="20" height="20" rx="6" fill="#181c26" stroke="#2d3548" stroke-width="1.2" />
+  <circle cx="12" cy="12" r="6.5" stroke="url(#mediaGrad)" stroke-width="1.5" stroke-dasharray="32" stroke-dashoffset="0" opacity="0.9" />
+  <circle cx="12" cy="12" r="3.2" fill="url(#centerGlow)" />
 </svg>

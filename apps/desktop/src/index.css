@@ -1,10 +1,10 @@
 :root {
   /* Soft, gentle neutral color palette */
-  --bg-main: #111318;
-  --bg-surface: #181b22;
-  --bg-surface-hover: #1f232d;
-  --bg-surface-elevated: #242834;
-  --bg-input: #14161d;
+  --bg-main: #0f1117;
+  --bg-surface: #151821;
+  --bg-surface-hover: #1b1f2b;
+  --bg-surface-elevated: #222736;
+  --bg-input: #12141c;
   
   --border-subtle: #262a36;
   --border-strong: #363c4d;
