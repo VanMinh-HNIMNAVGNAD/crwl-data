@@ -243,8 +243,22 @@ pub fn get_app_settings() -> AppSettings {
 }
 
 #[tauri::command]
-pub fn save_app_settings(settings: AppSettings) -> Result<(), String> {
-    SettingsManager::save(&settings)
+pub async fn save_app_settings(
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<(), String> {
+    let old_settings = SettingsManager::load();
+    let url_changed = old_settings.database_url != settings.database_url;
+    SettingsManager::save(&settings)?;
+
+    if url_changed {
+        let db = Arc::clone(&state.db);
+        tauri::async_runtime::spawn(async move {
+            db.init().await;
+        });
+    }
+
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

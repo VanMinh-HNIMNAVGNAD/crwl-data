@@ -46,7 +46,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
       onShowToast?.(res || 'Đã cập nhật yt-dlp thành công!')
       await fetchStatus()
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi cập nhật yt-dlp')
+      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi cập nhật yt-dlp')
     } finally {
       setUpdatingTool(null)
     }
@@ -60,7 +60,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
       onShowToast?.(res || 'Đã cập nhật gallery-dl thành công!')
       await fetchStatus()
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi cập nhật gallery-dl')
+      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi cập nhật gallery-dl')
     } finally {
       setUpdatingTool(null)
     }

@@ -231,6 +231,15 @@ impl DownloaderService {
         if lower.contains("soundcloud.com") {
             return Some("soundcloud");
         }
+        if lower.contains("pixiv.net") || lower.contains("pixiv.me") {
+            return Some("pixiv");
+        }
+        if lower.contains("douyin.com") {
+            return Some("douyin");
+        }
+        if lower.contains("tumblr.com") {
+            return Some("tumblr");
+        }
         None
     }
 
@@ -833,8 +842,8 @@ impl DownloaderService {
         if lower.contains("unsupported url") || lower.contains("no video formats") {
             return format!("Liên kết này không có luồng tải được. (Chi tiết: {raw})");
         }
-        if raw.len() > 300 {
-            return format!("{}...", &raw[..300]);
+        if raw.chars().count() > 300 {
+            return format!("{}...", raw.chars().take(300).collect::<String>());
         }
         raw
     }
@@ -1337,6 +1346,14 @@ mod tests {
     #[test]
     fn empty_stderr_gives_empty_summary() {
         assert_eq!(D::summarize_ytdlp_error(&[]), "");
+    }
+
+    #[test]
+    fn utf8_truncation_handles_multibyte_characters() {
+        let long_vn = "Tiếng Việt có dấu kiểm tra cắt chuỗi an toàn không bị panic khi gặp ký tự UTF-8 đa byte. ".repeat(10);
+        let summary = D::summarize_ytdlp_error(&[format!("ERROR: {long_vn}")]);
+        assert!(summary.ends_with("..."));
+        assert_eq!(summary.chars().count(), 303);
     }
 
     #[test]

@@ -11,7 +11,7 @@ import {
   IconCopy,
   IconSettings,
 } from './Icons'
-import { FORMAT_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform } from '../constants'
+import { FORMAT_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform, isGenericShortenerUrl } from '../constants'
 import {
   extractMedia,
   resolveShortUrl,
@@ -20,7 +20,6 @@ import {
   createTaskId,
   downloadThumbnail,
   downloadSubtitle,
-  downloadZipArchive,
   downloadAlbumBatch,
   downloadDirectFile,
   onDownloadProgress,
@@ -70,11 +69,15 @@ export default function LinkDownloader({ onShowToast }) {
   const trimmedUrl = url.trim()
   const syncValidation = useMemo(() => {
     if (!trimmedUrl) return { valid: true, status: 'empty', message: '' }
-    const detected = detectPlatform(trimmedUrl)
-    const initial = validatePlatformUrl(trimmedUrl, detected)
-    if (initial.status === 'needs_resolve') {
+    const initial = validatePlatformUrl(trimmedUrl, null)
+    if (!initial.valid) {
+      return initial
+    }
+    if (initial.status === 'needs_resolve' || isGenericShortenerUrl(trimmedUrl)) {
       return { valid: true, status: 'needs_resolve', message: 'Đang kiểm tra chuyển hướng link...' }
-    } else if (initial.status === 'matched') {
+    }
+    const detected = initial.platform || detectPlatform(trimmedUrl)
+    if (detected) {
       const pName = getPlatform(detected)?.name
       if (detected === 'movie') {
         return {
@@ -107,6 +110,7 @@ export default function LinkDownloader({ onShowToast }) {
           if (active && res.platform) {
             const pObj = getPlatform(res.platform)
             setAsyncResolved({
+              url: trimmedUrl,
               valid: true,
               status: 'matched',
               platform: res.platform,
@@ -118,7 +122,7 @@ export default function LinkDownloader({ onShowToast }) {
           }
         } catch {
           if (active) {
-            setAsyncResolved({ valid: true, status: 'manual', message: 'Liên kết cần phân tích trực tiếp' })
+            setAsyncResolved({ url: trimmedUrl, valid: true, status: 'manual', message: 'Liên kết cần phân tích trực tiếp' })
           }
         }
       }, 350)
@@ -129,8 +133,15 @@ export default function LinkDownloader({ onShowToast }) {
     }
   }, [syncValidation.status, trimmedUrl])
 
-  const validationState = asyncResolved && syncValidation.status === 'needs_resolve' ? asyncResolved : syncValidation
-  const resolvedUrl = asyncResolved?.resolvedUrl || trimmedUrl
+  const isResolvedForCurrentUrl =
+    syncValidation.status === 'needs_resolve' &&
+    asyncResolved?.url === trimmedUrl
+
+  const validationState = isResolvedForCurrentUrl ? asyncResolved : syncValidation
+  const resolvedUrl =
+    isResolvedForCurrentUrl && asyncResolved?.resolvedUrl
+      ? asyncResolved.resolvedUrl
+      : trimmedUrl
 
   useEffect(() => {
     if (singleMedia?.subtitles && singleMedia.subtitles.length > 0) {
@@ -152,6 +163,7 @@ export default function LinkDownloader({ onShowToast }) {
       if (text) {
         if (targetMode === 'single') {
           setUrl(text.trim())
+          setAsyncResolved(null)
         } else {
           setBatchText((prev) => (prev ? `${prev}\n${text.trim()}` : text.trim()))
         }
@@ -182,7 +194,8 @@ export default function LinkDownloader({ onShowToast }) {
       }
     } catch (err) {
       if (!cancelRef.current) {
-        onShowToast?.(err.message || 'Lỗi khi trích xuất liên kết')
+        const errorMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi trích xuất liên kết'
+        onShowToast?.(errorMsg)
       }
     } finally {
       setIsLoading(false)
@@ -224,7 +237,7 @@ export default function LinkDownloader({ onShowToast }) {
         const item = await extractMedia(link)
         if (item && !cancelRef.current) results.push(item)
       } catch (err) {
-        const errMsg = err.message || ''
+        const errMsg = typeof err === 'string' ? err : err?.message || ''
         const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('55 giây')
         console.warn(`[Batch] Lỗi ${isTimeout ? 'timeout' : 'bóc tách'} ${link}:`, errMsg)
         failedLinks.push({ link, reason: isTimeout ? 'Timeout' : errMsg.slice(0, 60) })
@@ -253,8 +266,8 @@ export default function LinkDownloader({ onShowToast }) {
   }
 
   // Tải stream video/audio đơn
-  const handleDownloadStream = async (stream) => {
-    if (!singleMedia) return
+  const handleDownloadStream = async (stream, media = singleMedia) => {
+    if (!media) return
     const streamId = stream.formatId || stream.quality || 'stream'
     setDownloadingId(streamId)
 
@@ -274,7 +287,7 @@ export default function LinkDownloader({ onShowToast }) {
 
     const taskId = createTaskId()
     setDownloadStartTime(Date.now())
-    setDownloadTaskTitle(singleMedia.title || stream.quality || 'Video')
+    setDownloadTaskTitle(media.title || stream.quality || 'Video')
     setNativeProgress({
       id: taskId,
       percent: 0,
@@ -298,14 +311,14 @@ export default function LinkDownloader({ onShowToast }) {
       }
 
       const res = await startNativeDownload({
-        url: stream.url || singleMedia.originalUrl,
+        url: stream.url || media.originalUrl,
         formatId: stream.url ? null : stream.formatId,
         isAudio: isAudioOnly,
         isMute: isMute,
-        referer: stream.url ? singleMedia.originalUrl : undefined,
+        referer: stream.url ? media.originalUrl : undefined,
         startTime: trimStart || undefined,
         endTime: trimEnd || undefined,
-        title: singleMedia.title,
+        title: media.title,
         destDir: targetDir,
         embedSubs: embedSubs,
         embedMetadata: embedMetadata,
@@ -329,6 +342,7 @@ export default function LinkDownloader({ onShowToast }) {
         onShowToast?.(`Đã tải xong: ${res.file_path || res.file_name || 'tệp'}`)
       }
     } catch (err) {
+      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải stream'
       setNativeProgress({
         id: taskId,
         percent: 0,
@@ -336,9 +350,9 @@ export default function LinkDownloader({ onShowToast }) {
         eta: '',
         status: 'error',
         phase: 'Tải thất bại',
-        message: err.message,
+        message: errMsg,
       })
-      onShowToast?.(err.message || 'Lỗi khi tải stream')
+      onShowToast?.(errMsg)
     } finally {
       // Gỡ listener trong mọi trường hợp — trước đây khi tải lỗi listener bị rò rỉ,
       // tích lũy dần và làm thanh tiến trình nhảy loạn ở các lần tải sau.
@@ -360,7 +374,7 @@ export default function LinkDownloader({ onShowToast }) {
         onShowToast?.(`Đã lưu thumbnail: ${res.file_name}`)
       }
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi tải thumbnail')
+      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải thumbnail')
     }
   }
 
@@ -372,13 +386,14 @@ export default function LinkDownloader({ onShowToast }) {
       const res = await downloadSubtitle({
         url: singleMedia.originalUrl,
         lang: sub.lang,
+        format: sub.ext,
         title: singleMedia.title,
       })
       if (res?.file_name) {
         onShowToast?.(`Đã lưu phụ đề: ${res.file_name}`)
       }
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi tải phụ đề')
+      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải phụ đề')
     }
   }
 
@@ -406,7 +421,7 @@ export default function LinkDownloader({ onShowToast }) {
       document.body.removeChild(a)
       onShowToast?.('Bắt đầu tải ảnh')
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi tải ảnh')
+      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải ảnh')
     }
   }
 
@@ -494,6 +509,7 @@ export default function LinkDownloader({ onShowToast }) {
       })
       onShowToast?.(res?.message || (res?.file_path ? `Đã lưu tại: ${res.file_path}` : `Đã tải xong ${itemsToDownload.length} ảnh!`))
     } catch (err) {
+      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải album'
       setNativeProgress({
         id: taskId,
         percent: 0,
@@ -501,9 +517,9 @@ export default function LinkDownloader({ onShowToast }) {
         eta: '',
         status: 'error',
         phase: 'Tải thất bại',
-        message: err.message,
+        message: errMsg,
       })
-      onShowToast?.(err.message || 'Lỗi khi tải album')
+      onShowToast?.(errMsg)
     } finally {
       if (typeof unlisten === 'function') unlisten()
       setIsZipDownloading(false)
@@ -585,10 +601,10 @@ export default function LinkDownloader({ onShowToast }) {
                 onChange={(e) => {
                   const val = e.target.value
                   setUrl(val)
+                  setAsyncResolved(null)
                   if (!val.trim()) {
                     setSingleMedia(null)
                     setBatchMedias([])
-                    setAsyncResolved(null)
                     setSelectedImages({})
                     setNativeProgress(null)
                     setDownloadStartTime(null)
@@ -758,8 +774,10 @@ export default function LinkDownloader({ onShowToast }) {
                   src={buildProxyImageUrl(singleMedia.thumbnail || singleMedia.highResThumbnail)}
                   alt={singleMedia.title}
                   className="preview-img"
+                  referrerPolicy="no-referrer"
                   onError={(e) => {
-                    e.target.src = singleMedia.thumbnail || singleMedia.highResThumbnail
+                    e.currentTarget.onerror = null
+                    e.currentTarget.src = singleMedia.thumbnail || singleMedia.highResThumbnail
                   }}
                 />
                 {singleMedia.duration && (
@@ -1032,7 +1050,7 @@ export default function LinkDownloader({ onShowToast }) {
                         type="checkbox"
                         className="album-checkbox"
                         checked={Boolean(selectedImages[img.id])}
-                        onChange={() => {}}
+                        readOnly
                       />
                       <button
                         type="button"
@@ -1197,11 +1215,8 @@ export default function LinkDownloader({ onShowToast }) {
                     type="button"
                     className="minimal-small-btn"
                     onClick={() => {
-                      const topStream = m.streams?.[0]
-                      if (topStream) {
-                        setSingleMedia(m)
-                        handleDownloadStream(topStream)
-                      }
+                      const topStream = m.streams?.[0] || { quality: 'Tự động' }
+                      handleDownloadStream(topStream, m)
                     }}
                   >
                     <IconDownload className="w-3.5 h-3.5" />

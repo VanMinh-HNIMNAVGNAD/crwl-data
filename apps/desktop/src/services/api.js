@@ -214,34 +214,38 @@ export async function startNativeDownload({
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
   const customDir = destDir || getCustomDownloadDir() || null
 
-  return await invoke('start_download', {
-    options: {
-      url: url.trim(),
-      format_id: formatId || null,
-      is_audio: Boolean(isAudio),
-      audio_format: audioFormat || null,
-      audio_bitrate: audioBitrate || null,
-      title: title || null,
-      dest_dir: customDir,
-      browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
-      device_id: getDeviceId(),
-      start_time: startTime || null,
-      end_time: endTime || null,
-      is_mute: Boolean(isMute),
-      sponsor_block: Boolean(sponsorBlock),
-      // Các tuỳ chọn dưới đây trước kia bị bỏ rơi tại đây nên bật ở UI cũng không có tác dụng
-      embed_subs: Boolean(embedSubs),
-      embed_thumbnail: Boolean(embedThumbnail),
-      embed_metadata: Boolean(embedMetadata),
-      split_chapters: Boolean(splitChapters),
-      concurrent_fragments: concurrentFragments ? Number(concurrentFragments) : null,
-      video_format: videoFormat || null,
-      proxy: proxy || null,
-      referer: referer || null,
-      use_aria2c: Boolean(useAria2c),
-      task_id: taskId || null,
-    },
-  })
+  try {
+    return await invoke('start_download', {
+      options: {
+        url: url.trim(),
+        format_id: formatId || null,
+        is_audio: Boolean(isAudio),
+        audio_format: audioFormat || null,
+        audio_bitrate: audioBitrate || null,
+        title: title || null,
+        dest_dir: customDir,
+        browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
+        device_id: getDeviceId(),
+        start_time: startTime || null,
+        end_time: endTime || null,
+        is_mute: Boolean(isMute),
+        sponsor_block: Boolean(sponsorBlock),
+        // Các tuỳ chọn dưới đây trước kia bị bỏ rơi tại đây nên bật ở UI cũng không có tác dụng
+        embed_subs: Boolean(embedSubs),
+        embed_thumbnail: Boolean(embedThumbnail),
+        embed_metadata: Boolean(embedMetadata),
+        split_chapters: Boolean(splitChapters),
+        concurrent_fragments: concurrentFragments ? Number(concurrentFragments) : null,
+        video_format: videoFormat || null,
+        proxy: proxy || null,
+        referer: referer || null,
+        use_aria2c: Boolean(useAria2c),
+        task_id: taskId || null,
+      },
+    })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải xuống', { cause: err })
+  }
 }
 
 /**
@@ -249,12 +253,16 @@ export async function startNativeDownload({
  */
 export async function downloadThumbnail({ url, title, browser = null }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  return await invoke('download_thumbnail', {
-    url: url.trim(),
-    title: title || null,
-    browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
-    deviceId: getDeviceId(),
-  })
+  try {
+    return await invoke('download_thumbnail', {
+      url: url.trim(),
+      title: title || null,
+      browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
+      deviceId: getDeviceId(),
+    })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải thumbnail', { cause: err })
+  }
 }
 
 /**
@@ -262,36 +270,52 @@ export async function downloadThumbnail({ url, title, browser = null }) {
  */
 export async function downloadSubtitle({ url, lang, format = 'vtt', title, browser = null }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  return await invoke('download_subtitle', {
-    url: url.trim(),
-    lang,
-    format,
-    title: title || null,
-    browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
-    deviceId: getDeviceId(),
-  })
+  try {
+    return await invoke('download_subtitle', {
+      url: url.trim(),
+      lang,
+      format,
+      title: title || null,
+      browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
+      deviceId: getDeviceId(),
+    })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải phụ đề', { cause: err })
+  }
 }
 
 /**
  * Hộp thoại chọn thư mục lưu tệp tải về
  */
 export async function selectDownloadDirectory() {
-  const dir = await invoke('select_download_directory')
-  if (dir) {
-    setCustomDownloadDir(dir)
+  try {
+    const dir = await invoke('select_download_directory')
+    if (dir) {
+      setCustomDownloadDir(dir)
+    }
+    return dir
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi chọn thư mục lưu tệp', { cause: err })
   }
-  return dir
 }
 
 export async function getDefaultDownloadDirectory() {
   const custom = getCustomDownloadDir()
   if (custom) return custom
-  return await invoke('get_default_download_directory')
+  try {
+    return await invoke('get_default_download_directory')
+  } catch {
+    return ''
+  }
 }
 
 export async function openDownloadFolder(filePath) {
   if (filePath) {
-    return await invoke('open_download_folder', { path: filePath })
+    try {
+      return await invoke('open_download_folder', { path: filePath })
+    } catch (err) {
+      throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi mở thư mục', { cause: err })
+    }
   }
   return false
 }
@@ -412,13 +436,17 @@ export function buildProxyMediaUrl(mediaUrl) {
  */
 export async function downloadDirectFile({ url, filename, referer, destDir }) {
   const customDir = destDir || getCustomDownloadDir() || null
-  return await invoke('download_direct_file', {
-    url: url.trim(),
-    filename: filename || null,
-    referer: referer || null,
-    destDir: customDir,
-    deviceId: getDeviceId(),
-  })
+  try {
+    return await invoke('download_direct_file', {
+      url: url.trim(),
+      filename: filename || null,
+      referer: referer || null,
+      destDir: customDir,
+      deviceId: getDeviceId(),
+    })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải tệp', { cause: err })
+  }
 }
 
 /**
@@ -426,18 +454,22 @@ export async function downloadDirectFile({ url, filename, referer, destDir }) {
  */
 export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, asZip = false, taskId = null }) {
   const customDir = destDir || getCustomDownloadDir() || null
-  return await invoke('download_album_batch', {
-    items: items.map((it) => ({
-      url: it.url,
-      filename: it.filename || it.title || null,
-      referer: it.referer || null,
-    })),
-    albumName: albumName || 'Album_Media',
-    destDir: customDir,
-    asZip: Boolean(asZip),
-    deviceId: getDeviceId(),
-    taskId: taskId || null,
-  })
+  try {
+    return await invoke('download_album_batch', {
+      items: items.map((it) => ({
+        url: it.url,
+        filename: it.filename || it.title || null,
+        referer: it.referer || null,
+      })),
+      albumName: albumName || 'Album_Media',
+      destDir: customDir,
+      asZip: Boolean(asZip),
+      deviceId: getDeviceId(),
+      taskId: taskId || null,
+    })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải album', { cause: err })
+  }
 }
 
 /**
@@ -512,11 +544,19 @@ export async function getBinaryStatus() {
 }
 
 export async function updateYtdlp() {
-  return await invoke('update_ytdlp')
+  try {
+    return await invoke('update_ytdlp')
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi cập nhật yt-dlp', { cause: err })
+  }
 }
 
 export async function updateGalleryDl() {
-  return await invoke('update_gallery_dl')
+  try {
+    return await invoke('update_gallery_dl')
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi cập nhật gallery-dl', { cause: err })
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -532,5 +572,9 @@ export async function getAppSettings() {
 }
 
 export async function saveAppSettings(settings) {
-  return await invoke('save_app_settings', { settings })
+  try {
+    return await invoke('save_app_settings', { settings })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi lưu cấu hình', { cause: err })
+  }
 }

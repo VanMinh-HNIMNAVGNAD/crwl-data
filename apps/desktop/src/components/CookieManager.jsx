@@ -125,13 +125,24 @@ const PLATFORMS = [
     requiredKeys: [],
     optionalKeys: [],
     guide: [
-      { step: 1, text: 'Nhập tên nền tảng hoặc domain website (ví dụ: threads, pixiv, bsky)' },
+      { step: 1, text: 'Nhập tên nền tảng (ví dụ: pixiv, threads, bilibili, soundcloud...)' },
       { step: 2, text: 'F12 → Application → Cookies → chọn domain mong muốn' },
       { step: 3, text: 'Copy toàn bộ cookie string hoặc JSON và dán vào ô bên dưới' },
     ],
     placeholder: 'key1=value1; key2=value2; ...',
-    hint: 'Hỗ trợ mọi website. Nhớ nhập đúng tên nền tảng hoặc domain.',
+    hint: 'Hỗ trợ các nền tảng: pixiv, threads, bilibili, douyin, soundcloud, tumblr, linkedin, pinterest. Tự động chuẩn hóa domain (vd: pixiv.net → pixiv).',
   },
+]
+
+const SUPPORTED_CUSTOM_PLATFORMS = [
+  'pixiv',
+  'threads',
+  'bilibili',
+  'douyin',
+  'soundcloud',
+  'tumblr',
+  'linkedin',
+  'pinterest',
 ]
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,26 +217,29 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
       return
     }
     if (activeTab === 'custom' && !customDomain.trim()) {
-      showToast('error', 'Vui lòng nhập tên nền tảng hoặc domain cho cookie tùy chỉnh')
+      showToast('error', 'Vui lòng nhập tên nền tảng cho cookie tùy chỉnh')
       return
     }
 
     setSaving(true)
     try {
-      const platformKey = activeTab === 'custom'
-        ? customDomain.trim().toLowerCase()
+      const rawPlatformKey = activeTab === 'custom'
+        ? customDomain.trim()
         : activeTab
 
       const result = await savePlatformCookies(
-        platformKey,
+        rawPlatformKey,
         cookieStr,
       )
       showToast('success', `✅ ${result.message || `Đã lưu ${result.cookie_count || 1} cookie cho ${result.platform}`}`)
       setCookieInputs((prev) => ({ ...prev, [activeTab]: '' }))
+      if (activeTab === 'custom') {
+        setCustomDomain('')
+      }
       await loadStatus()
       if (onCookieUpdated) onCookieUpdated()
     } catch (err) {
-      showToast('error', err.message || 'Lỗi khi lưu cookie')
+      showToast('error', typeof err === 'string' ? err : err?.message || 'Lỗi khi lưu cookie')
     } finally {
       setSaving(false)
     }
@@ -239,7 +253,7 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
       await loadStatus()
       if (onCookieUpdated) onCookieUpdated()
     } catch (err) {
-      showToast('error', err.message || 'Lỗi khi xóa cookie')
+      showToast('error', typeof err === 'string' ? err : err?.message || 'Lỗi khi xóa cookie')
     }
   }
 
@@ -337,14 +351,27 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
           {/* Domain input (custom only) */}
           {activeTab === 'custom' && (
             <div className="cm-field">
-              <label className="cm-field-label">Tên nền tảng / Domain (ví dụ: threads, pixiv.net)</label>
+              <label className="cm-field-label">Tên nền tảng (ví dụ: pixiv, threads, bilibili...)</label>
               <input
                 type="text"
                 className="cm-input"
-                placeholder="pixiv.net"
+                placeholder="pixiv (hoặc pixiv.net, threads, bilibili...)"
                 value={customDomain}
                 onChange={(e) => setCustomDomain(e.target.value)}
               />
+              <div className="cm-suggest-chips">
+                <span className="cm-suggest-label">Gợi ý:</span>
+                {SUPPORTED_CUSTOM_PLATFORMS.map((plat) => (
+                  <button
+                    key={plat}
+                    type="button"
+                    className="cm-suggest-btn"
+                    onClick={() => setCustomDomain(plat)}
+                  >
+                    {plat}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
 

@@ -150,11 +150,11 @@ impl SettingsManager {
 
         let _ = ensure_config_dir();
         let template = r#"# Crwl Desktop App — Configuration
-# Sao chép file này và điền thông tin Supabase của bạn
+# Điền thông tin Supabase của bạn nếu muốn đồng bộ lịch sử tải về vào database
 
 # Supabase PostgreSQL Connection URL
 # Lấy từ: https://supabase.com → Settings → Database → Connection string → URI
-DATABASE_URL=postgresql://postgres.xxxx:yourpassword@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres
+# DATABASE_URL=postgresql://postgres.[PROJECT_REF]:[PASSWORD]@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres
 "#;
 
         if let Err(e) = std::fs::write(&env_path, template) {

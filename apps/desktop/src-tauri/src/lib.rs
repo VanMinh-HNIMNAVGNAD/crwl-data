@@ -28,8 +28,12 @@ pub fn run() {
             // Tạo thư mục config và .env mẫu nếu chưa có
             SettingsManager::ensure_env_template();
 
-            // Khởi tạo Database pool
-            let db = tauri::async_runtime::block_on(async { Database::init().await });
+            // Khởi tạo Database pool trong nền (spawn) để không block việc khởi động và hiển thị cửa sổ
+            let db = Arc::new(Database::new());
+            let db_clone = Arc::clone(&db);
+            tauri::async_runtime::spawn(async move {
+                db_clone.init().await;
+            });
 
             // Tìm đường dẫn Python CLI
             let res_dir = app.path().resource_dir().ok();
@@ -42,7 +46,7 @@ pub fn run() {
             });
 
             app.manage(AppState {
-                db: Arc::new(db),
+                db,
                 sidecar: Arc::new(sidecar),
             });
             Ok(())

@@ -134,7 +134,7 @@ export default function AccountDownloader({ onShowToast }) {
         onShowToast?.('Không tìm thấy tệp phương tiện công khai nào từ tài khoản này.')
       }
     } catch (err) {
-      onShowToast?.(err.message || 'Lỗi khi quét tài khoản!')
+      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi quét tài khoản!')
     } finally {
       clearInterval(elapsedTimer)
       setIsCrawling(false)
@@ -214,6 +214,7 @@ export default function AccountDownloader({ onShowToast }) {
         onShowToast?.(`Đã lưu tại: ${res.file_path || res.file_name || 'tệp'}`)
       }
     } catch (err) {
+      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải tệp'
       setNativeProgress({
         id: taskId,
         percent: 0,
@@ -221,9 +222,9 @@ export default function AccountDownloader({ onShowToast }) {
         eta: '',
         status: 'error',
         phase: 'Tải thất bại',
-        message: err.message,
+        message: errMsg,
       })
-      onShowToast?.(err.message || 'Lỗi khi tải tệp')
+      onShowToast?.(errMsg)
     } finally {
       if (typeof unlisten === 'function') unlisten()
       setDownloadingId(null)
@@ -383,6 +384,7 @@ export default function AccountDownloader({ onShowToast }) {
         onShowToast?.(`Đã tải thành công (${itemsToDownload.length} tệp)!`)
       }
     } catch (err) {
+      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải danh sách'
       setNativeProgress({
         id: taskId,
         percent: 0,
@@ -390,9 +392,9 @@ export default function AccountDownloader({ onShowToast }) {
         eta: '',
         status: 'error',
         phase: 'Tải thất bại',
-        message: err.message,
+        message: errMsg,
       })
-      onShowToast?.(err.message || 'Lỗi khi tải danh sách')
+      onShowToast?.(errMsg)
     } finally {
       if (typeof unlisten === 'function') unlisten()
       setIsZipDownloading(false)

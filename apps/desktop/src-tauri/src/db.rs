@@ -1,9 +1,13 @@
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use tokio::sync::RwLock;
+
+use crate::settings::SettingsManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadHistoryRecord {
@@ -22,20 +26,69 @@ pub struct DownloadHistoryRecord {
 
 #[derive(Debug, Clone)]
 pub struct Database {
-    pub pool: Option<PgPool>,
+    pub pool: Arc<RwLock<Option<PgPool>>>,
 }
 
 impl Database {
-    /// Tự động tìm chuỗi DATABASE_URL từ .env hoặc biến môi trường hệ thống
+    pub fn new() -> Self {
+        Self {
+            pool: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn from_pool(pool: Option<PgPool>) -> Self {
+        Self {
+            pool: Arc::new(RwLock::new(pool)),
+        }
+    }
+
+    pub async fn get_pool(&self) -> Option<PgPool> {
+        self.pool.read().await.clone()
+    }
+
+    #[allow(dead_code)]
+    pub async fn is_connected(&self) -> bool {
+        self.pool.read().await.is_some()
+    }
+
+    /// Kiểm tra xem URL có phải là giá trị mẫu / giả lập hay không
+    pub fn is_placeholder_url(url: &str) -> bool {
+        let u = url.trim();
+        if u.is_empty() {
+            return true;
+        }
+        let lower = u.to_lowercase();
+        lower.contains("postgres.xxxx")
+            || lower.contains("yourpassword")
+            || lower.contains("<password>")
+            || lower.contains("[password]")
+            || lower.contains("user:password")
+            || lower.contains("host:5432")
+    }
+
+    /// Tự động tìm chuỗi DATABASE_URL từ settings.json, biến môi trường hệ thống hoặc file .env
     pub fn resolve_database_url() -> Option<String> {
-        // 1. Kiểm tra env trực tiếp (ưu tiên nhất)
-        if let Ok(url) = env::var("DATABASE_URL") {
-            if !url.trim().is_empty() {
-                return Some(url.trim().to_string());
+        // 1. Kiểm tra settings.database_url (từ settings.json của ứng dụng)
+        let settings = SettingsManager::load();
+        if let Some(url) = settings.database_url {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() && !Self::is_placeholder_url(trimmed) {
+                info!("Đã nạp DATABASE_URL từ settings.json");
+                return Some(trimmed.to_string());
             }
         }
 
-        // 2. Tìm theo thứ tự ưu tiên cho Desktop App
+        // 2. Kiểm tra biến môi trường hệ thống trực tiếp
+        if let Ok(url) = env::var("DATABASE_URL") {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() && !Self::is_placeholder_url(trimmed) {
+                info!("Đã nạp DATABASE_URL từ biến môi trường hệ thống");
+                return Some(trimmed.to_string());
+            }
+        }
+
+        // 3. Tìm theo thứ tự ưu tiên các file .env
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let config_dir = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
 
@@ -48,11 +101,15 @@ impl Database {
 
         for candidate in candidates {
             if candidate.exists() {
-                let _ = dotenvy::from_path(&candidate);
-                if let Ok(url) = env::var("DATABASE_URL") {
-                    if !url.trim().is_empty() {
-                        info!("Đã nạp DATABASE_URL từ file: {:?}", candidate);
-                        return Some(url.trim().to_string());
+                if let Ok(iter) = dotenvy::from_path_iter(&candidate) {
+                    for item in iter.flatten() {
+                        if item.0 == "DATABASE_URL" {
+                            let url = item.1.trim().to_string();
+                            if !url.is_empty() && !Self::is_placeholder_url(&url) {
+                                info!("Đã nạp DATABASE_URL từ file: {:?}", candidate);
+                                return Some(url);
+                            }
+                        }
                     }
                 }
             }
@@ -61,8 +118,8 @@ impl Database {
         None
     }
 
-    /// Khởi tạo kết nối tới PostgreSQL
-    pub async fn init() -> Self {
+    /// Khởi tạo kết nối tới PostgreSQL trong nền
+    pub async fn init(&self) {
         let database_url = Self::resolve_database_url();
 
         if let Some(ref url) = database_url {
@@ -78,17 +135,17 @@ impl Database {
                     if let Err(e) = Self::init_schema(&pool).await {
                         warn!("⚠️ Lỗi khi khởi tạo schema: {e}");
                     }
-                    return Self { pool: Some(pool) };
+                    *self.pool.write().await = Some(pool);
                 }
                 Err(e) => {
                     error!("❌ Không thể kết nối PostgreSQL: {e}. Ứng dụng sẽ hoạt động ở chế độ Offline (không lưu DB).");
+                    *self.pool.write().await = None;
                 }
             }
         } else {
-            warn!("⚠️ Không tìm thấy DATABASE_URL. Ứng dụng sẽ hoạt động ở chế độ Offline.");
+            info!("ℹ️ Không tìm thấy DATABASE_URL hợp lệ. Ứng dụng sẽ hoạt động ở chế độ Offline.");
+            *self.pool.write().await = None;
         }
-
-        Self { pool: None }
     }
 
     /// Tự động đảm bảo 5 bảng của schema.sql tồn tại
@@ -187,7 +244,7 @@ impl Database {
 
     /// Lấy hoặc tạo user theo device_id
     pub async fn get_or_create_user(&self, device_id: &str) -> Option<uuid::Uuid> {
-        let pool = self.pool.as_ref()?;
+        let pool = self.get_pool().await?;
         let username = format!("desktop_{}", &device_id.chars().take(10).collect::<String>());
 
         let query = r#"
@@ -200,7 +257,7 @@ impl Database {
         match sqlx::query(query)
             .bind(&username)
             .bind(device_id)
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
         {
             Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok(),
@@ -224,7 +281,7 @@ impl Database {
         error_reason: Option<&str>,
         client_ip: Option<&str>,
     ) -> Option<i64> {
-        let pool = self.pool.as_ref()?;
+        let pool = self.get_pool().await?;
         let user_id = self.get_or_create_user(device_id).await;
 
         let query = r#"
@@ -248,7 +305,7 @@ impl Database {
             .bind(error_reason)
             .bind(client_ip)
             .bind(device_id)
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
         {
             Ok(row) => row.try_get::<i64, _>("id").ok(),
@@ -265,7 +322,7 @@ impl Database {
         limit: i64,
         device_id: Option<&str>,
     ) -> Vec<DownloadHistoryRecord> {
-        let pool = match self.pool.as_ref() {
+        let pool = match self.get_pool().await {
             Some(p) => p,
             None => return Vec::new(),
         };
@@ -295,7 +352,7 @@ impl Database {
                 let rows = sqlx::query(&query)
                     .bind(limit)
                     .bind(dev_id)
-                    .fetch_all(pool)
+                    .fetch_all(&pool)
                     .await
                     .unwrap_or_default();
 
@@ -321,7 +378,7 @@ impl Database {
         query.push_str(" ORDER BY dh.downloaded_at DESC LIMIT $1;");
         let rows = sqlx::query(&query)
             .bind(limit)
-            .fetch_all(pool)
+            .fetch_all(&pool)
             .await
             .unwrap_or_default();
 
@@ -344,7 +401,7 @@ impl Database {
 
     /// Xóa lịch sử tải của thiết bị
     pub async fn clear_download_history(&self, device_id: Option<&str>) -> bool {
-        let pool = match self.pool.as_ref() {
+        let pool = match self.get_pool().await {
             Some(p) => p,
             None => return false,
         };
@@ -352,10 +409,10 @@ impl Database {
         let result = if let Some(dev_id) = device_id {
             sqlx::query("DELETE FROM download_history WHERE device_id = $1;")
                 .bind(dev_id)
-                .execute(pool)
+                .execute(&pool)
                 .await
         } else {
-            sqlx::query("DELETE FROM download_history;").execute(pool).await
+            sqlx::query("DELETE FROM download_history;").execute(&pool).await
         };
 
         match result {
@@ -375,7 +432,7 @@ impl Database {
         data: &serde_json::Value,
         client_ip: Option<&str>,
     ) -> Option<(uuid::Uuid, uuid::Uuid)> {
-        let pool = self.pool.as_ref()?;
+        let pool = self.get_pool().await?;
         let user_id = self.get_or_create_user(device_id).await;
 
         let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled Media");
@@ -426,7 +483,7 @@ impl Database {
             .bind(title)
             .bind(client_ip)
             .bind(device_id)
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
         {
             Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok()?,
@@ -461,7 +518,7 @@ impl Database {
             .bind(thumb)
             .bind(duration_seconds)
             .bind(formats)
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
         {
             Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok()?,
@@ -483,7 +540,7 @@ impl Database {
         data: &serde_json::Value,
         client_ip: Option<&str>,
     ) -> Option<(uuid::Uuid, usize)> {
-        let pool = self.pool.as_ref()?;
+        let pool = self.get_pool().await?;
         let user_id = self.get_or_create_user(device_id).await;
 
         let platform = data.get("platform").and_then(|v| v.as_str()).unwrap_or("auto");
@@ -516,7 +573,7 @@ impl Database {
             .bind(total_items)
             .bind(client_ip)
             .bind(device_id)
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
         {
             Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok()?,
@@ -541,7 +598,7 @@ impl Database {
             .bind(job_id)
             .bind(source_url)
             .bind(total_items)
-            .fetch_one(pool)
+            .fetch_one(&pool)
             .await
         {
             Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok()?,
@@ -584,7 +641,7 @@ impl Database {
                 .bind(item_title)
                 .bind(item_author)
                 .bind(item_thumb)
-                .execute(pool)
+                .execute(&pool)
                 .await
             {
                 inserted_count += 1;
@@ -593,5 +650,36 @@ impl Database {
 
         info!("✅ Đã ghi nhận profile crawl vào DB: Job {job_id}, {inserted_count} extracted_medias");
         Some((job_id, media_list.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_placeholder_url() {
+        assert!(Database::is_placeholder_url(""));
+        assert!(Database::is_placeholder_url("   "));
+        assert!(Database::is_placeholder_url(
+            "postgresql://postgres.xxxx:yourpassword@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres"
+        ));
+        assert!(Database::is_placeholder_url("postgresql://user:yourpassword@localhost:5432/db"));
+        assert!(Database::is_placeholder_url("postgresql://user:<password>@localhost:5432/db"));
+        assert!(Database::is_placeholder_url("postgresql://user:[PASSWORD]@localhost:5432/db"));
+        assert!(!Database::is_placeholder_url(
+            "postgresql://postgres.realref:MySecret123@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_database_new_and_from_pool() {
+        let db = Database::new();
+        assert!(!db.is_connected().await);
+        assert!(db.get_pool().await.is_none());
+
+        let db_from_none = Database::from_pool(None);
+        assert!(!db_from_none.is_connected().await);
+        assert!(db_from_none.get_pool().await.is_none());
     }
 }

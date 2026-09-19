@@ -185,6 +185,56 @@ impl BinaryManager {
         }
     }
 
+    pub(crate) fn evaluate_ytdlp_update(
+        stdout: &str,
+        stderr: &str,
+        success: bool,
+        code: Option<i32>,
+    ) -> Result<String, String> {
+        let combined = format!("{stdout}\n{stderr}");
+
+        if combined.contains("up to date") || combined.contains("is up to date") {
+            return Ok("yt-dlp đã là phiên bản mới nhất!".to_string());
+        }
+
+        if success {
+            return Ok("Đã cập nhật yt-dlp thành công!".to_string());
+        }
+
+        let err = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("Mã thoát: {}", code.unwrap_or(-1))
+        };
+        Err(err)
+    }
+
+    pub(crate) fn evaluate_pip_ytdlp_update(
+        stdout: &str,
+        stderr: &str,
+        success: bool,
+        code: Option<i32>,
+    ) -> Result<String, String> {
+        if stdout.contains("Requirement already satisfied") || stderr.contains("already satisfied") {
+            return Ok("yt-dlp đã là phiên bản mới nhất!".to_string());
+        }
+
+        if success {
+            return Ok("Đã cập nhật yt-dlp thành công qua pip!".to_string());
+        }
+
+        let err = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("Mã thoát: {}", code.unwrap_or(-1))
+        };
+        Err(err)
+    }
+
     /// Cập nhật yt-dlp lên version mới nhất
     pub async fn update_ytdlp() -> Result<String, String> {
         let ytdlp_path = Self::find_binary("yt-dlp")
@@ -199,22 +249,20 @@ impl BinaryManager {
             .output()
             .await;
 
-        if let Ok(res) = output {
-            let stdout = String::from_utf8_lossy(&res.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&res.stderr).to_string();
-            let combined = format!("{stdout}\n{stderr}");
-
-            if combined.contains("up to date") || combined.contains("is up to date") {
-                return Ok("yt-dlp đã là phiên bản mới nhất!".to_string());
+        let ytdlp_err = match output {
+            Ok(res) => {
+                let stdout = String::from_utf8_lossy(&res.stdout);
+                let stderr = String::from_utf8_lossy(&res.stderr);
+                match Self::evaluate_ytdlp_update(&stdout, &stderr, res.status.success(), res.status.code()) {
+                    Ok(msg) => return Ok(msg),
+                    Err(e) => e,
+                }
             }
-
-            if res.status.success() {
-                return Ok("Đã cập nhật yt-dlp thành công!".to_string());
-            }
-        }
+            Err(e) => format!("Không thể chạy yt-dlp: {e}"),
+        };
 
         // Nếu yt-dlp -U không thành công (vd do cài qua pip hoặc pipx), thử fallback qua pip
-        if let Some(python) = Self::find_binary("python3") {
+        let pip_err = if let Some(python) = Self::find_binary("python3") {
             let pip_res = Command::new(&python)
                 .args(["-m", "pip", "install", "-U", "yt-dlp", "--break-system-packages"])
                 .stdout(Stdio::piped())
@@ -222,18 +270,24 @@ impl BinaryManager {
                 .output()
                 .await;
 
-            if let Ok(pres) = pip_res {
-                let pstdout = String::from_utf8_lossy(&pres.stdout).to_string();
-                if pstdout.contains("Requirement already satisfied") {
-                    return Ok("yt-dlp đã là phiên bản mới nhất!".to_string());
+            match pip_res {
+                Ok(pres) => {
+                    let pstdout = String::from_utf8_lossy(&pres.stdout);
+                    let pstderr = String::from_utf8_lossy(&pres.stderr);
+                    match Self::evaluate_pip_ytdlp_update(&pstdout, &pstderr, pres.status.success(), pres.status.code()) {
+                        Ok(msg) => return Ok(msg),
+                        Err(e) => e,
+                    }
                 }
-                if pres.status.success() {
-                    return Ok("Đã cập nhật yt-dlp thành công qua pip!".to_string());
-                }
+                Err(e) => format!("Không thể chạy pip: {e}"),
             }
-        }
+        } else {
+            "python3 chưa được cài đặt".to_string()
+        };
 
-        Ok("yt-dlp đã là phiên bản mới nhất!".to_string())
+        Err(format!(
+            "Lỗi cập nhật yt-dlp: {ytdlp_err} (Thử qua pip: {pip_err})"
+        ))
     }
 
     /// Cập nhật gallery-dl lên version mới nhất (pip install -U gallery-dl)
@@ -272,5 +326,52 @@ impl BinaryManager {
                 Err(format!("Lỗi cập nhật gallery-dl: {}", stderr.trim()))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_evaluate_ytdlp_update_up_to_date() {
+        let stdout = "Latest version: 2026.08.19\nyt-dlp is up to date";
+        let res = BinaryManager::evaluate_ytdlp_update(stdout, "", false, Some(0));
+        assert_eq!(res.unwrap(), "yt-dlp đã là phiên bản mới nhất!");
+    }
+
+    #[test]
+    fn test_evaluate_ytdlp_update_success() {
+        let stdout = "Updating to version 2026.09.01 ...\nUpdated yt-dlp to version 2026.09.01";
+        let res = BinaryManager::evaluate_ytdlp_update(stdout, "", true, Some(0));
+        assert_eq!(res.unwrap(), "Đã cập nhật yt-dlp thành công!");
+    }
+
+    #[test]
+    fn test_evaluate_ytdlp_update_error() {
+        let stderr = "ERROR: yt-dlp was installed with a package manager";
+        let res = BinaryManager::evaluate_ytdlp_update("", stderr, false, Some(1));
+        assert_eq!(res.unwrap_err(), "ERROR: yt-dlp was installed with a package manager");
+    }
+
+    #[test]
+    fn test_evaluate_pip_ytdlp_update_already_satisfied() {
+        let stdout = "Requirement already satisfied: yt-dlp in /usr/local/lib/python3.12";
+        let res = BinaryManager::evaluate_pip_ytdlp_update(stdout, "", true, Some(0));
+        assert_eq!(res.unwrap(), "yt-dlp đã là phiên bản mới nhất!");
+    }
+
+    #[test]
+    fn test_evaluate_pip_ytdlp_update_success() {
+        let stdout = "Successfully installed yt-dlp-2026.09.01";
+        let res = BinaryManager::evaluate_pip_ytdlp_update(stdout, "", true, Some(0));
+        assert_eq!(res.unwrap(), "Đã cập nhật yt-dlp thành công qua pip!");
+    }
+
+    #[test]
+    fn test_evaluate_pip_ytdlp_update_error() {
+        let stderr = "error: externally-managed-environment";
+        let res = BinaryManager::evaluate_pip_ytdlp_update("", stderr, false, Some(1));
+        assert_eq!(res.unwrap_err(), "error: externally-managed-environment");
     }
 }

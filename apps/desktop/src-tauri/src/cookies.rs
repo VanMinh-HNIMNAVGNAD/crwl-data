@@ -163,11 +163,194 @@ impl CookieService {
         }
     }
 
+    /// Chuẩn hóa tên platform hoặc domain về định danh platform chuẩn
+    pub fn normalize_platform(raw: &str) -> Option<String> {
+        let mut s = raw.trim().to_lowercase();
+        if s.is_empty() {
+            return None;
+        }
+
+        // Loại bỏ schema (http://, https://)
+        if let Some(pos) = s.find("://") {
+            s = s[pos + 3..].to_string();
+        }
+
+        // Bỏ path / query nếu có (vd: pixiv.net/artworks -> pixiv.net)
+        if let Some(pos) = s.find('/') {
+            s = s[..pos].to_string();
+        }
+        if let Some(pos) = s.find('?') {
+            s = s[..pos].to_string();
+        }
+
+        // Loại bỏ www. và dấu chấm đầu
+        let s = s.trim_start_matches('.').trim_start_matches("www.");
+
+        // Bỏ đuôi .txt nếu người dùng nhập nhầm tên file
+        let s = s.strip_suffix(".txt").unwrap_or(s).trim();
+
+        match s {
+            "instagram" | "instagram.com" | "instagr.am" | "ig" => Some("instagram".to_string()),
+            "tiktok" | "tiktok.com" => Some("tiktok".to_string()),
+            "facebook" | "facebook.com" | "fb.com" | "fb.watch" | "fb.me" | "fb" => Some("facebook".to_string()),
+            "twitter" | "twitter.com" | "x.com" | "x" | "t.co" => Some("twitter".to_string()),
+            "youtube" | "youtube.com" | "youtu.be" | "youtube-nocookie.com" | "yt" | "google" => Some("youtube".to_string()),
+            "pinterest" | "pinterest.com" | "pin.it" => Some("pinterest".to_string()),
+            "threads" | "threads.net" => Some("threads".to_string()),
+            "pixiv" | "pixiv.net" | "pixiv.me" | "pixiv_net" => Some("pixiv".to_string()),
+            "reddit" | "reddit.com" | "redd.it" | "v.redd.it" => Some("reddit".to_string()),
+            "bilibili" | "bilibili.com" | "b23.tv" => Some("bilibili".to_string()),
+            "douyin" | "douyin.com" => Some("douyin".to_string()),
+            "soundcloud" | "soundcloud.com" | "on.soundcloud.com" => Some("soundcloud".to_string()),
+            "tumblr" | "tumblr.com" => Some("tumblr".to_string()),
+            "linkedin" | "linkedin.com" => Some("linkedin".to_string()),
+            _ => {
+                if s.ends_with(".pinterest.com") || s.contains("pinterest.") {
+                    return Some("pinterest".to_string());
+                }
+                if s.ends_with(".instagram.com") {
+                    return Some("instagram".to_string());
+                }
+                if s.ends_with(".tiktok.com") {
+                    return Some("tiktok".to_string());
+                }
+                if s.ends_with(".facebook.com") {
+                    return Some("facebook".to_string());
+                }
+                if s.ends_with(".twitter.com") || s.ends_with(".x.com") {
+                    return Some("twitter".to_string());
+                }
+                if s.ends_with(".youtube.com") {
+                    return Some("youtube".to_string());
+                }
+                if s.ends_with(".reddit.com") {
+                    return Some("reddit".to_string());
+                }
+                if s.ends_with(".bilibili.com") {
+                    return Some("bilibili".to_string());
+                }
+                if s.ends_with(".douyin.com") {
+                    return Some("douyin".to_string());
+                }
+                if s.ends_with(".soundcloud.com") {
+                    return Some("soundcloud".to_string());
+                }
+                if s.ends_with(".tumblr.com") {
+                    return Some("tumblr".to_string());
+                }
+                if s.ends_with(".linkedin.com") {
+                    return Some("linkedin".to_string());
+                }
+                if s.ends_with(".threads.net") {
+                    return Some("threads".to_string());
+                }
+                if s.ends_with(".pixiv.net") {
+                    return Some("pixiv".to_string());
+                }
+
+                let supported = Self::supported_platforms();
+                if supported.contains(&s.to_string()) {
+                    return Some(s.to_string());
+                }
+
+                None
+            }
+        }
+    }
+
+    /// Xác thực và chuẩn hóa tên platform theo `supported_platforms()`
+    pub fn validate_and_normalize_platform(raw: &str) -> Result<String, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("Tên nền tảng không được để trống".to_string());
+        }
+
+        let supported = Self::supported_platforms();
+        match Self::normalize_platform(trimmed) {
+            Some(norm) if supported.contains(&norm) => Ok(norm),
+            _ => Err(format!(
+                "Nền tảng '{}' không được hỗ trợ. Các nền tảng hỗ trợ: {}",
+                trimmed,
+                supported.join(", ")
+            )),
+        }
+    }
+
+    /// Dọn dẹp các file cookie định danh cũ/thừa sau khi lưu
+    fn cleanup_legacy_cookie_files(normalized_platform: &str) {
+        let dir = cookies_dir();
+        if !dir.exists() {
+            return;
+        }
+        let candidates: &[&str] = match normalized_platform {
+            "pixiv" => &["pixiv.net.txt", "pixiv_net.txt"],
+            "threads" => &["threads.net.txt"],
+            "twitter" => &["x.com.txt", "twitter.com.txt", "x.txt"],
+            "facebook" => &["facebook.com.txt", "fb.com.txt", "fb.txt"],
+            "youtube" => &["youtube.com.txt", "youtu.be.txt", "google.txt"],
+            "tiktok" => &["tiktok.com.txt"],
+            "instagram" => &["instagram.com.txt"],
+            "reddit" => &["reddit.com.txt"],
+            "bilibili" => &["bilibili.com.txt"],
+            "douyin" => &["douyin.com.txt"],
+            "soundcloud" => &["soundcloud.com.txt"],
+            "tumblr" => &["tumblr.com.txt"],
+            "linkedin" => &["linkedin.com.txt"],
+            "pinterest" => &["pinterest.com.txt"],
+            _ => &[],
+        };
+        for legacy in candidates {
+            let p = dir.join(legacy);
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    /// Tự động di chuyển các file cookie cũ (vd: pixiv.net.txt -> pixiv.txt) nếu file chuẩn chưa có
+    pub fn migrate_legacy_cookie_files() {
+        let dir = cookies_dir();
+        if !dir.exists() {
+            return;
+        }
+        let legacy_mappings = [
+            ("pixiv.net.txt", "pixiv.txt"),
+            ("pixiv_net.txt", "pixiv.txt"),
+            ("threads.net.txt", "threads.txt"),
+            ("x.com.txt", "twitter.txt"),
+            ("twitter.com.txt", "twitter.txt"),
+            ("facebook.com.txt", "facebook.txt"),
+            ("youtube.com.txt", "youtube.txt"),
+            ("tiktok.com.txt", "tiktok.txt"),
+            ("instagram.com.txt", "instagram.txt"),
+            ("reddit.com.txt", "reddit.txt"),
+            ("bilibili.com.txt", "bilibili.txt"),
+            ("douyin.com.txt", "douyin.txt"),
+            ("soundcloud.com.txt", "soundcloud.txt"),
+            ("tumblr.com.txt", "tumblr.txt"),
+            ("linkedin.com.txt", "linkedin.txt"),
+            ("pinterest.com.txt", "pinterest.txt"),
+        ];
+
+        for (legacy, standard) in legacy_mappings {
+            let legacy_path = dir.join(legacy);
+            let standard_path = dir.join(standard);
+            if legacy_path.exists() {
+                if !standard_path.exists() {
+                    let _ = std::fs::rename(&legacy_path, &standard_path);
+                } else {
+                    let _ = std::fs::remove_file(&legacy_path);
+                }
+            }
+        }
+    }
+
     /// Lưu cookie string vào file cho một platform
     pub fn save_cookies(platform: &str, cookie_string: &str) -> Result<SaveCookieResult, String> {
+        let normalized = Self::validate_and_normalize_platform(platform)?;
         ensure_cookies_dir().map_err(|e| format!("Không tạo được thư mục cookie: {e}"))?;
 
-        let file_path = cookie_file_path(platform);
+        let file_path = cookie_file_path(&normalized);
 
         // Validate: phải có nội dung hợp lệ
         let trimmed = cookie_string.trim();
@@ -175,24 +358,27 @@ impl CookieService {
             return Err("Cookie string không được để trống".to_string());
         }
 
-        let (netscape_content, count) = Self::convert_to_netscape(platform, trimmed);
+        let (netscape_content, count) = Self::convert_to_netscape(&normalized, trimmed);
 
         std::fs::write(&file_path, netscape_content)
             .map_err(|e| format!("Không thể ghi file cookie: {e}"))?;
 
+        Self::cleanup_legacy_cookie_files(&normalized);
+
         let path_str = file_path.to_string_lossy().to_string();
-        info!("Đã lưu {count} cookie(s) cho platform '{platform}' vào: {path_str}");
+        info!("Đã lưu {count} cookie(s) cho platform '{normalized}' vào: {path_str}");
 
         Ok(SaveCookieResult {
             success: true,
-            platform: platform.to_string(),
+            platform: normalized.clone(),
             file_path: path_str,
-            message: format!("Đã lưu thành công {count} cookie cho '{platform}' theo chuẩn Netscape"),
+            message: format!("Đã lưu thành công {count} cookie cho '{normalized}' theo chuẩn Netscape"),
         })
     }
 
     /// Lấy trạng thái cookie của tất cả các platform được hỗ trợ
     pub fn get_cookie_status() -> CookieStatusResult {
+        Self::migrate_legacy_cookie_files();
         let supported = Self::supported_platforms();
         let mut statuses = Vec::new();
 
@@ -229,11 +415,17 @@ impl CookieService {
     pub fn delete_cookies(platform: Option<&str>) -> Result<bool, String> {
         match platform {
             Some(p) => {
-                let file_path = cookie_file_path(p);
+                let norm = Self::normalize_platform(p).unwrap_or_else(|| p.to_lowercase());
+                let file_path = cookie_file_path(&norm);
                 if file_path.exists() {
                     std::fs::remove_file(&file_path)
                         .map_err(|e| format!("Không thể xóa cookie file: {e}"))?;
-                    info!("Đã xóa cookie cho platform: {}", p);
+                    info!("Đã xóa cookie cho platform: {}", norm);
+                }
+                Self::cleanup_legacy_cookie_files(&norm);
+                let raw_path = cookie_file_path(p);
+                if raw_path.exists() && raw_path != file_path {
+                    let _ = std::fs::remove_file(&raw_path);
                 }
                 Ok(true)
             }
@@ -263,7 +455,8 @@ impl CookieService {
 
     /// Lấy đường dẫn cookie file cho yt-dlp (dùng --cookies flag)
     pub fn get_cookie_file_path(platform: &str) -> Option<PathBuf> {
-        let path = cookie_file_path(platform);
+        let norm = Self::normalize_platform(platform).unwrap_or_else(|| platform.to_lowercase());
+        let path = cookie_file_path(&norm);
         if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
             Some(path)
         } else {
@@ -346,5 +539,50 @@ mod tests {
         assert_eq!(count, 1);
         assert!(output.contains(".social.com\tTRUE\t/\tFALSE\t"));
     }
+
+    #[test]
+    fn test_normalize_platform() {
+        assert_eq!(CookieService::normalize_platform("pixiv.net"), Some("pixiv".to_string()));
+        assert_eq!(CookieService::normalize_platform(".pixiv.net"), Some("pixiv".to_string()));
+        assert_eq!(CookieService::normalize_platform("https://www.pixiv.net/artworks/123"), Some("pixiv".to_string()));
+        assert_eq!(CookieService::normalize_platform("pixiv.net.txt"), Some("pixiv".to_string()));
+        assert_eq!(CookieService::normalize_platform("pixiv"), Some("pixiv".to_string()));
+        assert_eq!(CookieService::normalize_platform("threads.net"), Some("threads".to_string()));
+        assert_eq!(CookieService::normalize_platform("x.com"), Some("twitter".to_string()));
+        assert_eq!(CookieService::normalize_platform("twitter.com"), Some("twitter".to_string()));
+        assert_eq!(CookieService::normalize_platform("fb.com"), Some("facebook".to_string()));
+        assert_eq!(CookieService::normalize_platform("facebook.com"), Some("facebook".to_string()));
+        assert_eq!(CookieService::normalize_platform("youtu.be"), Some("youtube".to_string()));
+        assert_eq!(CookieService::normalize_platform("b23.tv"), Some("bilibili".to_string()));
+        assert_eq!(CookieService::normalize_platform("unknown-domain.xyz"), None);
+        assert_eq!(CookieService::normalize_platform("   "), None);
+    }
+
+    #[test]
+    fn test_validate_and_normalize_platform() {
+        assert_eq!(CookieService::validate_and_normalize_platform("pixiv.net").unwrap(), "pixiv");
+        assert_eq!(CookieService::validate_and_normalize_platform("threads").unwrap(), "threads");
+        assert_eq!(CookieService::validate_and_normalize_platform("x.com").unwrap(), "twitter");
+
+        let err_empty = CookieService::validate_and_normalize_platform("  ");
+        assert!(err_empty.is_err());
+        assert!(err_empty.unwrap_err().contains("không được để trống"));
+
+        let err_unsupported = CookieService::validate_and_normalize_platform("invalidplatform.xyz");
+        assert!(err_unsupported.is_err());
+        assert!(err_unsupported.unwrap_err().contains("không được hỗ trợ"));
+    }
+
+    #[test]
+    fn test_save_cookies_validation() {
+        let res = CookieService::save_cookies("invalidplatform.xyz", "cookie=123");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("không được hỗ trợ"));
+
+        let empty_res = CookieService::save_cookies("pixiv.net", "   ");
+        assert!(empty_res.is_err());
+        assert!(empty_res.unwrap_err().contains("không được để trống"));
+    }
 }
+
 

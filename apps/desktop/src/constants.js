@@ -263,12 +263,24 @@ export function validatePlatformUrl(url = '', expectedPlatformId = null) {
     }
   }
 
-  // Nếu người dùng không chọn nền tảng cụ thể (chế độ tự do)
+  // 1. Kiểm tra nếu là liên kết rút gọn chung (bit.ly, tinyurl, v.v.)
+  const isGeneric = isGenericShortenerUrl(url)
+  if (isGeneric) {
+    return {
+      valid: true,
+      status: 'needs_resolve',
+      isShortener: true,
+      isGeneric: true,
+      message: `Phát hiện liên kết rút gọn (${parsed.hostname}). Đang giải mã điểm đến...`,
+    }
+  }
+
+  // 2. Nếu người dùng không chọn nền tảng cụ thể (chế độ tự do)
   if (!expectedPlatformId) {
     const detected = detectPlatform(url)
     return {
       valid: true,
-      status: 'ok',
+      status: detected ? 'matched' : 'ok',
       platform: detected,
       message: detected ? `Nhận diện nền tảng: ${detected.toUpperCase()}` : '',
     }
@@ -325,17 +337,14 @@ export function validatePlatformUrl(url = '', expectedPlatformId = null) {
     }
   }
 
-  // 3. Nếu là link rút gọn chung (bit.ly, tinyurl, v.v.) hoặc domain ngoài chưa rõ
+  // 3. Domain ngoài chưa rõ đối với nền tảng được chọn
   // Không được chặn! Cần gửi lên backend để giải mã chuyển hướng HTTP
-  const isGeneric = isGenericShortenerUrl(url)
   return {
     valid: true,
     status: 'needs_resolve',
-    isShortener: true,
-    isGeneric,
-    message: isGeneric
-      ? `Phát hiện liên kết rút gọn (${parsed.hostname}). Đang giải mã điểm đến...`
-      : 'Đang kiểm tra liên kết chuyển hướng...',
+    isShortener: false,
+    isGeneric: false,
+    message: 'Đang kiểm tra liên kết chuyển hướng...',
   }
 }
 

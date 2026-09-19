@@ -15,11 +15,14 @@ use std::time::Duration;
 use log::{error, info, warn};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{oneshot, Mutex};
 
 /// Counter tạo request ID tăng dần
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Counter tạo worker ID tăng dần để phân biệt các lần spawn worker
+static WORKER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn next_req_id() -> String {
     format!("req_{}", REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst))
@@ -32,8 +35,8 @@ struct SidecarInner {
     /// Kênh gửi (request_id, json_line, oneshot_reply_sender)
     tx: tokio::sync::mpsc::Sender<(String, String, oneshot::Sender<Result<Value, String>>)>,
     pending: Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<Result<Value, String>>>>>,
-    /// Handle của Python subprocess
-    _child: Child,
+    /// ID phiên bản worker để phân biệt khi worker cũ kết thúc
+    worker_id: u64,
 }
 
 /// Public handle — Clone-safe vì bọc trong Arc<Mutex>
@@ -41,6 +44,7 @@ struct SidecarInner {
 pub struct SidecarManager {
     inner: Arc<Mutex<Option<SidecarInner>>>,
     cli_path: PathBuf,
+    spawn_lock: Arc<Mutex<()>>,
 }
 
 impl SidecarManager {
@@ -49,6 +53,7 @@ impl SidecarManager {
         let mgr = Self {
             inner: Arc::new(Mutex::new(None)),
             cli_path,
+            spawn_lock: Arc::new(Mutex::new(())),
         };
         mgr.start_worker().await;
         mgr
@@ -139,9 +144,22 @@ impl SidecarManager {
     }
 
     /// Khởi động Python subprocess với --stdin mode
-    async fn start_worker(&self) {
-        let cli = self.cli_path.clone();
-        let inner_arc = self.inner.clone();
+    pub fn start_worker(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let _guard = this.spawn_lock.lock().await;
+
+            // Nếu đã có worker đang hoạt động thì không khởi động lại
+            {
+                let lock = this.inner.lock().await;
+                if lock.is_some() {
+                    return;
+                }
+            }
+
+            let worker_id = WORKER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let cli = this.cli_path.clone();
+            let inner_arc = this.inner.clone();
 
         let mut cmd = Command::new("python3");
         cmd.arg(&cli).arg("--stdin");
@@ -150,6 +168,7 @@ impl SidecarManager {
             cmd.current_dir(proj_root);
             cmd.env("PYTHONPATH", proj_root);
         }
+        cmd.kill_on_drop(true);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()); // stderr ra console để debug
@@ -157,17 +176,18 @@ impl SidecarManager {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                error!("[Sidecar] Không thể khởi động Python worker: {e}");
+                error!("[Sidecar] Không thể khởi động Python worker #{worker_id}: {e}");
                 return;
             }
         };
 
-        info!("[Sidecar] Python worker đã khởi động (PID: {:?})", child.id());
+        let child_id = child.id();
+        info!("[Sidecar] Python worker #{worker_id} đã khởi động (PID: {:?})", child_id);
 
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
-                error!("[Sidecar] Không lấy được stdout của Python worker");
+                error!("[Sidecar] Không lấy được stdout của Python worker #{worker_id}");
                 return;
             }
         };
@@ -175,7 +195,7 @@ impl SidecarManager {
         let mut stdin = match child.stdin.take() {
             Some(s) => s,
             None => {
-                error!("[Sidecar] Không lấy được stdin của Python worker");
+                error!("[Sidecar] Không lấy được stdin của Python worker #{worker_id}");
                 return;
             }
         };
@@ -198,62 +218,136 @@ impl SidecarManager {
             while let Some((req_id, line, reply_tx)) = rx.recv().await {
                 {
                     let mut map = pending_write.lock().await;
-                    map.insert(req_id, reply_tx);
+                    map.insert(req_id.clone(), reply_tx);
                 }
                 if let Err(e) = stdin.write_all(line.as_bytes()).await {
                     error!("[Sidecar] Lỗi ghi stdin: {e}");
+                    let mut map = pending_write.lock().await;
+                    if let Some(tx) = map.remove(&req_id) {
+                        let _ = tx.send(Err(format!("Lỗi ghi stdin sidecar: {e}")));
+                    }
                     break;
                 }
                 if let Err(e) = stdin.write_all(b"\n").await {
                     error!("[Sidecar] Lỗi ghi newline stdin: {e}");
+                    let mut map = pending_write.lock().await;
+                    if let Some(tx) = map.remove(&req_id) {
+                        let _ = tx.send(Err(format!("Lỗi ghi stdin sidecar: {e}")));
+                    }
                     break;
                 }
-                let _ = stdin.flush().await;
+                if let Err(e) = stdin.flush().await {
+                    error!("[Sidecar] Lỗi flush stdin: {e}");
+                    let mut map = pending_write.lock().await;
+                    if let Some(tx) = map.remove(&req_id) {
+                        let _ = tx.send(Err(format!("Lỗi flush stdin sidecar: {e}")));
+                    }
+                    break;
+                }
             }
         });
 
         // Task 2: stdout reader — đọc JSON response, route về caller qua oneshot
+        let mgr_clone = self.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let line = line.trim().to_string();
-                if line.is_empty() {
-                    continue;
-                }
+            loop {
+                match reader.next_line().await {
+                    Ok(Some(line)) => {
+                        let line = line.trim().to_string();
+                        if line.is_empty() {
+                            continue;
+                        }
 
-                match serde_json::from_str::<Value>(&line) {
-                    Ok(val) => {
-                        let req_id = val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let mut map = pending_read.lock().await;
-                        if let Some(reply_tx) = map.remove(&req_id) {
-                            let success = val.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                            if success {
-                                let data = val.get("data").cloned().unwrap_or(Value::Null);
-                                let _ = reply_tx.send(Ok(data));
-                            } else {
-                                let err = val
-                                    .get("error")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Unknown sidecar error")
-                                    .to_string();
-                                let _ = reply_tx.send(Err(err));
+                        match serde_json::from_str::<Value>(&line) {
+                            Ok(val) => {
+                                let req_id = val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let mut map = pending_read.lock().await;
+                                if let Some(reply_tx) = map.remove(&req_id) {
+                                    let success = val.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    if success {
+                                        let data = val.get("data").cloned().unwrap_or(Value::Null);
+                                        let _ = reply_tx.send(Ok(data));
+                                    } else {
+                                        let err = val
+                                            .get("error")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("Unknown sidecar error")
+                                            .to_string();
+                                        let _ = reply_tx.send(Err(err));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[Sidecar] Lỗi parse JSON response: {e} — line: {line}");
                             }
                         }
                     }
+                    Ok(None) => {
+                        warn!("[Sidecar] Python worker #{worker_id} stdout đã đóng (EOF).");
+                        break;
+                    }
                     Err(e) => {
-                        warn!("[Sidecar] Lỗi parse JSON response: {e} — line: {line}");
+                        warn!("[Sidecar] Lỗi đọc stdout Python worker #{worker_id}: {e}");
+                        break;
                     }
                 }
             }
-            warn!("[Sidecar] Python worker stdout đã đóng.");
+
+            // 1. Trả lỗi cho mọi pending request đang chờ response từ worker này
+            {
+                let mut map = pending_read.lock().await;
+                let count = map.len();
+                if count > 0 {
+                    warn!("[Sidecar] Python worker #{worker_id} kết thúc: huỷ {count} pending request(s)");
+                    for (_id, reply_tx) in map.drain() {
+                        let _ = reply_tx.send(Err("Python worker đã dừng đột ngột (stdout EOF)".to_string()));
+                    }
+                }
+            }
+
+            // 2. Chỉ xoá inner nếu worker hiện tại trong inner vẫn là worker này
+            let should_respawn = {
+                let mut lock = mgr_clone.inner.lock().await;
+                if let Some(inner) = lock.as_ref() {
+                    if inner.worker_id == worker_id {
+                        *lock = None;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            };
+
+            // 3. Tự động respawn worker
+            if should_respawn {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                info!("[Sidecar] Đang tự động khởi động lại Python worker...");
+                mgr_clone.start_worker().await;
+            }
+        });
+
+        // Task 3: Chờ process kết thúc để thu hồi zombie process (reap child)
+        tokio::spawn(async move {
+            match child.wait().await {
+                Ok(status) => {
+                    info!("[Sidecar] Python worker #{worker_id} (PID: {:?}) đã thoát: {status}", child_id);
+                }
+                Err(e) => {
+                    warn!("[Sidecar] Lỗi chờ Python worker #{worker_id} (PID: {:?}): {e}", child_id);
+                }
+            }
         });
 
         let mut lock = inner_arc.lock().await;
         *lock = Some(SidecarInner {
             tx,
             pending,
-            _child: child,
+            worker_id,
         });
+        })
     }
 
     /// Thời gian chờ tối đa theo loại request.
@@ -286,22 +380,37 @@ impl SidecarManager {
 
         let line = serde_json::to_string(&payload).map_err(|e| format!("Serialize error: {e}"))?;
 
-
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        {
-            let lock = self.inner.lock().await;
-            match lock.as_ref() {
-                Some(inner) => {
-                    inner.tx.send((req_id.clone(), line, reply_tx)).await.map_err(|_| {
-                        "Sidecar worker không phản hồi — có thể đã bị crash".to_string()
-                    })?;
-                }
-                None => {
-                    return Err("Python sidecar chưa khởi động".to_string());
+        // 1. Lấy kênh gửi tx; nếu worker đang trong quá trình khởi động lại, đợi tối đa 3 giây
+        let mut tx_opt = None;
+        for _ in 0..30 {
+            {
+                let lock = self.inner.lock().await;
+                if let Some(inner) = lock.as_ref() {
+                    tx_opt = Some(inner.tx.clone());
+                    break;
                 }
             }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        let tx = match tx_opt {
+            Some(t) => t,
+            None => {
+                // Thử kích hoạt start_worker nếu chưa có
+                self.start_worker().await;
+                let lock = self.inner.lock().await;
+                match lock.as_ref() {
+                    Some(inner) => inner.tx.clone(),
+                    None => return Err("Python sidecar chưa khởi động hoặc không thể khởi động".to_string()),
+                }
+            }
+        };
+
+        tx.send((req_id.clone(), line, reply_tx)).await.map_err(|_| {
+            "Sidecar worker không phản hồi — có thể đã bị crash".to_string()
+        })?;
 
         let wait_for = Self::timeout_for(&payload);
         match tokio::time::timeout(wait_for, reply_rx).await {
@@ -386,3 +495,109 @@ impl SidecarManager {
         self.send_request(payload).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_timeout_for() {
+        assert_eq!(
+            SidecarManager::timeout_for(&json!({"action": "resolve"})),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 0})),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 150})),
+            Duration::from_secs(420)
+        );
+        assert_eq!(
+            SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 50})),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            SidecarManager::timeout_for(&json!({"action": "extract"})),
+            Duration::from_secs(150)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worker_eof_cancels_pending_and_respawns() {
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join(format!(
+            "test_sidecar_crash_{}.py",
+            REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+
+        // Script giả lập: đọc 1 dòng từ stdin rồi lập tức exit(1) (EOF trên stdout)
+        {
+            let mut file = std::fs::File::create(&script_path).expect("Tạo file mock Python script");
+            writeln!(file, "import sys\nline = sys.stdin.readline()\nsys.exit(1)\n").unwrap();
+        }
+
+        let mgr = SidecarManager::new(script_path.clone()).await;
+
+        // Gửi request. Khi Python worker crash (stdout EOF), request PHẢI trả lỗi ngay lập tức
+        let start = std::time::Instant::now();
+        let res = mgr.extract_media("https://example.com/test", None).await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "Request phải trả về lỗi khi worker crash");
+        let err_msg = res.unwrap_err();
+        assert!(
+            err_msg.contains("stdout EOF") || err_msg.contains("dừng đột ngột") || err_msg.contains("crash"),
+            "Thông báo lỗi phải thông báo worker đã dừng/crash: {err_msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Request không được treo quá lâu (mất: {:?})",
+            elapsed
+        );
+
+        // Đợi 700ms để Task 2 hoàn tất dọn dẹp và respawn worker mới
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        {
+            let lock = mgr.inner.lock().await;
+            assert!(lock.is_some(), "Worker phải được tự động respawn lại sau khi crash");
+            if let Some(inner) = lock.as_ref() {
+                let pending_map = inner.pending.lock().await;
+                assert_eq!(pending_map.len(), 0, "Pending map phải trống sau khi worker dừng");
+            }
+        }
+
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[tokio::test]
+    async fn test_worker_normal_response() {
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join(format!(
+            "test_sidecar_echo_{}.py",
+            REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+
+        // Script giả lập bình thường: đọc JSON từ stdin và trả về JSON success
+        {
+            let mut file = std::fs::File::create(&script_path).expect("Tạo file mock Python script");
+            writeln!(
+                file,
+                "import sys, json\nfor line in sys.stdin:\n    req = json.loads(line.strip())\n    sys.stdout.write(json.dumps({{'id': req['id'], 'success': True, 'data': {{'title': 'Mock Video'}}}})+'\\n')\n    sys.stdout.flush()\n"
+            ).unwrap();
+        }
+
+        let mgr = SidecarManager::new(script_path.clone()).await;
+        let res = mgr.extract_media("https://example.com/echo", None).await;
+
+        assert!(res.is_ok(), "Request phải thành công với mock worker bình thường");
+        let data = res.unwrap();
+        assert_eq!(data.get("title").and_then(|v| v.as_str()), Some("Mock Video"));
+
+        let _ = std::fs::remove_file(&script_path);
+    }
+}
+
