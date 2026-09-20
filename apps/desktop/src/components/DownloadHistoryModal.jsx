@@ -31,9 +31,10 @@ function formatDate(isoStr) {
 export default function DownloadHistoryModal({ isOpen, onClose }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
-  const [isLoading, setIsLoading] = useState(false)
+  const [isLoading, setIsLoading] = useState(true)
   const [isClearing, setIsClearing] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
+  const [clearError, setClearError] = useState(null)
 
   const loadHistory = async () => {
     setIsLoading(true)
@@ -52,39 +53,50 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
   const handleClearHistory = async () => {
     setIsClearing(true)
     try {
-      await clearDownloadHistory()
+      // Backend trả false khi không có kết nối DB hoặc câu lệnh xoá lỗi. Trước đây
+      // giá trị này bị bỏ qua nên UI luôn hiện danh sách rỗng như thể đã xoá xong.
+      const { success } = await clearDownloadHistory()
+      if (!success) {
+        setClearError('Không xóa được lịch sử — chưa kết nối được cơ sở dữ liệu. Danh sách vẫn giữ nguyên.')
+        setConfirmClear(false)
+        return
+      }
       setData({ total: 0, history: [] })
+      setClearError(null)
       setConfirmClear(false)
     } catch (err) {
       console.error('Lỗi khi xóa lịch sử:', err)
+      setClearError(err?.message || 'Lỗi khi xóa lịch sử')
     } finally {
       setIsClearing(false)
     }
   }
 
   useEffect(() => {
+    if (!isOpen) return undefined
     let active = true
-    if (isOpen) {
-      setIsLoading(true)
-      setError(null)
-      getDownloadHistory(50)
-        .then((res) => {
-          if (active) {
-            setConfirmClear(false)
-            setData(res)
-            setIsLoading(false)
-          }
-        })
-        .catch((err) => {
-          if (active) {
-            console.warn('Lỗi khi tải lịch sử:', err)
-            setError(err.message || 'Lỗi khi tải lịch sử')
-            setIsLoading(false)
-          }
-        })
-    }
+    getDownloadHistory(50)
+      .then((res) => {
+        if (!active) return
+        setConfirmClear(false)
+        setData(res)
+        setError(null)
+        setIsLoading(false)
+      })
+      .catch((err) => {
+        if (!active) return
+        console.warn('Lỗi khi tải lịch sử:', err)
+        setError(err.message || 'Lỗi khi tải lịch sử')
+        setIsLoading(false)
+      })
+    // Dọn về trạng thái chờ khi đóng modal, để lần mở sau hiện spinner thay vì
+    // danh sách cũ. Làm trong cleanup nên effect không setState đồng bộ.
     return () => {
       active = false
+      setData(null)
+      setError(null)
+      setClearError(null)
+      setIsLoading(true)
     }
   }, [isOpen])
 
@@ -205,6 +217,20 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
                 disabled={isClearing}
               >
                 {isClearing ? 'Đang xóa...' : 'Xác nhận xóa'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {clearError && (
+          <div className="history-confirm-banner history-clear-error">
+            <div className="history-confirm-message">
+              <IconAlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+              <span>{clearError}</span>
+            </div>
+            <div className="history-confirm-actions">
+              <button type="button" className="btn-secondary-action" onClick={() => setClearError(null)}>
+                Đóng
               </button>
             </div>
           </div>

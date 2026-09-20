@@ -33,6 +33,12 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from core.cancellation import (
+    RequestCancelled,
+    begin_request,
+    cancel_request,
+    end_request,
+)
 from core.dispatcher import MediaDispatcher
 from core.resolver.url_resolver import UrlResolver
 
@@ -62,6 +68,7 @@ def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict
     if not url:
         return {"id": req_id, "success": False, "error": "Missing 'url' parameter"}
 
+    begin_request(req_id)
     try:
         if action == "extract":
             res = dispatcher.extract(url, browser=req.get("browser"))
@@ -89,10 +96,21 @@ def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict
             return {"id": req_id, "success": True, "data": res.to_dict()}
 
         return {"id": req_id, "success": False, "error": f"Unknown action: '{action}'"}
+    except RequestCancelled:
+        sys.stderr.write(f"[Sidecar] Request {req_id} đã bị huỷ theo yêu cầu người dùng\n")
+        sys.stderr.flush()
+        return {
+            "id": req_id,
+            "success": False,
+            "cancelled": True,
+            "error": "Đã huỷ theo yêu cầu.",
+        }
     except Exception as e:
         sys.stderr.write(f"[Sidecar:ERROR] Request {req_id} failed: {e}\n")
         sys.stderr.flush()
         return {"id": req_id, "success": False, "error": str(e)}
+    finally:
+        end_request(req_id)
 
 
 def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None:
@@ -124,6 +142,20 @@ def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None
                 req = json.loads(line)
             except json.JSONDecodeError as e:
                 output_json({"success": False, "error": f"Invalid JSON input: {e}"})
+                continue
+
+            # Lệnh huỷ phải xử lý NGAY tại vòng đọc. Nếu đẩy vào pool, nó sẽ xếp
+            # hàng sau đúng những request đang bận mà nó cần huỷ → không bao giờ chạy.
+            if (req.get("action") or "").lower() == "cancel":
+                target = (req.get("target") or req.get("target_id") or "").strip()
+                killed = cancel_request(target) if target else 0
+                sys.stderr.write(f"[Sidecar] Huỷ request '{target}': đã kill {killed} tiến trình con\n")
+                sys.stderr.flush()
+                output_json({
+                    "id": req.get("id"),
+                    "success": True,
+                    "data": {"target": target, "killedProcesses": killed},
+                })
                 continue
 
             pool.submit(process, req)

@@ -346,55 +346,47 @@ impl Database {
             "#,
         );
 
-        if let Some(dev_id) = device_id {
-            if !dev_id.trim().is_empty() {
-                query.push_str(" WHERE dh.device_id = $2 ORDER BY dh.downloaded_at DESC LIMIT $1;");
-                let rows = sqlx::query(&query)
-                    .bind(limit)
-                    .bind(dev_id)
-                    .fetch_all(&pool)
-                    .await
-                    .unwrap_or_default();
+        let scoped_device = device_id.filter(|d| !d.trim().is_empty());
 
-                return rows
-                    .into_iter()
-                    .map(|r| DownloadHistoryRecord {
-                        id: r.get("id"),
-                        media_title: r.get("media_title"),
-                        file_name: r.get("file_name"),
-                        file_size_bytes: r.get("file_size_bytes"),
-                        platform: r.get("platform"),
-                        status: r.get("status"),
-                        client_ip: r.get("client_ip"),
-                        device_id: r.get("device_id"),
-                        browser_name: r.get("browser_name"),
-                        downloaded_at: r.get("downloaded_at"),
-                        username: r.get("username"),
-                    })
-                    .collect();
+        let rows = if let Some(dev_id) = scoped_device {
+            query.push_str(" WHERE dh.device_id = $2 ORDER BY dh.downloaded_at DESC LIMIT $1;");
+            sqlx::query(&query)
+                .bind(limit)
+                .bind(dev_id)
+                .fetch_all(&pool)
+                .await
+        } else {
+            query.push_str(" ORDER BY dh.downloaded_at DESC LIMIT $1;");
+            sqlx::query(&query).bind(limit).fetch_all(&pool).await
+        };
+
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Lỗi khi đọc download_history: {e}");
+                return Vec::new();
             }
-        }
+        };
 
-        query.push_str(" ORDER BY dh.downloaded_at DESC LIMIT $1;");
-        let rows = sqlx::query(&query)
-            .bind(limit)
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default();
-
+        // `Row::get` panic khi cột NULL hoặc sai kiểu. Một panic trong Tauri command
+        // khiến promise phía UI không bao giờ resolve — modal Lịch sử quay vô tận.
+        // Dùng `try_get` để hàng dữ liệu lỗi chỉ bị bỏ qua thay vì treo cả tính năng.
         rows.into_iter()
             .map(|r| DownloadHistoryRecord {
-                id: r.get("id"),
-                media_title: r.get("media_title"),
-                file_name: r.get("file_name"),
-                file_size_bytes: r.get("file_size_bytes"),
-                platform: r.get("platform"),
-                status: r.get("status"),
-                client_ip: r.get("client_ip"),
-                device_id: r.get("device_id"),
-                browser_name: r.get("browser_name"),
-                downloaded_at: r.get("downloaded_at"),
-                username: r.get("username"),
+                id: r.try_get("id").unwrap_or_default(),
+                media_title: r.try_get("media_title").unwrap_or_default(),
+                file_name: r.try_get("file_name").unwrap_or_default(),
+                file_size_bytes: r.try_get("file_size_bytes").unwrap_or_default(),
+                platform: r.try_get("platform").unwrap_or_default(),
+                status: r
+                    .try_get::<Option<String>, _>("status")
+                    .unwrap_or_default()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                client_ip: r.try_get("client_ip").unwrap_or_default(),
+                device_id: r.try_get("device_id").unwrap_or_default(),
+                browser_name: r.try_get("browser_name").unwrap_or_default(),
+                downloaded_at: r.try_get("downloaded_at").unwrap_or_default(),
+                username: r.try_get("username").unwrap_or_default(),
             })
             .collect()
     }

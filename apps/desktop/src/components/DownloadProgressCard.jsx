@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { IconDownload, IconCheck, IconClose } from './Icons'
+import { openDownloadFolder } from '../services/api'
 
 function formatSeconds(secs) {
   if (!Number.isFinite(secs) || secs < 0) return '00:00'
@@ -27,11 +28,12 @@ export function Timer({ startTime, isFinished }) {
       return undefined
     }
 
+    // Mỗi lần chuyển từ "đã xong" sang "đang chạy" là một lượt tải MỚI.
+    // Trước đây startRef chỉ được gán một lần nên từ lượt tải thứ hai trở đi
+    // đồng hồ đếm dồn từ lượt đầu tiên và hiển thị sai hoàn toàn.
     frozenRef.current = null
-    if (!startRef.current) {
-      startRef.current = startTime || Date.now()
-    }
-    const start = startTime || startRef.current
+    startRef.current = startTime || Date.now()
+    const start = startRef.current
 
     setElapsed(Math.max(0, Math.floor((Date.now() - start) / 1000)))
     const interval = setInterval(() => {
@@ -98,24 +100,41 @@ export default function DownloadProgressCard({
               {title ? (title.length > 50 ? `${title.slice(0, 48)}...` : title) : 'Đang xử lý tải xuống...'}
             </h4>
             <span className="progress-sub-status">{statusText}</span>
-            {isDone && savedPath && (
+            {isFinished && savedPath && (
               <span className="progress-saved-path" title={savedPath}>
-                Đã lưu tại: {savedPath}
+                {isError ? 'Tệp đã tải nằm tại: ' : 'Đã lưu tại: '}
+                {savedPath}
               </span>
             )}
           </div>
         </div>
 
-        {isFinished && onDismiss && (
-          <button
-            type="button"
-            className="progress-card-close-btn"
-            onClick={onDismiss}
-            title="Đóng thông báo"
-          >
-            <IconClose className="w-3.5 h-3.5" />
-          </button>
-        )}
+        <div className="progress-card-actions">
+          {isFinished && savedPath && (
+            <button
+              type="button"
+              className="progress-open-folder-btn"
+              onClick={() => {
+                openDownloadFolder(savedPath).catch((err) => {
+                  console.warn('Không mở được thư mục:', err)
+                })
+              }}
+              title={`Mở thư mục chứa tệp:\n${savedPath}`}
+            >
+              📁 Mở thư mục
+            </button>
+          )}
+          {isFinished && onDismiss && (
+            <button
+              type="button"
+              className="progress-card-close-btn"
+              onClick={onDismiss}
+              title="Đóng thông báo"
+            >
+              <IconClose className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Progress Track */}

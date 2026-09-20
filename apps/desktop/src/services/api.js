@@ -4,21 +4,12 @@
  * NestJS backend đã được loại bỏ hoàn toàn.
  */
 
-import { invoke, isTauri as checkIsTauri } from '@tauri-apps/api/core'
+import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Core Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-export function isTauri() {
-  try {
-    return Boolean(checkIsTauri && checkIsTauri())
-  } catch {
-    return false
-  }
-}
-
 let fallbackDeviceId = null
 
 export function getDeviceId() {
@@ -109,13 +100,17 @@ export function setAlwaysAskDownloadDir(enabled) {
 // 1. Extract Media
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function extractMedia(url, browserOverride = null) {
+/**
+ * @param taskId Mã tác vụ để có thể HUỶ thật sự bằng `cancelExtraction(taskId)`.
+ */
+export async function extractMedia(url, browserOverride = null, taskId = null) {
   const browser = browserOverride !== null ? browserOverride : getActiveBrowser()
   try {
     return await invoke('extract_media', {
       url: url.trim(),
       browser: browser || undefined,
       deviceId: getDeviceId(),
+      taskId: taskId || null,
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi trích xuất media', { cause: err })
@@ -134,6 +129,7 @@ export async function crawlProfile({
   browser = null,
   rangeStart,
   rangeEnd,
+  taskId = null,
 }) {
   try {
     const targetBrowser = browser !== null ? browser : getActiveBrowser()
@@ -150,6 +146,7 @@ export async function crawlProfile({
       rangeStart: finalRangeStart,
       rangeEnd: finalRangeEnd,
       deviceId: getDeviceId(),
+      taskId: taskId || null,
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi quét tài khoản', { cause: err })
@@ -168,6 +165,20 @@ export async function resolveShortUrl(url, expectedPlatform = null) {
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi giải mã URL', { cause: err })
+  }
+}
+
+/**
+ * Huỷ thật sự một tác vụ bóc tách / quét đang chạy: kill luôn tiến trình
+ * yt-dlp / gallery-dl phía Python, không chỉ bỏ qua kết quả trả về.
+ */
+export async function cancelExtraction(taskId) {
+  if (!taskId) return false
+  try {
+    return await invoke('cancel_extraction', { taskId })
+  } catch (err) {
+    console.warn('Không gửi được lệnh huỷ:', err)
+    return false
   }
 }
 
@@ -333,7 +344,7 @@ export function onDownloadProgress(callback, taskId = null) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. System Info & Browsers
+// 5. Browsers
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getBrowsersList() {
@@ -341,17 +352,10 @@ export async function getBrowsersList() {
     const browsers = await invoke('get_browsers_list')
     return { browsers }
   } catch (err) {
-    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi lấy danh sách trình duyệt')
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi lấy danh sách trình duyệt', { cause: err })
   }
 }
 
-export async function getSystemHealth() {
-  try {
-    return await invoke('get_system_health')
-  } catch (err) {
-    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi kiểm tra hệ thống')
-  }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. Download History
@@ -366,7 +370,7 @@ export async function getDownloadHistory(limit = 30) {
     })
     return { total: list?.length || 0, history: list || [] }
   } catch (err) {
-    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi tải lịch sử')
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi tải lịch sử', { cause: err })
   }
 }
 
@@ -396,7 +400,7 @@ export async function getCookieStatus() {
   try {
     return await invoke('get_cookie_status')
   } catch (err) {
-    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy trạng thái cookie')
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy trạng thái cookie', { cause: err })
   }
 }
 
@@ -404,7 +408,7 @@ export async function getSupportedCookiePlatforms() {
   try {
     return await invoke('get_supported_cookie_platforms')
   } catch (err) {
-    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy danh sách nền tảng')
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy danh sách nền tảng', { cause: err })
   }
 }
 
@@ -419,16 +423,11 @@ export async function deletePlatformCookies(platform = null) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. Proxy & Direct / Album Download — Native Desktop (không bị CORS/403)
+// 8. Direct / Album Download — Native Desktop (không bị CORS/403)
+//
+// Không còn lớp proxy ảnh: bản desktop tải tệp qua Rust (curl + Referer + UA)
+// nên URL CDN được dùng trực tiếp, không cần biến đổi gì ở phía JS.
 // ─────────────────────────────────────────────────────────────────────────────
-
-export function buildProxyImageUrl(rawUrl) {
-  return rawUrl || ''
-}
-
-export function buildProxyMediaUrl(mediaUrl) {
-  return mediaUrl || ''
-}
 
 /**
  * Tải một tệp ảnh trực tiếp về thư mục Downloads với header chống chặn 403
@@ -453,7 +452,12 @@ export async function downloadDirectFile({ url, filename, referer, destDir, plat
 /**
  * Tải album nhiều ảnh hoặc đóng gói thành file ZIP native trên máy
  */
-export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, asZip = false, taskId = null, platform = null }) {
+/**
+ * @param albumDir Thư mục album do một lượt gọi TRƯỚC trả về. Truyền vào để các
+ *   bước nối tiếp (tải ảnh → tải video → nén ZIP) cùng thao tác trên đúng một
+ *   thư mục. Bỏ trống thì backend cấp phát thư mục mới, sạch.
+ */
+export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, albumDir = null, asZip = false, taskId = null, platform = null }) {
   const customDir = destDir || getCustomDownloadDir() || null
 
   try {
@@ -461,6 +465,7 @@ export async function downloadAlbumBatch({ items, albumName = 'Album_Media', des
       items: items.map((i) => ({ ...i, filename: i.filename || null, referer: i.referer || null })),
       albumName,
       destDir: customDir,
+      albumDir: albumDir || null,
       asZip: Boolean(asZip),
       deviceId: getDeviceId(),
       taskId: taskId || null,
@@ -471,65 +476,6 @@ export async function downloadAlbumBatch({ items, albumName = 'Album_Media', des
   }
 }
 
-/**
- * ZIP download: Trong Tauri dùng Native Rust (nhanh, chống 403, lưu trực tiếp ổ cứng).
- * Nếu chạy web thuần thì fallback sang JSZip.
- */
-export async function downloadZipArchive(items, zipName = 'Album_Media', onProgress, taskId = null, platform = null) {
-  if (isTauri()) {
-    onProgress?.({ receivedBytes: 0, total: items.length })
-    const res = await downloadAlbumBatch({
-      items,
-      albumName: zipName,
-      asZip: true,
-      taskId,
-      platform,
-    })
-    onProgress?.({ receivedBytes: items.length, total: items.length })
-    return res
-  }
-
-  // Dynamic import JSZip cho fallback browser
-  let JSZip
-  try {
-    const mod = await import('jszip')
-    JSZip = mod.default
-  } catch (err) {
-    throw new Error('JSZip chưa được cài. Chạy: pnpm add jszip', { cause: err })
-  }
-
-  const zip = new JSZip()
-  const folder = zip.folder(zipName)
-  let done = 0
-
-  await Promise.all(
-    items.map(async (item) => {
-      try {
-        const res = await fetch(item.url)
-        if (!res.ok) return
-        const blob = await res.blob()
-        const ext = item.ext || 'jpg'
-        const filename = `${item.title || `media_${done + 1}`}.${ext}`
-        folder.file(filename, blob)
-      } catch {
-        // skip failed items
-      } finally {
-        done++
-        onProgress?.({ receivedBytes: done, total: items.length })
-      }
-    })
-  )
-
-  const content = await zip.generateAsync({ type: 'blob' })
-  const downloadUrl = URL.createObjectURL(content)
-  const a = document.createElement('a')
-  a.href = downloadUrl
-  a.download = `${zipName}.zip`
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  setTimeout(() => URL.revokeObjectURL(downloadUrl), 5000)
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. Binary Manager — kiểm tra và cập nhật yt-dlp, gallery-dl, ffmpeg
@@ -539,7 +485,7 @@ export async function getBinaryStatus() {
   try {
     return await invoke('get_binary_status')
   } catch (err) {
-    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy trạng thái binary')
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy trạng thái binary', { cause: err })
   }
 }
 
@@ -560,6 +506,26 @@ export async function updateGalleryDl() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 9b. Python Sidecar — trạng thái & khởi động lại khi engine bóc tách chết
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getSidecarStatus() {
+  try {
+    return await invoke('get_sidecar_status')
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi kiểm tra Python worker', { cause: err })
+  }
+}
+
+export async function restartSidecar() {
+  try {
+    return await invoke('restart_sidecar')
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khởi động lại Python worker', { cause: err })
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 10. App Settings — đọc/ghi cấu hình ~/.config/crwl/settings.json
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -567,7 +533,7 @@ export async function getAppSettings() {
   try {
     return await invoke('get_app_settings')
   } catch (err) {
-    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi đọc cấu hình')
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi đọc cấu hình', { cause: err })
   }
 }
 

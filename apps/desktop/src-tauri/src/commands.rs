@@ -7,8 +7,8 @@ use crate::cookies::{CookieService, CookieStatusResult, SaveCookieResult};
 use crate::db::{Database, DownloadHistoryRecord};
 use crate::downloader::{DirectFileItem, DownloadOptions, DownloadResult, DownloaderService};
 use crate::settings::{AppSettings, SettingsManager};
-use crate::sidecar::SidecarManager;
-use crate::system::{BrowserInfo, SystemHealthInfo, SystemService};
+use crate::sidecar::{SidecarManager, WorkerStatus};
+use crate::system::{BrowserInfo, SystemService};
 
 pub struct AppState {
     pub db: Arc<Database>,
@@ -22,8 +22,12 @@ pub async fn extract_media(
     browser: Option<String>,
     device_id: Option<String>,
     client_ip: Option<String>,
+    task_id: Option<String>,
 ) -> Result<Value, String> {
-    let res = state.sidecar.extract_media(&url, browser.as_deref()).await?;
+    let res = state
+        .sidecar
+        .extract_media(&url, browser.as_deref(), task_id.as_deref())
+        .await?;
     let db = Arc::clone(&state.db);
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
     let url_clone = url.clone();
@@ -47,6 +51,7 @@ pub async fn crawl_profile(
     range_end: Option<u32>,
     device_id: Option<String>,
     client_ip: Option<String>,
+    task_id: Option<String>,
 ) -> Result<Value, String> {
     let res = state
         .sidecar
@@ -58,6 +63,7 @@ pub async fn crawl_profile(
             browser.as_deref(),
             range_start,
             range_end,
+            task_id.as_deref(),
         )
         .await?;
     let db = Arc::clone(&state.db);
@@ -125,11 +131,6 @@ pub async fn clear_download_history(
     device_id: Option<String>,
 ) -> Result<bool, String> {
     Ok(state.db.clear_download_history(device_id.as_deref()).await)
-}
-
-#[tauri::command]
-pub async fn get_system_health() -> SystemHealthInfo {
-    SystemService::get_health_info().await
 }
 
 #[tauri::command]
@@ -234,6 +235,58 @@ pub async fn update_gallery_dl() -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Python Sidecar Lifecycle — cho phép hồi phục khi worker chuyển sang FAILED
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarStatusInfo {
+    /// uninitialized | starting | running | failed | stopped
+    pub state: String,
+    pub healthy: bool,
+    pub consecutive_crashes: u32,
+    pub last_error: Option<String>,
+}
+
+/// Huỷ một tác vụ bóc tách / quét đang chạy.
+/// Kill luôn tiến trình yt-dlp / gallery-dl phía Python thay vì chỉ bỏ qua kết quả.
+#[tauri::command]
+pub async fn cancel_extraction(state: State<'_, AppState>, task_id: String) -> Result<bool, String> {
+    state.sidecar.cancel(&task_id).await?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn get_sidecar_status(state: State<'_, AppState>) -> Result<SidecarStatusInfo, String> {
+    let status = state.sidecar.status().await;
+    let name = match &status {
+        WorkerStatus::Uninitialized => "uninitialized",
+        WorkerStatus::Starting => "starting",
+        WorkerStatus::Running => "running",
+        WorkerStatus::Failed(_) => "failed",
+        WorkerStatus::Stopped => "stopped",
+    };
+    Ok(SidecarStatusInfo {
+        state: name.to_string(),
+        healthy: matches!(status, WorkerStatus::Running | WorkerStatus::Starting),
+        consecutive_crashes: state.sidecar.consecutive_crashes().await,
+        last_error: state.sidecar.last_error().await,
+    })
+}
+
+/// Khởi động lại Python worker sau khi nó đã chuyển sang trạng thái FAILED.
+/// Không có lệnh này thì người dùng buộc phải thoát hẳn ứng dụng mới bóc tách lại được.
+#[tauri::command]
+pub async fn restart_sidecar(state: State<'_, AppState>) -> Result<String, String> {
+    state.sidecar.reset_and_start().await;
+    match state.sidecar.status().await {
+        WorkerStatus::Failed(reason) => Err(format!("Không khởi động lại được Python worker: {reason}")),
+        WorkerStatus::Stopped => Err("Python worker vẫn đang ở trạng thái dừng.".to_string()),
+        _ => Ok("Đã khởi động lại Python worker.".to_string()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // App Settings Commands (thay thế NestJS DownloaderConfig)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -294,6 +347,7 @@ pub async fn download_album_batch(
     items: Vec<DirectFileItem>,
     album_name: Option<String>,
     dest_dir: Option<String>,
+    album_dir: Option<String>,
     as_zip: Option<bool>,
     device_id: Option<String>,
     task_id: Option<String>,
@@ -305,6 +359,7 @@ pub async fn download_album_batch(
         items,
         album_name.as_deref(),
         dest_dir.as_deref(),
+        album_dir.as_deref(),
         as_zip.unwrap_or(false),
         &dev_id,
         task_id,

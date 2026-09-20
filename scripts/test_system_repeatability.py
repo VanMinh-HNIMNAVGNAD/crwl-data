@@ -20,6 +20,23 @@ from core.dispatcher import MediaDispatcher
 from core.resolver.url_resolver import UrlResolver
 from core.extractors.gallery import GalleryDlExtractor
 
+
+def network_available(timeout: float = 3.0) -> bool:
+    """Bỏ qua các bài cần Internet thay vì để cả suite đỏ khi mất mạng.
+    Đặt CRWL_SKIP_NETWORK_TESTS=1 để ép bỏ qua."""
+    if os.environ.get("CRWL_SKIP_NETWORK_TESTS") == "1":
+        return False
+    try:
+        import socket
+        socket.create_connection(("1.1.1.1", 443), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+HAS_NETWORK = network_available()
+SKIPPED_NETWORK = []
+
 def print_header(title: str):
     print("\n" + "=" * 76)
     print(f"  📌 {title}")
@@ -285,18 +302,21 @@ def test_module_4_live_extraction():
     test_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 
     print_sub("4.1 Trích xuất thông tin video thực tế qua Dispatcher (YouTube 'Me at the zoo')")
+    if not HAS_NETWORK:
+        SKIPPED_NETWORK.append("4.1 Trích xuất media thực tế")
+        print("     ⏭️  Bỏ qua: không có kết nối Internet")
+        return
+
+    # Có mạng mà trích xuất hỏng thì phải BÁO LỖI. `except Exception` trước đây
+    # biến cả lỗi thật thành dòng "bỏ qua mạng ngoại tuyến" màu vàng.
     for i in range(1, 4):
         t0 = time.time()
-        try:
-            meta = dispatcher.extract(test_url, browser="none")
-            assert meta.title, "Thiếu tiêu đề media"
-            assert meta.platform == "youtube"
-            assert len(meta.streams) > 0
-            elapsed = time.time() - t0
-            print_pass(i, f"Trích xuất: '{meta.title[:30]}...'", elapsed, f"{len(meta.streams)} formats | Tác giả: {meta.author}")
-        except Exception as e:
-            elapsed = time.time() - t0
-            print(f"     ⚠️ Lần {i}/3 - Bỏ qua trích xuất mạng ngoại tuyến: {e}")
+        meta = dispatcher.extract(test_url, browser="none")
+        assert meta.title, "Thiếu tiêu đề media"
+        assert meta.platform == "youtube"
+        assert len(meta.streams) > 0
+        elapsed = time.time() - t0
+        print_pass(i, f"Trích xuất: '{meta.title[:30]}...'", elapsed, f"{len(meta.streams)} formats | Tác giả: {meta.author}")
 
 # ==============================================================================
 # MAIN RUNNER
@@ -321,7 +341,11 @@ def main():
 
     total_time = time.time() - start_time
     print("\n" + "=" * 76)
-    print(f"  🎉 TẤT CẢ 4 MODULE VÀ CÁC TÍNH NĂNG CON ĐÃ VƯỢT QUA 3 LẦN KIỂM THỬ THÀNH CÔNG!")
+    if SKIPPED_NETWORK:
+        print(f"  ✅ CÁC MODULE ĐÃ CHẠY ĐỀU VƯỢT QUA 3 LẦN KIỂM THỬ")
+        print(f"  ⏭️  Bỏ qua {len(SKIPPED_NETWORK)} bài cần mạng: " + "; ".join(SKIPPED_NETWORK))
+    else:
+        print(f"  🎉 TẤT CẢ 4 MODULE VÀ CÁC TÍNH NĂNG CON ĐÃ VƯỢT QUA 3 LẦN KIỂM THỬ THÀNH CÔNG!")
     print(f"  ⏱️  Tổng thời gian thực thi: {total_time:.2f} giây")
     print("=" * 76 + "\n")
 

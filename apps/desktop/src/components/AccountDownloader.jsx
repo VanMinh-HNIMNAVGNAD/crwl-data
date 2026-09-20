@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef } from 'react'
 import {
   IconClose,
   IconPaste,
@@ -10,12 +10,12 @@ import {
 import { detectPlatform } from '../constants'
 import {
   crawlProfile,
+  cancelExtraction,
   startNativeDownload,
   createTaskId,
   downloadDirectFile,
   downloadAlbumBatch,
   onDownloadProgress,
-  buildProxyImageUrl,
   selectDownloadDirectory,
   getAlwaysAskDownloadDir,
 } from '../services/api'
@@ -39,6 +39,8 @@ export default function AccountDownloader({ onShowToast }) {
   const [nativeProgress, setNativeProgress] = useState(null)
   const [downloadTaskTitle, setDownloadTaskTitle] = useState('')
   const [isZipDownloading, setIsZipDownloading] = useState(false)
+  const [isCancellingCrawl, setIsCancellingCrawl] = useState(false)
+  const crawlTaskRef = useRef(null)
 
   // Tự động nhận diện platform từ input hoặc dùng platform đã chọn
   const detected = detectPlatform(accountInput)
@@ -87,8 +89,11 @@ export default function AccountDownloader({ onShowToast }) {
     }
 
     setIsCrawling(true)
+    setIsCancellingCrawl(false)
     setElapsedCrawl(0)
     setStatusText('Đang kết nối tài khoản...')
+    const crawlTaskId = createTaskId()
+    crawlTaskRef.current = crawlTaskId
 
     // Không có cách nào biết trước tổng số bài viết, nên hiển thị thời gian đã
     // trôi qua (số liệu thật) thay vì một thanh phần trăm tự bịa.
@@ -121,6 +126,7 @@ export default function AccountDownloader({ onShowToast }) {
         platform: activePlatform,
         rangeStart: startNum,
         rangeEnd: endNum,
+        taskId: crawlTaskId,
       })
 
       if (resultData && resultData.media && resultData.media.length > 0) {
@@ -134,9 +140,20 @@ export default function AccountDownloader({ onShowToast }) {
       onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi quét tài khoản!')
     } finally {
       clearInterval(elapsedTimer)
+      crawlTaskRef.current = null
       setIsCrawling(false)
+      setIsCancellingCrawl(false)
       setStatusText('')
     }
+  }
+
+  // Dừng thật tiến trình quét đang chạy phía Python
+  const handleCancelCrawl = async () => {
+    const taskId = crawlTaskRef.current
+    if (!taskId) return
+    setIsCancellingCrawl(true)
+    onShowToast?.('Đang dừng tiến trình quét...')
+    await cancelExtraction(taskId)
   }
 
   // Tải 1 tệp trong profile
@@ -312,6 +329,21 @@ export default function AccountDownloader({ onShowToast }) {
           unlisten = null
         }
 
+        if (albumRes && albumRes.success === false) {
+          setNativeProgress({
+            id: taskId,
+            percent: 100,
+            speed: '',
+            eta: '',
+            status: 'error',
+            phase: 'Nén ZIP thất bại',
+            filePath: albumRes.file_path,
+            message: albumRes.message,
+          })
+          onShowToast?.(albumRes.message || 'Nén ZIP thất bại')
+          return
+        }
+
         setNativeProgress({
           id: taskId,
           percent: 100,
@@ -378,6 +410,10 @@ export default function AccountDownloader({ onShowToast }) {
         }
       }
 
+      if (asZip && !albumFolder) {
+        throw new Error('Không tạo được thư mục album để nén ZIP.')
+      }
+
       // Bước 2: Tải các video (lưu thẳng vào albumFolder nếu có, để gom chung với ảnh)
       let lastVideoRes = null
       if (videoItems.length > 0) {
@@ -439,10 +475,29 @@ export default function AccountDownloader({ onShowToast }) {
           items: [],
           albumName,
           destDir: targetDir,
+          // Nén ĐÚNG thư mục vừa tải vào. Để backend suy lại từ tên album sẽ trỏ
+          // nhầm khi thư mục được cấp phát tên khác (Album_1, Album_2...).
+          albumDir: albumFolder,
           asZip: true,
           taskId,
           platform: profileResult?.platform,
         })
+
+        // success=false nghĩa là tải xong nhưng nén ZIP hỏng — không được báo "Hoàn tất".
+        if (zipRes && zipRes.success === false) {
+          setNativeProgress({
+            id: taskId,
+            percent: 100,
+            speed: '',
+            eta: '',
+            status: 'error',
+            phase: 'Nén ZIP thất bại',
+            filePath: zipRes.file_path,
+            message: zipRes.message,
+          })
+          onShowToast?.(zipRes.message || 'Nén ZIP thất bại')
+          return
+        }
 
         setNativeProgress({
           id: taskId,
@@ -645,7 +700,7 @@ export default function AccountDownloader({ onShowToast }) {
               {isCrawling ? (
                 <>
                   <span className="minimal-spinner" />
-                  <span>Đang quét... {elapsedCrawl}s</span>
+                  <span>{isCancellingCrawl ? 'Đang dừng...' : `Đang quét... ${elapsedCrawl}s`}</span>
                 </>
               ) : (
                 <>
@@ -654,6 +709,16 @@ export default function AccountDownloader({ onShowToast }) {
                 </>
               )}
             </button>
+            {isCrawling && !isCancellingCrawl && (
+              <button
+                type="button"
+                className="pane-cancel-btn"
+                onClick={handleCancelCrawl}
+                title="Dừng tiến trình quét đang chạy"
+              >
+                ✕ Hủy
+              </button>
+            )}
           </div>
 
           {statusText && (
@@ -678,7 +743,7 @@ export default function AccountDownloader({ onShowToast }) {
               <div className="profile-info-block">
                 {profileResult.avatar && (
                   <img
-                    src={buildProxyImageUrl(profileResult.avatar)}
+                    src={profileResult.avatar}
                     alt=""
                     className="profile-avatar-img"
                     onError={(e) => {
@@ -798,7 +863,7 @@ export default function AccountDownloader({ onShowToast }) {
                   >
                     <div className="profile-item-thumb-box">
                       <img
-                        src={buildProxyImageUrl(item.thumb || item.url)}
+                        src={item.thumb || item.url}
                         alt=""
                         className="profile-item-thumb"
                         onError={(e) => {

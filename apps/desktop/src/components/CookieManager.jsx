@@ -1,5 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
-import { savePlatformCookies, getCookieStatus, deletePlatformCookies } from '../services/api'
+import {
+  savePlatformCookies,
+  getCookieStatus,
+  deletePlatformCookies,
+  getSupportedCookiePlatforms,
+} from '../services/api'
 import {
   IconInstagram,
   IconX,
@@ -134,7 +139,10 @@ const PLATFORMS = [
   },
 ]
 
-const SUPPORTED_CUSTOM_PLATFORMS = [
+// Danh sách dự phòng khi chưa gọi được backend. Nguồn chuẩn là
+// `CookieService::supported_platforms()` phía Rust — hardcode ở đây từng
+// lệch khỏi backend mà không ai phát hiện.
+const FALLBACK_CUSTOM_PLATFORMS = [
   'pixiv',
   'threads',
   'bilibili',
@@ -157,6 +165,7 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
   const [toast, setToast] = useState(null) // { type: 'success'|'error', msg }
   const [status, setStatus] = useState(null)
   const [confirmDelete, setConfirmDelete] = useState(null) // platform string
+  const [customPlatforms, setCustomPlatforms] = useState(FALLBACK_CUSTOM_PLATFORMS)
   const modalRef = useRef(null)
   const toastTimer = useRef(null)
 
@@ -182,6 +191,11 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
   useEffect(() => {
     let active = true
     if (isOpen) {
+      getSupportedCookiePlatforms()
+        .then((list) => {
+          if (active && Array.isArray(list) && list.length) setCustomPlatforms(list)
+        })
+        .catch(() => {})
       getCookieStatus()
         .then((s) => {
           if (active) setStatus(s)
@@ -363,7 +377,7 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
               />
               <div className="cm-suggest-chips">
                 <span className="cm-suggest-label">Gợi ý:</span>
-                {SUPPORTED_CUSTOM_PLATFORMS.map((plat) => (
+                {customPlatforms.map((plat) => (
                   <button
                     key={plat}
                     type="button"

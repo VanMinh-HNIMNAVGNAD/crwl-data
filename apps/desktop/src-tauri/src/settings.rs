@@ -30,10 +30,6 @@ pub struct AppSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_dir: Option<String>,
 
-    /// Trình duyệt mặc định để lấy cookie
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_browser: Option<String>,
-
     /// Đường dẫn tùy chỉnh tới yt-dlp binary
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ytdlp_path: Option<String>,
@@ -46,29 +42,11 @@ pub struct AppSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
 
-    /// Số lượng video mặc định khi crawl profile
-    #[serde(default = "default_crawl_limit")]
-    pub default_crawl_limit: u32,
-
-    /// Tự động nhúng metadata vào file tải về
-    #[serde(default = "default_true")]
-    pub embed_metadata: bool,
-
-    /// Tự động nhúng thumbnail vào file audio
-    #[serde(default = "default_true")]
-    pub embed_thumbnail: bool,
-
     /// Phiên bản settings schema (để migrate sau này)
     #[serde(default = "default_version")]
     pub schema_version: u32,
 }
 
-fn default_crawl_limit() -> u32 {
-    50
-}
-fn default_true() -> bool {
-    true
-}
 fn default_version() -> u32 {
     1
 }
@@ -77,13 +55,9 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             download_dir: None,
-            default_browser: None,
             ytdlp_path: None,
             gallery_dl_path: None,
             database_url: None,
-            default_crawl_limit: 50,
-            embed_metadata: true,
-            embed_thumbnail: true,
             schema_version: 1,
         }
     }
@@ -94,6 +68,44 @@ impl Default for AppSettings {
 pub struct SettingsManager;
 
 impl SettingsManager {
+    /// Đường dẫn binary do người dùng chỉ định, chỉ trả về khi tệp tồn tại và
+    /// có quyền thực thi — cấu hình sai không được làm hỏng luồng tải.
+    pub fn custom_binary_path(which: &str) -> Option<PathBuf> {
+        let s = Self::load();
+        let raw = match which {
+            "yt-dlp" => s.ytdlp_path,
+            "gallery-dl" => s.gallery_dl_path,
+            _ => None,
+        }?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(trimmed);
+        if p.is_file() {
+            Some(p)
+        } else {
+            warn!("[Settings] Bỏ qua đường dẫn {which} không hợp lệ: {trimmed}");
+            None
+        }
+    }
+
+    /// Thư mục tải mặc định do người dùng đặt trong cấu hình
+    pub fn custom_download_dir() -> Option<PathBuf> {
+        let raw = Self::load().download_dir?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(trimmed);
+        if p.is_dir() {
+            Some(p)
+        } else {
+            warn!("[Settings] Bỏ qua thư mục tải không hợp lệ: {trimmed}");
+            None
+        }
+    }
+
     /// Đọc settings từ file. Trả về default nếu file chưa tồn tại.
     pub fn load() -> AppSettings {
         let path = settings_path();

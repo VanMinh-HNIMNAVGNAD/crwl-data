@@ -109,6 +109,31 @@ MUSIC_HOSTNAME_KEYWORDS = [
     "nhac", "music", "audio", "nhacviet", "beatvn", "soundvn",
 ]
 
+# Nhận diện URL luồng phát trực tiếp. Dùng regex thay vì `".ts" in url`: chuỗi
+# trần khiến mọi URL chỉ cần chứa ".ts" (vd host "x.ts.cdn.com", query "?f=a.tsv")
+# đều bị xếp nhầm vào nhóm "Phim & Stream" TRƯỚC cả khi khớp nền tảng đã biết.
+# `.m3u8` / `.mpd` là token gần như không thể trùng ngẫu nhiên nên chấp nhận ở
+# bất kỳ đâu; còn `.ts` / `.m4s` quá ngắn nên chỉ tính khi nằm trong PATH.
+STREAM_MANIFEST_RE = re.compile(r"\.(?:m3u8|mpd)(?:[?#]|$)", re.IGNORECASE)
+STREAM_SEGMENT_RE = re.compile(r"\.(?:ts|m4s)$", re.IGNORECASE)
+STREAM_PATH_RE = re.compile(r"/(?:hls|dash)/", re.IGNORECASE)
+
+
+def is_direct_stream_url(url: str) -> bool:
+    """URL trỏ thẳng tới manifest/segment của luồng phát (HLS/DASH)."""
+    if not url or not isinstance(url, str):
+        return False
+    if STREAM_MANIFEST_RE.search(url):
+        return True
+    try:
+        path = urllib.parse.urlparse(
+            url if re.match(r"^https?://", url, re.IGNORECASE) else "https://" + url
+        ).path or ""
+    except Exception:
+        path = url
+    return bool(STREAM_SEGMENT_RE.search(path) or STREAM_PATH_RE.search(path))
+
+
 GENERIC_SHORTENER_DOMAINS = [
     "bit.ly", "tinyurl.com", "t.ly", "cutt.ly", "is.gd", "v.gd", "rb.gy",
     "shorturl.at", "goo.gl", "ow.ly", "buff.ly", "clck.ru", "rebrand.ly",
@@ -154,8 +179,7 @@ class UrlResolver:
             return None, None
 
         # Direct stream URL → movie
-        url_lower = url.lower()
-        if any(ext in url_lower for ext in (".m3u8", ".mpd", "/hls/", "/dash/", ".ts", ".m4s")):
+        if is_direct_stream_url(url):
             return "movie", "Phim & Stream"
 
         # Khớp với danh sách platform đã biết

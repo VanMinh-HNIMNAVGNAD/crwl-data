@@ -11,11 +11,11 @@ import {
   IconCopy,
   IconSettings,
 } from './Icons'
-import { FORMAT_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform, isGenericShortenerUrl } from '../constants'
+import { VIDEO_CONTAINER_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform, isGenericShortenerUrl } from '../constants'
 import {
   extractMedia,
+  cancelExtraction,
   resolveShortUrl,
-  isTauri,
   startNativeDownload,
   createTaskId,
   downloadThumbnail,
@@ -23,8 +23,6 @@ import {
   downloadAlbumBatch,
   downloadDirectFile,
   onDownloadProgress,
-  buildProxyMediaUrl,
-  buildProxyImageUrl,
   selectDownloadDirectory,
   getAlwaysAskDownloadDir,
   setAlwaysAskDownloadDir,
@@ -124,7 +122,8 @@ export default function LinkDownloader({ onShowToast }) {
   const selectedSubLang = userSelectedSubLang || singleMedia?.subtitles?.[0]?.lang || ''
   const [alwaysAskDir, setAlwaysAskDir] = useState(getAlwaysAskDownloadDir())
   const [isZipDownloading, setIsZipDownloading] = useState(false)
-  const cancelRef = useRef(false)         // dùng để hủy batch extract
+  const cancelRef = useRef(false)         // chặn xử lý kết quả sau khi đã hủy
+  const activeExtractTaskRef = useRef(null) // task đang chạy, để huỷ thật ở backend
   const [isCancelling, setIsCancelling] = useState(false)
 
   // Trimmer tool state
@@ -254,8 +253,10 @@ export default function LinkDownloader({ onShowToast }) {
     cancelRef.current = false
     setIsCancelling(false)
     setIsLoading(true)
+    const taskId = createTaskId()
+    activeExtractTaskRef.current = taskId
     try {
-      const data = await extractMedia(targetUrl)
+      const data = await extractMedia(targetUrl, null, taskId)
       if (!cancelRef.current && data) {
         setSingleMedia(data)
         setBatchMedias([])
@@ -267,6 +268,7 @@ export default function LinkDownloader({ onShowToast }) {
         onShowToast?.(errorMsg)
       }
     } finally {
+      activeExtractTaskRef.current = null
       setIsLoading(false)
       setIsCancelling(false)
     }
@@ -302,14 +304,18 @@ export default function LinkDownloader({ onShowToast }) {
         statusText: `[${i + 1}/${parsedBatchLinks.length}] Đang giải mã: ${shortLink}`,
       })
 
+      const linkTaskId = createTaskId()
+      activeExtractTaskRef.current = linkTaskId
       try {
-        const item = await extractMedia(link)
+        const item = await extractMedia(link, null, linkTaskId)
         if (item && !cancelRef.current) results.push(item)
       } catch (err) {
         const errMsg = typeof err === 'string' ? err : err?.message || ''
         const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('55 giây')
         console.warn(`[Batch] Lỗi ${isTimeout ? 'timeout' : 'bóc tách'} ${link}:`, errMsg)
         failedLinks.push({ link, reason: isTimeout ? 'Timeout' : errMsg.slice(0, 60) })
+      } finally {
+        activeExtractTaskRef.current = null
       }
     }
 
@@ -327,16 +333,26 @@ export default function LinkDownloader({ onShowToast }) {
     }
   }
 
-  // Hủy giải mã đang chạy
-  const handleCancelExtract = () => {
+  // Hủy giải mã đang chạy — kill luôn tiến trình yt-dlp/gallery-dl phía Python,
+  // không chỉ bỏ qua kết quả như trước.
+  const handleCancelExtract = async () => {
     cancelRef.current = true
     setIsCancelling(true)
-    onShowToast?.('Đang hủy giải mã...')
+    const taskId = activeExtractTaskRef.current
+    if (taskId) {
+      onShowToast?.('Đang dừng tiến trình bóc tách...')
+      await cancelExtraction(taskId)
+    }
+    onShowToast?.('Đã hủy giải mã.')
   }
 
   // Tải stream video/audio đơn
   const handleDownloadStream = async (stream, media = singleMedia) => {
     if (!media) return
+    if (!media.originalUrl && !stream?.url) {
+      onShowToast?.('Liên kết này không có nguồn tải hợp lệ để tải về.')
+      return
+    }
     const streamId = stream.formatId || stream.quality || 'stream'
     setDownloadingId(streamId)
 
@@ -483,27 +499,16 @@ export default function LinkDownloader({ onShowToast }) {
     try {
       const generated = generateBatchMediaFilenames([img], singleMedia?.originalUrl)
       const filename = generated[0]?.filename || `${sanitizeFilenamePart(img.title || 'photo')}.${img.ext || 'jpg'}`
-      if (isTauri()) {
-        onShowToast?.(`Đang tải ảnh: ${filename}...`)
-        const res = await downloadDirectFile({
-          url: img.url,
-          filename,
-          referer: singleMedia?.originalUrl,
-          platform: singleMedia?.platform,
-        })
-        if (res?.file_name) {
-          onShowToast?.(`Đã lưu: ${res.file_name}`)
-        }
-        return
+      onShowToast?.(`Đang tải ảnh: ${filename}...`)
+      const res = await downloadDirectFile({
+        url: img.url,
+        filename,
+        referer: singleMedia?.originalUrl,
+        platform: singleMedia?.platform,
+      })
+      if (res?.file_name) {
+        onShowToast?.(`Đã lưu: ${res.file_name}`)
       }
-      const directUrl = buildProxyMediaUrl(img.url)
-      const a = document.createElement('a')
-      a.href = directUrl
-      a.download = filename
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      onShowToast?.('Bắt đầu tải ảnh')
     } catch (err) {
       onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải ảnh')
     }
@@ -582,6 +587,22 @@ export default function LinkDownloader({ onShowToast }) {
         taskId,
         platform: singleMedia?.platform,
       })
+      if (res && res.success === false) {
+        // Tải xong nhưng nén ZIP hỏng — báo đúng thay vì "Hoàn tất".
+        setNativeProgress({
+          id: taskId,
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'error',
+          phase: 'Nén ZIP thất bại',
+          filePath: res.file_path,
+          message: res.message,
+        })
+        onShowToast?.(res.message || 'Nén ZIP thất bại')
+        return
+      }
+
       setNativeProgress({
         id: taskId,
         percent: 100,
@@ -718,11 +739,12 @@ export default function LinkDownloader({ onShowToast }) {
 
             <div className="pane-control-row">
               <div className="pills-group">
-                {FORMAT_OPTIONS.slice(0, 3).map((f) => (
+                {VIDEO_CONTAINER_OPTIONS.map((f) => (
                   <button
                     key={f.id}
                     type="button"
                     className={`minimal-pill ${videoContainer === f.id ? 'active' : ''}`}
+                    title={f.desc}
                     onClick={() => setVideoContainer(f.id)}
                   >
                     {f.label}
@@ -852,7 +874,7 @@ export default function LinkDownloader({ onShowToast }) {
             <div className="media-summary-row">
               <div className="media-thumb-box">
                 <img
-                  src={buildProxyImageUrl(singleMedia.thumbnail || singleMedia.highResThumbnail)}
+                  src={singleMedia.thumbnail || singleMedia.highResThumbnail}
                   alt={singleMedia.title}
                   className="preview-img"
                   referrerPolicy="no-referrer"
@@ -1022,11 +1044,11 @@ export default function LinkDownloader({ onShowToast }) {
                     value={videoContainer}
                     onChange={(e) => setVideoContainer(e.target.value)}
                   >
-                    <option value="auto">Mặc định (Khuyên dùng)</option>
-                    <option value="mp4">MP4 (Tương thích cao)</option>
-                    <option value="mkv">MKV (Chất lượng gốc)</option>
-                    <option value="webm">WebM (Nhẹ / Web)</option>
-                    <option value="gif">GIF (Ảnh động)</option>
+                    {VIDEO_CONTAINER_OPTIONS.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.label} — {f.desc}
+                      </option>
+                    ))}
                   </select>
                 </div>
               </div>
@@ -1145,7 +1167,7 @@ export default function LinkDownloader({ onShowToast }) {
                       }
                     >
                       <img
-                        src={buildProxyImageUrl(img.thumb || img.url)}
+                        src={img.thumb || img.url}
                         alt=""
                         className="album-img"
                         onError={(e) => {
@@ -1297,11 +1319,20 @@ export default function LinkDownloader({ onShowToast }) {
                 Xóa kết quả
               </button>
             </div>
+
+            {/* Tiến trình tải của chế độ nhiều link */}
+            {nativeProgress && (
+              <DownloadProgressCard
+                progress={nativeProgress}
+                title={downloadTaskTitle}
+                onDismiss={() => setNativeProgress(null)}
+              />
+            )}
             <div className="batch-items-stack">
               {batchMedias.map((m, idx) => (
                 <div key={m.id || idx} className="batch-row-item">
                   <img
-                    src={buildProxyImageUrl(m.thumbnail || m.highResThumbnail)}
+                    src={m.thumbnail || m.highResThumbnail}
                     alt=""
                     className="batch-item-thumb"
                     onError={(e) => {

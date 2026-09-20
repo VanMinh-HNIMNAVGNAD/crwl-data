@@ -61,6 +61,9 @@ struct SidecarInner {
     pending: Arc<Mutex<std::collections::HashMap<String, oneshot::Sender<Result<Value, String>>>>>,
     /// ID phiên bản worker để phân biệt khi worker cũ kết thúc
     worker_id: u64,
+    /// Ra lệnh cho supervisor kill tiến trình Python. Nếu chỉ xoá handle thì
+    /// tiến trình con vẫn sống tiếp tới khi thoát hẳn ứng dụng.
+    kill_tx: tokio::sync::mpsc::Sender<()>,
 }
 
 /// Public handle — Clone-safe vì bọc trong Arc<Mutex>
@@ -73,9 +76,10 @@ pub struct SidecarManager {
 }
 
 impl SidecarManager {
-    /// Tạo SidecarManager và khởi động Python worker
-    pub async fn new(cli_path: PathBuf) -> Self {
-        let mgr = Self {
+    /// Dựng SidecarManager nhưng CHƯA khởi động worker.
+    /// Dùng lúc app khởi động để không chặn thread chính chờ Python spawn xong.
+    pub fn new_idle(cli_path: PathBuf) -> Self {
+        Self {
             inner: Arc::new(Mutex::new(None)),
             cli_path,
             spawn_lock: Arc::new(Mutex::new(())),
@@ -85,43 +89,55 @@ impl SidecarManager {
                 last_spawn_time: None,
                 last_error: None,
             })),
-        };
+        }
+    }
+
+    /// Tạo SidecarManager và khởi động Python worker ngay
+    #[cfg(test)]
+    pub async fn new(cli_path: PathBuf) -> Self {
+        let mgr = Self::new_idle(cli_path);
         mgr.start_worker().await;
         mgr
     }
 
     /// Lấy trạng thái vòng đời hiện tại của worker
-    #[allow(dead_code)]
     pub async fn status(&self) -> WorkerStatus {
         self.lifecycle.lock().await.status.clone()
     }
 
     /// Lấy số lần crash liên tiếp hiện tại
-    #[allow(dead_code)]
     pub async fn consecutive_crashes(&self) -> u32 {
         self.lifecycle.lock().await.consecutive_crashes
     }
 
     /// Lấy thông báo lỗi cuối cùng nếu có
-    #[allow(dead_code)]
     pub async fn last_error(&self) -> Option<String> {
         self.lifecycle.lock().await.last_error.clone()
     }
 
-    /// Dừng worker và chuyển sang trạng thái Stopped (không tự động restart)
+    /// Dừng worker: chuyển sang Stopped (không tự restart) VÀ kill tiến trình Python.
     #[allow(dead_code)]
     pub async fn stop(&self) {
         {
             let mut lc = self.lifecycle.lock().await;
             lc.status = WorkerStatus::Stopped;
         }
-        let mut lock = self.inner.lock().await;
-        *lock = None;
+        let taken = self.inner.lock().await.take();
+        if let Some(inner) = taken {
+            // Supervisor đang chờ trên kill_rx sẽ gọi child.kill() giúp.
+            let _ = inner.kill_tx.send(()).await;
+        }
     }
 
-    /// Reset bộ đếm lỗi và khởi động lại worker thủ công
-    #[allow(dead_code)]
+    /// Reset bộ đếm lỗi và khởi động lại worker thủ công.
+    /// Dọn sạch worker cũ trước để nút "Khởi động lại" luôn có tác dụng, kể cả khi
+    /// `inner` còn sót handle của một tiến trình đã chết (start_worker thoát sớm
+    /// khi `inner.is_some()`).
     pub async fn reset_and_start(&self) {
+        let stale = self.inner.lock().await.take();
+        if let Some(inner) = stale {
+            let _ = inner.kill_tx.send(()).await;
+        }
         {
             let mut lc = self.lifecycle.lock().await;
             lc.status = WorkerStatus::Uninitialized;
@@ -386,6 +402,8 @@ impl SidecarManager {
 
             // Kênh báo hiệu stdout EOF tới supervisor task
             let (stdout_eof_tx, mut stdout_eof_rx) = tokio::sync::mpsc::channel::<()>(1);
+            // Kênh ra lệnh kill từ stop() tới supervisor task
+            let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel::<()>(1);
             let mgr_clone_for_read = this.clone();
 
             // Task 2: stdout reader — đọc JSON response, route về caller qua oneshot
@@ -446,6 +464,25 @@ impl SidecarManager {
                 let _ = stdout_eof_tx.send(()).await;
             });
 
+            // Đăng ký worker vào `inner` NGAY, TRƯỚC khi spawn supervisor.
+            //
+            // Trước đây việc này nằm ở cuối hàm, sau khi supervisor đã chạy. Nếu tiến
+            // trình Python chết tức thì, supervisor có thể tới bước kiểm tra
+            // `inner.worker_id == worker_id` khi `inner` vẫn còn None → nó thoát sớm,
+            // KHÔNG tăng bộ đếm crash và KHÔNG lên lịch restart. Sau đó thân hàm mới
+            // ghi đè `inner = Some(...)` trỏ tới một worker đã chết và đặt trạng thái
+            // Running. Từ đó `inner.is_some()` khiến mọi lần start_worker (kể cả
+            // reset_and_start) đều thoát sớm → bóc tách hỏng vĩnh viễn mà UI báo "đang chạy".
+            {
+                let mut lock = inner_arc.lock().await;
+                *lock = Some(SidecarInner {
+                    tx,
+                    pending: pending.clone(),
+                    worker_id,
+                    kill_tx,
+                });
+            }
+
             // Task 3: Supervisor & Exit Handler — theo dõi tiến trình, reap zombie, xử lý crash và restart
             let mgr_clone = this.clone();
             let last_stderr_exit = last_stderr.clone();
@@ -465,6 +502,11 @@ impl SidecarManager {
                                 child.wait().await
                             }
                         }
+                    }
+                    _ = kill_rx.recv() => {
+                        info!("[Sidecar] Nhận lệnh dừng — kill Python worker #{worker_id} (PID: {:?})", child_id);
+                        let _ = child.kill().await;
+                        child.wait().await
                     }
                 };
 
@@ -593,14 +635,13 @@ impl SidecarManager {
                 }
             });
 
-            let mut lock = inner_arc.lock().await;
-            *lock = Some(SidecarInner {
-                tx,
-                pending,
-                worker_id,
-            });
-
-            {
+            // Chỉ báo Running khi worker này VẪN là worker đang đăng ký. Nếu nó đã
+            // chết và supervisor kịp dọn `inner` thì không được đè trạng thái lên.
+            let still_current = {
+                let lock = inner_arc.lock().await;
+                lock.as_ref().map(|i| i.worker_id == worker_id).unwrap_or(false)
+            };
+            if still_current {
                 let mut lc = this.lifecycle.lock().await;
                 if !matches!(lc.status, WorkerStatus::Failed(_)) && lc.status != WorkerStatus::Stopped {
                     lc.status = WorkerStatus::Running;
@@ -631,9 +672,69 @@ impl SidecarManager {
         }
     }
 
+    /// Mã request gửi xuống Python.
+    ///
+    /// Khi UI cung cấp task-id, dùng luôn nó (tiền tố `ui_`) để lệnh huỷ sau này
+    /// tìm đúng request mà không cần bảng ánh xạ. Nếu id đó đang được dùng thì
+    /// quay về bộ đếm nội bộ để hai request không đè lên nhau trong `pending`.
+    async fn resolve_req_id(&self, client_task_id: Option<&str>) -> String {
+        let candidate = match client_task_id.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => format!("ui_{t}"),
+            None => return next_req_id(),
+        };
+        let lock = self.inner.lock().await;
+        if let Some(inner) = lock.as_ref() {
+            if inner.pending.lock().await.contains_key(&candidate) {
+                warn!("[Sidecar] task_id '{candidate}' đang được dùng — cấp id nội bộ thay thế");
+                return next_req_id();
+            }
+        }
+        candidate
+    }
+
+    /// Huỷ một request đang chạy: kill tiến trình con phía Python và trả lời
+    /// caller ngay lập tức thay vì bắt UI chờ hết timeout.
+    pub async fn cancel(&self, task_id: &str) -> Result<(), String> {
+        let target = task_id.trim();
+        if target.is_empty() {
+            return Err("Thiếu mã tác vụ cần huỷ".to_string());
+        }
+        let target_id = format!("ui_{target}");
+
+        let (tx, pending) = {
+            let lock = self.inner.lock().await;
+            match lock.as_ref() {
+                Some(inner) => (inner.tx.clone(), inner.pending.clone()),
+                None => return Err("Python worker chưa sẵn sàng".to_string()),
+            }
+        };
+
+        // 1. Báo Python kill tiến trình con. Dùng oneshot bỏ đi vì không cần phản hồi.
+        let cancel_id = next_req_id();
+        let line = serde_json::to_string(&json!({
+            "id": cancel_id,
+            "action": "cancel",
+            "target": target_id,
+        }))
+        .map_err(|e| format!("Serialize error: {e}"))?;
+        let (throwaway_tx, _throwaway_rx) = oneshot::channel();
+        tx.send((cancel_id, line, throwaway_tx))
+            .await
+            .map_err(|_| "Không gửi được lệnh huỷ tới Python worker".to_string())?;
+
+        // 2. Giải phóng caller ngay. Python vẫn sẽ trả một response cho request này,
+        //    lúc đó không còn ai trong `pending` nên nó bị bỏ qua — đúng như mong muốn.
+        if let Some(reply_tx) = pending.lock().await.remove(&target_id) {
+            let _ = reply_tx.send(Err("Đã huỷ theo yêu cầu.".to_string()));
+        }
+
+        info!("[Sidecar] Đã gửi lệnh huỷ cho '{target_id}'");
+        Ok(())
+    }
+
     /// Gửi request IPC tới Python worker và đợi response
-    async fn send_request(&self, payload: Value) -> Result<Value, String> {
-        let req_id = next_req_id();
+    async fn send_request(&self, payload: Value, client_task_id: Option<&str>) -> Result<Value, String> {
+        let req_id = self.resolve_req_id(client_task_id).await;
         let mut payload = payload;
         payload["id"] = Value::String(req_id.clone());
 
@@ -655,7 +756,10 @@ impl SidecarManager {
             {
                 let lc = self.lifecycle.lock().await;
                 if let WorkerStatus::Failed(reason) = &lc.status {
-                    return Err(format!("Python worker đã gặp sự cố và dừng hoạt động: {reason}"));
+                    return Err(format!(
+                        "Python worker đã gặp sự cố và dừng hoạt động: {reason}\n\
+                         Hãy mở 'Công cụ' (⚙) và bấm 'Khởi động lại' ở mục Python 3 sau khi đã khắc phục."
+                    ));
                 }
                 if lc.status == WorkerStatus::Stopped {
                     return Err("Python worker đã dừng hoạt động (Stopped)".to_string());
@@ -671,7 +775,10 @@ impl SidecarManager {
                 {
                     let lc = self.lifecycle.lock().await;
                     if let WorkerStatus::Failed(reason) = &lc.status {
-                        return Err(format!("Python worker đã gặp sự cố và dừng hoạt động: {reason}"));
+                        return Err(format!(
+                        "Python worker đã gặp sự cố và dừng hoạt động: {reason}\n\
+                         Hãy mở 'Công cụ' (⚙) và bấm 'Khởi động lại' ở mục Python 3 sau khi đã khắc phục."
+                    ));
                     }
                     if lc.status == WorkerStatus::Stopped {
                         return Err("Python worker đã dừng hoạt động (Stopped)".to_string());
@@ -715,7 +822,12 @@ impl SidecarManager {
     }
 
     /// Trích xuất thông tin media từ URL
-    pub async fn extract_media(&self, url: &str, browser: Option<&str>) -> Result<Value, String> {
+    pub async fn extract_media(
+        &self,
+        url: &str,
+        browser: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<Value, String> {
         let mut payload = json!({ "action": "extract", "url": url });
         if let Some(b) = browser {
             // Truyền xuống Python kể cả "none" — Python sẽ tự xử lý logic bỏ cookie
@@ -723,7 +835,7 @@ impl SidecarManager {
                 payload["browser"] = Value::String(b.to_string());
             }
         }
-        self.send_request(payload).await
+        self.send_request(payload, task_id).await
     }
 
     /// Giải mã URL rút gọn
@@ -734,7 +846,7 @@ impl SidecarManager {
                 payload["expected"] = Value::String(p.to_string());
             }
         }
-        self.send_request(payload).await
+        self.send_request(payload, None).await
     }
 
     /// Quét profile / channel / playlist
@@ -747,6 +859,7 @@ impl SidecarManager {
         browser: Option<&str>,
         range_start: Option<u32>,
         range_end: Option<u32>,
+        task_id: Option<&str>,
     ) -> Result<Value, String> {
         let mut payload = json!({
             "action": "crawl",
@@ -776,7 +889,7 @@ impl SidecarManager {
             payload["range_end"] = Value::Number(re.into());
         }
 
-        self.send_request(payload).await
+        self.send_request(payload, task_id).await
     }
 }
 
@@ -827,7 +940,7 @@ mod tests {
 
         // Gửi request. Khi Python worker crash (stdout EOF), request PHẢI trả lỗi ngay lập tức
         let start = std::time::Instant::now();
-        let res = mgr.extract_media("https://example.com/test", None).await;
+        let res = mgr.extract_media("https://example.com/test", None, None).await;
         let elapsed = start.elapsed();
 
         assert!(res.is_err(), "Request phải trả về lỗi khi worker crash");
@@ -875,7 +988,7 @@ mod tests {
         }
 
         let mgr = SidecarManager::new(script_path.clone()).await;
-        let res = mgr.extract_media("https://example.com/echo", None).await;
+        let res = mgr.extract_media("https://example.com/echo", None, None).await;
 
         assert!(res.is_ok(), "Request phải thành công với mock worker bình thường");
         let data = res.unwrap();
@@ -945,7 +1058,7 @@ mod tests {
         );
 
         // 5. Gửi request phải trả về lỗi ngay lập tức, không bị treo và không kích hoạt spawn lại
-        let res = mgr.extract_media("https://example.com/test", None).await;
+        let res = mgr.extract_media("https://example.com/test", None, None).await;
         assert!(res.is_err(), "Request phải trả về lỗi khi worker đã Failed");
         let err = res.unwrap_err();
         assert!(
@@ -988,7 +1101,7 @@ mod tests {
         mgr.reset_and_start().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let res = mgr.extract_media("https://example.com/recovered", None).await;
+        let res = mgr.extract_media("https://example.com/recovered", None, None).await;
         assert!(res.is_ok(), "Worker phải phục hồi thành công sau reset_and_start");
         let data = res.unwrap();
         assert_eq!(data.get("title").and_then(|v| v.as_str()), Some("Recovered Video"));
@@ -1027,6 +1140,177 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&script_path);
+    }
+
+    /// `stop()` phải KILL tiến trình Python, không chỉ bỏ handle đi.
+    /// Trước đây tiến trình con vẫn sống tới khi thoát hẳn ứng dụng.
+    #[tokio::test]
+    async fn test_stop_actually_kills_the_python_process() {
+        let temp_dir = std::env::temp_dir();
+        // uuid thay vì counter: counter reset về 1 mỗi lần chạy test nên file .pid
+        // của lần chạy trước còn sót lại sẽ bị đọc nhầm.
+        let uniq = uuid::Uuid::new_v4();
+        let script_path = temp_dir.join(format!("test_sidecar_kill_{uniq}.py"));
+        let pid_path = temp_dir.join(format!("test_sidecar_kill_{uniq}.pid"));
+        let _ = std::fs::remove_file(&pid_path);
+
+        // Worker ghi PID rồi bận xử lý dài (KHÔNG đọc stdin) — mô phỏng lúc đang
+        // chạy một lệnh yt-dlp lâu. Đây chính là trường hợp mà việc chỉ đóng stdin
+        // không đủ để kết thúc tiến trình.
+        {
+            let mut file = std::fs::File::create(&script_path).expect("Tạo file mock Python script");
+            writeln!(
+                file,
+                "import os, time\nopen(r'{}', 'w').write(str(os.getpid()))\ntime.sleep(300)\n",
+                pid_path.display()
+            )
+            .unwrap();
+        }
+
+        let mgr = SidecarManager::new(script_path.clone()).await;
+        // Chờ worker ghi xong PID
+        let mut pid: Option<i32> = None;
+        for _ in 0..40 {
+            if let Ok(txt) = std::fs::read_to_string(&pid_path) {
+                if let Ok(v) = txt.trim().parse::<i32>() {
+                    pid = Some(v);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("Worker phải ghi được PID ra file");
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "Tiến trình Python #{pid} phải đang chạy trước khi stop()"
+        );
+
+        mgr.stop().await;
+
+        // Chờ supervisor kill và reap tiến trình
+        let mut gone = false;
+        for _ in 0..40 {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "stop() phải kill tiến trình Python (PID {pid} vẫn còn sống)");
+        assert_eq!(mgr.status().await, WorkerStatus::Stopped);
+
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
+    /// #6 — Huỷ phải giải phóng caller NGAY và kill tiến trình con phía Python,
+    /// thay vì để UI ngồi chờ hết timeout còn yt-dlp vẫn chạy.
+    #[tokio::test]
+    async fn test_cancel_releases_caller_and_kills_child_process() {
+        let temp_dir = std::env::temp_dir();
+        let uniq = uuid::Uuid::new_v4();
+        let script_path = temp_dir.join(format!("test_sidecar_cancel_{uniq}.py"));
+        let child_pid_path = temp_dir.join(format!("test_sidecar_cancel_{uniq}.childpid"));
+
+        // Worker giả lập extractor thật: nhận request → sinh tiến trình con chạy lâu
+        // (giống yt-dlp) và đăng ký nó với module cancellation.
+        {
+            let mut file = std::fs::File::create(&script_path).expect("Tạo mock script");
+            let body = format!(
+                r#"import sys, os, json, threading, subprocess
+sys.path.insert(0, r'{root}')
+from core.cancellation import begin_request, end_request, cancel_request, register_process, RequestCancelled
+
+def serve(req):
+    rid = req['id']
+    begin_request(rid)
+    try:
+        p = subprocess.Popen(['sleep', '120'], start_new_session=True)
+        register_process(p)
+        open(r'{pidfile}', 'w').write(str(p.pid))
+        p.communicate()
+        out = {{'id': rid, 'success': True, 'data': {{}}}}
+    except RequestCancelled:
+        out = {{'id': rid, 'success': False, 'cancelled': True, 'error': 'huy'}}
+    finally:
+        end_request(rid)
+    print(json.dumps(out), flush=True)
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    if (req.get('action') or '') == 'cancel':
+        cancel_request(req.get('target') or '')
+        print(json.dumps({{'id': req['id'], 'success': True, 'data': {{}}}}), flush=True)
+        continue
+    threading.Thread(target=serve, args=(req,), daemon=True).start()
+"#,
+                root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../..")
+                    .canonicalize()
+                    .unwrap()
+                    .display(),
+                pidfile = child_pid_path.display(),
+            );
+            use std::io::Write as _;
+            file.write_all(body.as_bytes()).unwrap();
+        }
+
+        let mgr = SidecarManager::new(script_path.clone()).await;
+        let mgr_for_req = mgr.clone();
+
+        // Gửi request kèm task_id của UI
+        let req_handle = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let res = mgr_for_req
+                .extract_media("https://example.com/slow", None, Some("task-xyz"))
+                .await;
+            (res, start.elapsed())
+        });
+
+        // Chờ tiến trình con xuất hiện
+        let mut child_pid: Option<i32> = None;
+        for _ in 0..60 {
+            if let Ok(t) = std::fs::read_to_string(&child_pid_path) {
+                if let Ok(v) = t.trim().parse::<i32>() {
+                    child_pid = Some(v);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let child_pid = child_pid.expect("Mock worker phải sinh được tiến trình con");
+        assert!(std::path::Path::new(&format!("/proc/{child_pid}")).exists());
+
+        mgr.cancel("task-xyz").await.expect("Gửi lệnh huỷ phải thành công");
+
+        let (res, elapsed) = req_handle.await.unwrap();
+        assert!(res.is_err(), "Request bị huỷ phải trả lỗi, không treo");
+        assert!(
+            res.unwrap_err().contains("huỷ"),
+            "Thông báo phải nói rõ là đã huỷ"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "Caller phải được giải phóng ngay, không chờ hết timeout (mất {elapsed:?})"
+        );
+
+        // Tiến trình con phải bị kill, không sống tiếp 120s
+        let mut gone = false;
+        for _ in 0..60 {
+            if !std::path::Path::new(&format!("/proc/{child_pid}")).exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "Tiến trình con {child_pid} phải bị kill khi huỷ");
+
+        mgr.stop().await;
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&child_pid_path);
     }
 
     #[tokio::test]

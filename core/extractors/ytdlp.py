@@ -160,13 +160,14 @@ class YtDlpExtractor(BaseExtractor):
         cmd.append(url)
 
         self.log(f"yt-dlp playlist ({range_spec or 'all'}): {url}")
-        code, stdout, stderr = self.run_process(cmd, timeout=timeout)
-
-        if tmp_cookie and os.path.exists(tmp_cookie):
-            try:
-                os.remove(tmp_cookie)
-            except Exception:
-                pass
+        try:
+            code, stdout, stderr = self.run_process(cmd, timeout=timeout)
+        finally:
+            if tmp_cookie and os.path.exists(tmp_cookie):
+                try:
+                    os.remove(tmp_cookie)
+                except Exception:
+                    pass
 
         if code != 0 and not stdout.strip():
             if browser and browser != "none":
@@ -290,36 +291,45 @@ class YtDlpExtractor(BaseExtractor):
             )
 
             target_heights = [2160, 1440, 1080, 720, 480, 360]
-            for h in target_heights:
-                matched = next((ah for ah in available_heights if ah >= h * 0.95), None)
-                if matched or (h == 720 and available_heights):
-                    if h >= 2160:
-                        label = "4K (2160p Ultra HD)"
-                    elif h >= 1440:
-                        label = "2K (1440p Quad HD)"
-                    elif h >= 1080:
-                        label = "Full HD (1080p)"
-                    elif h >= 720:
-                        label = "HD (720p)"
-                    elif h >= 480:
-                        label = "Chuẩn SD (480p)"
-                    else:
-                        label = "Tiết kiệm (360p)"
+            matched_heights = [
+                h for h in target_heights
+                if any(ah >= h * 0.95 for ah in available_heights)
+            ]
+            # Video thấp hơn cả mốc 360p (ví dụ 240p) vẫn phải có ít nhất một lựa
+            # chọn — dùng chính độ phân giải thật thay vì gắn nhãn 720p không có thật.
+            if not matched_heights and available_heights:
+                matched_heights = [available_heights[0]]
 
-                    muxed_spec = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+            for h in matched_heights:
+                if h >= 2160:
+                    label = "4K (2160p Ultra HD)"
+                elif h >= 1440:
+                    label = "2K (1440p Quad HD)"
+                elif h >= 1080:
+                    label = "Full HD (1080p)"
+                elif h >= 720:
+                    label = "HD (720p)"
+                elif h >= 480:
+                    label = "Chuẩn SD (480p)"
+                elif h >= 360:
+                    label = "Tiết kiệm (360p)"
+                else:
+                    label = f"Thấp ({h}p)"
 
-                    streams.append(
-                        StreamFormat(
-                            format_id=muxed_spec,
-                            quality=f"{label} — Có âm thanh đầy đủ",
-                            format="MP4",
-                            size=None,
-                            raw_size=None,
-                            stream_type="full",
-                            has_audio=True,
-                            has_video=True,
-                        )
+                muxed_spec = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+
+                streams.append(
+                    StreamFormat(
+                        format_id=muxed_spec,
+                        quality=f"{label} — Có âm thanh đầy đủ",
+                        format="MP4",
+                        size=None,
+                        raw_size=None,
+                        stream_type="full",
+                        has_audio=True,
+                        has_video=True,
                     )
+                )
 
             # Trường hợp không có thông tin height (như Facebook có hd/sd)
             if not available_heights and video_formats:
@@ -571,11 +581,16 @@ class YtDlpExtractor(BaseExtractor):
         return f"{mins:02d}:{secs:02d}"
 
     @staticmethod
-    def format_bytes(b: int) -> str:
-        if not b or b <= 0:
+    def format_bytes(b: Any) -> str:
+        try:
+            b = int(b)
+        except (TypeError, ValueError):
             return "0 B"
-        sizes = ["B", "KB", "MB", "GB", "TB"]
-        i = int(math.floor(math.log(b, 1024)))
+        if b <= 0:
+            return "0 B"
+        sizes = ["B", "KB", "MB", "GB", "TB", "PB"]
+        # Kẹp chỉ số trong phạm vi `sizes` để không IndexError với tệp rất lớn
+        i = max(0, min(int(math.floor(math.log(b, 1024))), len(sizes) - 1))
         p = math.pow(1024, i)
         s = round(b / p, 1)
         return f"{s} {sizes[i]}"

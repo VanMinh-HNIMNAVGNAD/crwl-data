@@ -11,6 +11,8 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::settings::SettingsManager;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinaryStatus {
     pub name: String,
@@ -35,6 +37,10 @@ pub struct BinaryManager;
 impl BinaryManager {
     /// Tìm binary trong PATH và các vị trí phổ biến trên Linux
     pub fn find_binary(name: &str) -> Option<PathBuf> {
+        // Đường dẫn do người dùng cấu hình được ưu tiên trước PATH
+        if let Some(custom) = SettingsManager::custom_binary_path(name) {
+            return Some(custom);
+        }
         // Tìm trong PATH
         if let Ok(p) = which::which(name) {
             return Some(p);
@@ -211,28 +217,126 @@ impl BinaryManager {
         Err(err)
     }
 
-    pub(crate) fn evaluate_pip_ytdlp_update(
-        stdout: &str,
-        stderr: &str,
-        success: bool,
-        code: Option<i32>,
-    ) -> Result<String, String> {
-        if stdout.contains("Requirement already satisfied") || stderr.contains("already satisfied") {
-            return Ok("yt-dlp đã là phiên bản mới nhất!".to_string());
+    /// Binary có nằm trong một venv của pipx không (~/.local/pipx/venvs/<tool>/bin/…)
+    pub(crate) fn is_pipx_managed(path: &std::path::Path) -> bool {
+        let p = path.to_string_lossy().replace('\\', "/");
+        p.contains("/pipx/venvs/") || p.contains("/pipx/shared/")
+    }
+
+    /// Binary có nằm trong thư mục của người dùng không (cài kiểu `pip --user`)
+    pub(crate) fn is_user_local(path: &std::path::Path) -> bool {
+        match dirs::home_dir() {
+            Some(home) => path.starts_with(home),
+            None => false,
+        }
+    }
+
+    /// Một lượt chạy pip: trả về (thành công, stdout + stderr gộp)
+    async fn run_pip(python: &PathBuf, args: &[&str]) -> (bool, String) {
+        match Command::new(python)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+        {
+            Ok(out) => {
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                (out.status.success(), combined)
+            }
+            Err(e) => (false, format!("Không chạy được pip: {e}")),
+        }
+    }
+
+    /// Cài/nâng cấp một gói pip vào ĐÚNG môi trường đang chứa binary.
+    ///
+    /// Trước đây chỉ có duy nhất `pip install -U <pkg> --break-system-packages`:
+    /// thiếu `--user` nên với binary cài kiểu `pip --user` (ví dụ `~/.local/bin/yt-dlp`)
+    /// lệnh sẽ nhắm vào site-packages hệ thống — hoặc lỗi quyền, hoặc cài ra một
+    /// prefix khác hẳn với binary đang thực sự được dùng, và `--break-system-packages`
+    /// còn có nguy cơ đụng vào gói do distro quản lý.
+    pub(crate) async fn pip_upgrade(pkg: &str, existing_binary: Option<&PathBuf>) -> Result<String, String> {
+        // 1. pipx quản lý thì nâng cấp bằng pipx, tuyệt đối không đụng pip
+        if let Some(bin) = existing_binary {
+            if Self::is_pipx_managed(bin) {
+                if let Some(pipx) = Self::find_binary("pipx") {
+                    let out = Command::new(&pipx)
+                        .args(["upgrade", pkg])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .await
+                        .map_err(|e| format!("Không chạy được pipx: {e}"))?;
+                    let combined = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    if out.status.success() || combined.contains("already at latest version") {
+                        return Ok(format!("Đã cập nhật {pkg} qua pipx."));
+                    }
+                    return Err(format!("pipx upgrade {pkg} thất bại: {}", combined.trim()));
+                }
+                return Err(format!(
+                    "{pkg} được cài bằng pipx nhưng không tìm thấy lệnh pipx. Chạy thủ công: pipx upgrade {pkg}"
+                ));
+            }
         }
 
-        if success {
-            return Ok("Đã cập nhật yt-dlp thành công qua pip!".to_string());
+        let python = Self::find_binary("python3").ok_or_else(|| "python3 chưa được cài đặt".to_string())?;
+
+        // 2. Cài vào đúng phạm vi của binary hiện có: ~/… → --user
+        let prefer_user = existing_binary.map(|b| Self::is_user_local(b)).unwrap_or(true);
+
+        let mut attempts: Vec<Vec<&str>> = Vec::new();
+        if prefer_user {
+            attempts.push(vec!["-m", "pip", "install", "-U", "--user", pkg]);
+        }
+        attempts.push(vec!["-m", "pip", "install", "-U", pkg]);
+
+        let mut last = String::new();
+        for args in &attempts {
+            let (ok, out) = Self::run_pip(&python, args).await;
+            if out.contains("Requirement already satisfied") || out.contains("already satisfied") {
+                return Ok(format!("{pkg} đã là phiên bản mới nhất!"));
+            }
+            if ok {
+                let how = if args.contains(&"--user") { " (--user)" } else { "" };
+                return Ok(format!("Đã cập nhật {pkg} thành công qua pip{how}!"));
+            }
+            // venv đang hoạt động thì không dùng được --user → thử lại không cờ
+            if out.contains("Can not perform a '--user' install") {
+                last = out;
+                continue;
+            }
+            // PEP 668: Python do distro quản lý. Chỉ khi ĐÃ thất bại mới dùng
+            // --break-system-packages, và luôn kèm --user để không đụng gói hệ thống.
+            if out.contains("externally-managed-environment") {
+                let mut esc: Vec<&str> = args.clone();
+                esc.push("--break-system-packages");
+                if !esc.contains(&"--user") {
+                    esc.push("--user");
+                }
+                let (ok2, out2) = Self::run_pip(&python, &esc).await;
+                if out2.contains("already satisfied") {
+                    return Ok(format!("{pkg} đã là phiên bản mới nhất!"));
+                }
+                if ok2 {
+                    return Ok(format!(
+                        "Đã cập nhật {pkg} qua pip (--user --break-system-packages)."
+                    ));
+                }
+                last = out2;
+                continue;
+            }
+            last = out;
         }
 
-        let err = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!("Mã thoát: {}", code.unwrap_or(-1))
-        };
-        Err(err)
+        Err(format!("Cập nhật {pkg} thất bại: {}", last.trim()))
     }
 
     /// Cập nhật yt-dlp lên version mới nhất
@@ -261,71 +365,21 @@ impl BinaryManager {
             Err(e) => format!("Không thể chạy yt-dlp: {e}"),
         };
 
-        // Nếu yt-dlp -U không thành công (vd do cài qua pip hoặc pipx), thử fallback qua pip
-        let pip_err = if let Some(python) = Self::find_binary("python3") {
-            let pip_res = Command::new(&python)
-                .args(["-m", "pip", "install", "-U", "yt-dlp", "--break-system-packages"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await;
-
-            match pip_res {
-                Ok(pres) => {
-                    let pstdout = String::from_utf8_lossy(&pres.stdout);
-                    let pstderr = String::from_utf8_lossy(&pres.stderr);
-                    match Self::evaluate_pip_ytdlp_update(&pstdout, &pstderr, pres.status.success(), pres.status.code()) {
-                        Ok(msg) => return Ok(msg),
-                        Err(e) => e,
-                    }
-                }
-                Err(e) => format!("Không thể chạy pip: {e}"),
-            }
-        } else {
-            "python3 chưa được cài đặt".to_string()
-        };
-
-        Err(format!(
-            "Lỗi cập nhật yt-dlp: {ytdlp_err} (Thử qua pip: {pip_err})"
-        ))
+        // yt-dlp -U không xong (thường vì cài qua pip/pipx/distro) → nâng cấp
+        // đúng môi trường đang chứa binary đó.
+        match Self::pip_upgrade("yt-dlp", Some(&ytdlp_path)).await {
+            Ok(msg) => Ok(msg),
+            Err(pip_err) => Err(format!(
+                "Lỗi cập nhật yt-dlp: {ytdlp_err} (Thử qua trình quản lý gói: {pip_err})"
+            )),
+        }
     }
 
-    /// Cập nhật gallery-dl lên version mới nhất (pip install -U gallery-dl)
+    /// Cập nhật gallery-dl lên version mới nhất, vào đúng môi trường đang dùng
     pub async fn update_gallery_dl() -> Result<String, String> {
-        let python = Self::find_binary("python3")
-            .ok_or_else(|| "python3 chưa được cài đặt".to_string())?;
-
-        info!("Đang cập nhật gallery-dl via pip...");
-
-        let output = Command::new(&python)
-            .args(["-m", "pip", "install", "-U", "gallery-dl", "--break-system-packages"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| format!("Không thể chạy pip install gallery-dl: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if stdout.contains("Requirement already satisfied") {
-            return Ok("gallery-dl đã là phiên bản mới nhất!".to_string());
-        }
-
-        if output.status.success() {
-            if stdout.contains("Successfully installed") {
-                Ok("Đã cập nhật gallery-dl lên phiên bản mới thành công!".to_string())
-            } else {
-                Ok("gallery-dl đã là phiên bản mới nhất!".to_string())
-            }
-        } else {
-            // Kiểm tra nếu chỉ là cảnh báo user site-packages
-            if stdout.contains("Requirement already satisfied") || stderr.contains("already satisfied") {
-                Ok("gallery-dl đã là phiên bản mới nhất!".to_string())
-            } else {
-                Err(format!("Lỗi cập nhật gallery-dl: {}", stderr.trim()))
-            }
-        }
+        let existing = Self::find_binary("gallery-dl");
+        info!("Đang cập nhật gallery-dl (binary: {:?})...", existing);
+        Self::pip_upgrade("gallery-dl", existing.as_ref()).await
     }
 }
 
@@ -348,30 +402,36 @@ mod tests {
     }
 
     #[test]
+    fn pipx_managed_binaries_are_detected() {
+        use std::path::Path;
+        assert!(BinaryManager::is_pipx_managed(Path::new(
+            "/home/u/.local/pipx/venvs/yt-dlp/bin/yt-dlp"
+        )));
+        assert!(BinaryManager::is_pipx_managed(Path::new(
+            "/home/u/.local/pipx/shared/bin/yt-dlp"
+        )));
+        assert!(!BinaryManager::is_pipx_managed(Path::new("/home/u/.local/bin/yt-dlp")));
+        assert!(!BinaryManager::is_pipx_managed(Path::new("/usr/bin/yt-dlp")));
+    }
+
+    /// Binary cài kiểu `pip --user` phải được nâng cấp bằng `--user`, không đụng
+    /// site-packages của hệ thống.
+    #[test]
+    fn user_local_binaries_are_detected() {
+        use std::path::Path;
+        let home = dirs::home_dir().expect("cần HOME để chạy test này");
+        assert!(BinaryManager::is_user_local(&home.join(".local/bin/yt-dlp")));
+        assert!(!BinaryManager::is_user_local(Path::new("/usr/bin/yt-dlp")));
+        assert!(!BinaryManager::is_user_local(Path::new("/usr/local/bin/yt-dlp")));
+    }
+
+    #[test]
     fn test_evaluate_ytdlp_update_error() {
         let stderr = "ERROR: yt-dlp was installed with a package manager";
         let res = BinaryManager::evaluate_ytdlp_update("", stderr, false, Some(1));
         assert_eq!(res.unwrap_err(), "ERROR: yt-dlp was installed with a package manager");
     }
 
-    #[test]
-    fn test_evaluate_pip_ytdlp_update_already_satisfied() {
-        let stdout = "Requirement already satisfied: yt-dlp in /usr/local/lib/python3.12";
-        let res = BinaryManager::evaluate_pip_ytdlp_update(stdout, "", true, Some(0));
-        assert_eq!(res.unwrap(), "yt-dlp đã là phiên bản mới nhất!");
-    }
 
-    #[test]
-    fn test_evaluate_pip_ytdlp_update_success() {
-        let stdout = "Successfully installed yt-dlp-2026.09.01";
-        let res = BinaryManager::evaluate_pip_ytdlp_update(stdout, "", true, Some(0));
-        assert_eq!(res.unwrap(), "Đã cập nhật yt-dlp thành công qua pip!");
-    }
 
-    #[test]
-    fn test_evaluate_pip_ytdlp_update_error() {
-        let stderr = "error: externally-managed-environment";
-        let res = BinaryManager::evaluate_pip_ytdlp_update("", stderr, false, Some(1));
-        assert_eq!(res.unwrap_err(), "error: externally-managed-environment");
-    }
 }

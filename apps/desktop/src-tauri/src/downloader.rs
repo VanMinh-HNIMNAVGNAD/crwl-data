@@ -12,6 +12,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::binary_manager::BinaryManager;
 use crate::cookies::CookieService;
 use crate::db::Database;
+use crate::settings::SettingsManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DownloadOptions {
@@ -130,6 +131,10 @@ pub struct DownloaderService;
 impl DownloaderService {
     /// Tìm vị trí binary yt-dlp
     pub fn find_ytdlp() -> Result<PathBuf, String> {
+        // Đường dẫn tuỳ chỉnh trong settings được ưu tiên tuyệt đối
+        if let Some(custom) = SettingsManager::custom_binary_path("yt-dlp") {
+            return Ok(custom);
+        }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let candidates = vec![
             home.join(".local/bin/yt-dlp"),
@@ -155,6 +160,9 @@ impl DownloaderService {
 
     /// Lấy thư mục tải mặc định
     pub fn get_default_download_dir() -> PathBuf {
+        if let Some(custom) = SettingsManager::custom_download_dir() {
+            return custom;
+        }
         dirs::download_dir().unwrap_or_else(|| {
             dirs::home_dir()
                 .map(|h| h.join("Downloads"))
@@ -963,11 +971,39 @@ impl DownloaderService {
     }
 
     /// Tải album nhiều ảnh hoặc đóng gói thành file ZIP
+    /// Cấp phát thư mục album MỚI, không dùng lại thư mục đã có nội dung.
+    ///
+    /// Trước đây hàm luôn dùng `base/<Tiêu đề>`: tải lại cùng một album (hoặc hai
+    /// album trùng tên) sẽ đổ chung vào một chỗ, và bước nén ZIP `WalkDir` cả thư
+    /// mục nên gói luôn tệp thừa của lần trước.
+    fn allocate_album_dir(base_dest: &Path, clean_title: &str) -> PathBuf {
+        let is_free = |p: &Path| -> bool {
+            match std::fs::read_dir(p) {
+                Ok(mut entries) => entries.next().is_none(), // tồn tại nhưng rỗng → dùng được
+                Err(_) => !p.exists(),
+            }
+        };
+
+        let first = base_dest.join(clean_title);
+        if is_free(&first) {
+            return first;
+        }
+        for counter in 1..10_000u32 {
+            let cand = base_dest.join(format!("{clean_title}_{counter}"));
+            if is_free(&cand) {
+                return cand;
+            }
+        }
+        first
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn download_album_batch(
         app_handle: AppHandle,
         items: Vec<DirectFileItem>,
         album_name: Option<&str>,
         dest_dir: Option<&str>,
+        album_dir: Option<&str>,
         as_zip: bool,
         device_id: &str,
         task_id: Option<String>,
@@ -980,7 +1016,13 @@ impl DownloaderService {
 
         let raw_title = album_name.unwrap_or("Album_Media");
         let clean_title = Self::sanitize_file_name(raw_title, "Album_Media");
-        let target_dir = base_dest.join(&clean_title);
+
+        // `album_dir` = thư mục do một lượt gọi trước trả về (luồng tải ảnh rồi
+        // tải video rồi mới nén). Không có thì cấp phát thư mục mới, sạch.
+        let target_dir = match album_dir.map(str::trim).filter(|d| !d.is_empty()) {
+            Some(d) => PathBuf::from(d),
+            None => Self::allocate_album_dir(&base_dest, &clean_title),
+        };
 
         if !target_dir.exists() {
             tokio::fs::create_dir_all(&target_dir)
@@ -1136,10 +1178,23 @@ impl DownloaderService {
             failed = total - downloaded_files.len();
         }
 
+        let mut zip_error: Option<String> = None;
         if as_zip {
             emit(93.0, "processing", "Đang nén thành tệp ZIP...".to_string(), None);
-            let zip_filename = format!("{clean_title}.zip");
-            let zip_path = base_dest.join(&zip_filename);
+            // File::create() sẽ TRUNCATE tệp cũ: tải lại cùng album hoặc hai album
+            // trùng tên từng âm thầm xoá mất ZIP trước đó. Cấp phát tên không đụng độ
+            // giống như cách làm với từng tệp lẻ.
+            let mut reserved = std::collections::HashSet::new();
+            let zip_path = Self::resolve_collision_free_path(
+                &base_dest,
+                &format!("{clean_title}.zip"),
+                "zip",
+                &mut reserved,
+            );
+            let zip_filename = zip_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("{clean_title}.zip"));
 
             let target_dir_clone = target_dir.clone();
             let zip_path_clone = zip_path.clone();
@@ -1184,14 +1239,60 @@ impl DownloaderService {
                 }
                 Ok(Err(err)) => {
                     warn!("Nén ZIP thất bại: {err} — giữ nguyên thư mục ảnh đã tải");
+                    zip_error = Some(err);
                 }
                 Err(join_err) => {
                     warn!("Tiến trình nén ZIP bị gián đoạn: {join_err} — giữ nguyên thư mục ảnh đã tải");
+                    zip_error = Some(format!("tiến trình nén bị gián đoạn: {join_err}"));
                 }
             }
         }
 
         let dir_str = target_dir.to_string_lossy().to_string();
+
+        // Người dùng yêu cầu ZIP nhưng nén hỏng: các tệp vẫn còn nguyên trong thư
+        // mục, nhưng TUYỆT ĐỐI không được báo "Hoàn tất" như thể đã có ZIP.
+        if let Some(reason) = zip_error {
+            let msg = format!(
+                "Đã tải {} tệp nhưng KHÔNG nén được ZIP ({reason}). Các tệp vẫn nằm trong thư mục: {dir_str}",
+                downloaded_files.len()
+            );
+
+            db.record_download_history(
+                device_id,
+                &format!("Album: {clean_title}"),
+                &clean_title,
+                "album",
+                None,
+                None,
+                "failed",
+                Some(&msg),
+                client_ip,
+            ).await;
+
+            let _ = app_handle.emit(
+                "download-progress",
+                DownloadProgressPayload {
+                    id: task_id.clone(),
+                    percent: 100.0,
+                    speed: String::new(),
+                    eta: String::new(),
+                    status: "error".to_string(),
+                    phase: "Nén ZIP thất bại".to_string(),
+                    file_path: Some(dir_str.clone()),
+                    message: Some(msg.clone()),
+                    is_indeterminate: false,
+                },
+            );
+
+            return Ok(DownloadResult {
+                success: false,
+                file_path: Some(dir_str),
+                file_name: Some(clean_title),
+                message: msg,
+            });
+        }
+
         db.record_download_history(
             device_id,
             &format!("Album: {clean_title}"),
@@ -2067,6 +2168,79 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         println!("TEST #2: PASS");
+    }
+
+    /// #4 — mỗi album phải vào một thư mục SẠCH, không dùng lại thư mục còn tệp cũ
+    /// (nếu không, bước nén ZIP sẽ gói lẫn tệp của lần tải trước).
+    #[test]
+    fn album_dir_is_never_reused_when_it_still_has_files() {
+        let base = std::env::temp_dir().join(format!("test_album_alloc_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Lần 1: thư mục chưa tồn tại → dùng đúng tên album
+        let first = D::allocate_album_dir(&base, "Album");
+        assert_eq!(first, base.join("Album"));
+        std::fs::create_dir_all(&first).unwrap();
+
+        // Thư mục tồn tại nhưng RỖNG → vẫn dùng lại được
+        assert_eq!(D::allocate_album_dir(&base, "Album"), first);
+
+        // Có tệp cũ bên trong → phải cấp thư mục mới
+        std::fs::write(first.join("anh_cu.jpg"), b"stale").unwrap();
+        let second = D::allocate_album_dir(&base, "Album");
+        assert_eq!(second, base.join("Album_1"));
+        assert_ne!(second, first);
+
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("anh_moi.jpg"), b"new").unwrap();
+        let third = D::allocate_album_dir(&base, "Album");
+        assert_eq!(third, base.join("Album_2"));
+
+        // Tệp cũ không bị đụng tới
+        assert_eq!(std::fs::read_to_string(first.join("anh_cu.jpg")).unwrap(), "stale");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #5 — ZIP mới không được ghi đè ZIP cũ cùng tên
+    #[test]
+    fn zip_name_does_not_overwrite_an_existing_archive() {
+        let base = std::env::temp_dir().join(format!("test_zip_name_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        let mut reserved = std::collections::HashSet::new();
+        let p1 = D::resolve_collision_free_path(&base, "Album.zip", "zip", &mut reserved);
+        assert_eq!(p1, base.join("Album.zip"));
+        std::fs::write(&p1, b"zip cu").unwrap();
+
+        let mut reserved2 = std::collections::HashSet::new();
+        let p2 = D::resolve_collision_free_path(&base, "Album.zip", "zip", &mut reserved2);
+        assert_ne!(p2, p1, "ZIP thứ hai phải có tên khác");
+        assert_eq!(p2, base.join("Album_1.zip"));
+
+        // Nội dung ZIP cũ còn nguyên
+        assert_eq!(std::fs::read_to_string(&p1).unwrap(), "zip cu");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #3 — compress_dir_to_zip phải trả lỗi (không im lặng) khi không ghi được
+    #[test]
+    fn compress_dir_to_zip_reports_failure_instead_of_pretending_success() {
+        let src = std::env::temp_dir().join(format!("test_zip_fail_src_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.jpg"), b"x").unwrap();
+
+        // Ghi ZIP vào một đường dẫn không thể tạo được (thư mục cha không tồn tại)
+        let bad_zip = std::env::temp_dir()
+            .join(format!("khong_ton_tai_{}", uuid::Uuid::new_v4()))
+            .join("out.zip");
+
+        let res = D::compress_dir_to_zip(&src, &bad_zip);
+        assert!(res.is_err(), "Nén vào đường dẫn không hợp lệ phải trả Err");
+        assert!(!bad_zip.exists());
+
+        let _ = std::fs::remove_dir_all(&src);
     }
 
     #[test]

@@ -36,49 +36,111 @@ class MediaDispatcher(BaseExtractor):
     # URL Classification
     # ─────────────────────────────────────────────────────────────────────────
 
+    # Nhận diện nền tảng PHẢI dựa trên hostname, không phải substring của cả URL.
+    # `"x.com/" in url` từng khớp nhầm vox.com/, netflix.com/, fox.com/... và
+    # `"youtube.com" in url` khớp cả `evil.com/?ref=https://youtube.com/x`,
+    # khiến dispatcher định tuyến sang engine sai.
+    _VIDEO_AUDIO_DOMAINS = (
+        "youtube.com", "youtu.be",
+        "tiktok.com",
+        "twitch.tv",
+        "dailymotion.com", "dai.ly",
+        "soundcloud.com",
+        "nicovideo.jp", "nico.ms",
+        "bilibili.com", "b23.tv",
+        "rumble.com", "odysee.com",
+        "redd.it",
+    )
+
+    _GALLERY_DOMAINS = (
+        "pinterest.com", "pin.it",
+        "imgur.com", "flickr.com", "deviantart.com", "artstation.com",
+        "danbooru.donmai.us", "gelbooru.com", "safebooru.org",
+        "pixiv.net", "redd.it",
+        "threads.net", "bsky.app", "tumblr.com",
+        "x.com", "twitter.com",
+    )
+
+    _FACEBOOK_DOMAINS = ("facebook.com", "fb.com", "fb.watch", "fb.me")
+
+    @staticmethod
+    def _hostname_of(url: str) -> str:
+        import urllib.parse
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        if not raw.lower().startswith(("http://", "https://")):
+            raw = "https://" + raw
+        try:
+            return (urllib.parse.urlparse(raw).hostname or "").lower().rstrip(".")
+        except Exception:
+            return ""
+
+    @classmethod
+    def _host_is(cls, hostname: str, domain: str) -> bool:
+        """hostname == domain hoặc là subdomain của domain (không khớp 'vox.com' với 'x.com')."""
+        return bool(hostname) and (hostname == domain or hostname.endswith("." + domain))
+
+    @classmethod
+    def _host_in(cls, hostname: str, domains) -> bool:
+        return any(cls._host_is(hostname, d) for d in domains)
+
+    @staticmethod
+    def _path_of(url: str) -> str:
+        import urllib.parse
+        raw = (url or "").strip()
+        if not raw.lower().startswith(("http://", "https://")):
+            raw = "https://" + raw
+        try:
+            p = urllib.parse.urlparse(raw)
+            return ((p.path or "") + ("?" + p.query if p.query else "")).lower()
+        except Exception:
+            return raw.lower()
+
     def is_video_audio_platform(self, url: str) -> bool:
-        lower = url.lower()
-        video_platforms = [
-            "youtube.com", "youtu.be",
-            "tiktok.com",
-            "twitch.tv", "clips.twitch.tv",
-            "dailymotion.com", "dai.ly",
-            "soundcloud.com",
-            "nicovideo.jp", "nico.ms",
-            "bilibili.com", "b23.tv",
-            "rumble.com", "odysee.com",
-            "v.redd.it",
-        ]
-        if any(d in lower for d in video_platforms):
+        host = self._hostname_of(url)
+        if self._host_in(host, self._VIDEO_AUDIO_DOMAINS):
+            # redd.it chỉ tính là video khi là v.redd.it
+            if self._host_is(host, "redd.it"):
+                return host.startswith("v.")
             return True
 
         # Facebook Video / Reel / Watch
-        if "facebook.com" in lower or "fb.com" in lower or "fb.watch" in lower:
-            fb_video_markers = ("/reel", "/reels", "/watch", "/videos", "/video", "share/r", "share/v", "fb.watch")
-            return any(m in lower for m in fb_video_markers)
+        if self._host_in(host, self._FACEBOOK_DOMAINS):
+            if self._host_is(host, "fb.watch"):
+                return True
+            path = self._path_of(url)
+            fb_video_markers = ("/reel", "/reels", "/watch", "/videos", "/video", "/share/r", "/share/v")
+            return any(m in path for m in fb_video_markers)
 
         return False
 
     def is_gallery_platform(self, url: str) -> bool:
-        lower = url.lower()
-        if "instagram.com" in lower or "instagr.am" in lower:
-            return any(p in lower for p in ("/p/", "/reel/", "/reels/", "/stories/", "/tv/"))
+        host = self._hostname_of(url)
+        path = self._path_of(url)
+
+        if self._host_in(host, ("instagram.com", "instagr.am")):
+            return any(p in path for p in ("/p/", "/reel/", "/reels/", "/stories/", "/tv/"))
 
         # Facebook Photos / Posts / Albums
-        if "facebook.com" in lower or "fb.com" in lower:
-            fb_gallery_markers = ("/photo", "/photos", "/posts", "/media/set", "story.php", "permalink.php", "share/p")
-            return any(m in lower for m in fb_gallery_markers)
+        if self._host_in(host, self._FACEBOOK_DOMAINS):
+            fb_gallery_markers = ("/photo", "/photos", "/posts", "/media/set", "story.php", "permalink.php", "/share/p")
+            return any(m in path for m in fb_gallery_markers)
 
-        gallery_domains = [
-            "pinterest.com", "pin.it",
-            "imgur.com", "flickr.com", "deviantart.com", "artstation.com",
-            "danbooru", "gelbooru", "safebooru", "pixiv.net",
-            "reddit.com/gallery", "reddit.com/r/", "redd.it",
-            "threads.net", "bsky.app", "mastodon", "tumblr.com",
-            "/photo/",  # TikTok photo slideshow
-            "x.com/", "twitter.com/",
-        ]
-        return any(d in lower for d in gallery_domains)
+        # TikTok photo slideshow
+        if self._host_is(host, "tiktok.com"):
+            return "/photo/" in path
+
+        if self._host_is(host, "reddit.com"):
+            return "/gallery" in path or "/r/" in path
+
+        if self._host_is(host, "redd.it"):
+            return not host.startswith("v.")
+
+        if "mastodon" in host:
+            return True
+
+        return self._host_in(host, self._GALLERY_DOMAINS)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main Extract

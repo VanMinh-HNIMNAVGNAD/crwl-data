@@ -23,27 +23,6 @@
 
 ---
 
-## 1. Kiến Trúc & Giải Đáp Về Mã Nguồn HTML
-
-### ❓ Câu hỏi: "Hiện code vẫn còn HTML, có thể xoá đi không vì tưởng không để làm gì?"
-
-> [!CAUTION]
-> **KHÔNG ĐƯỢC XOÁ file `apps/desktop/index.html`!**
-
-### Giải thích nguyên lý kỹ thuật:
-1. **Bản chất của Desktop App (Tauri 2):**
-   - Ứng dụng desktop này sử dụng kiến trúc **Tauri v2**:
-     - **Backend**: Viết bằng **Rust** (`src-tauri`) và **Python** (`core`) để tải tệp, ghi đĩa, giải mã stream và quản lý DB.
-     - **Giao diện (GUI)**: Viết bằng **React 19 + Vite**, hiển thị trực tiếp lên màn hình desktop qua **WebKitGTK Webview** (trên Linux).
-2. **Vai trò sống còn của `apps/desktop/index.html`:**
-   - Trong kiến trúc Vite + React, file `index.html` là **điểm mồi (entry point) bắt buộc duy nhất**.
-   - Nó chứa thẻ `<div id="root"></div>` và `<script type="module" src="/src/main.jsx"></script>`.
-   - Nếu bạn xóa `index.html`: Vite sẽ báo lỗi `Index HTML not found`, lệnh `pnpm dev` và `pnpm build` sẽ hỏng ngay lập tức, và ứng dụng desktop sẽ chỉ hiển thị một màn hình trắng hoặc không thể khởi động.
-3. **Các file và khái niệm HTML khác trong dự án cần phân biệt:**
-   - `apps/desktop/dist/index.html`: Đây là file HTML sau khi biên dịch (build artifact do Vite sinh ra trong thư mục `dist/`). File này tự động tạo khi chạy `pnpm build`, bạn có thể xóa thư mục `dist/` khi muốn dọn dẹp (nó sẽ tự sinh lại khi build).
-   - **HTML trong `core/extractors/web_scraper.py` và `movie.py`**: Đây là **logic crawler** bằng Python dùng để đọc mã nguồn HTML của các trang web mục tiêu (như regex tìm thẻ `<video>`, `og:video`, link stream `.m3u8`, iframe). Đây là tính năng trích xuất media từ web chứ không phải mã thừa của app.
-   - **Các thẻ `<button>`, `<div>` trong file `.jsx`**: Đây là cú pháp JSX của React dùng để vẽ giao diện ứng dụng.
-
 ---
 
 ## 2. Yêu Cầu Môi Trường (Prerequisites)
@@ -140,11 +119,16 @@ Hệ thống ưu tiên đọc file cấu hình theo thứ tự:
 ### 3.2. Nội dung file `.env` mẫu:
 ```ini
 # Kết nối Supabase PostgreSQL qua IPv4 Pooler (Khuyên dùng để tránh lỗi IPv6)
-DATABASE_URL=postgresql://postgres.kztgjbpazypqfvxzgbrm:Dangvanminh0001%40%23@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres
+DATABASE_URL=postgresql://postgres.[PROJECT_REF]:[PASSWORD]@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres
 
 # Hoặc nếu sử dụng PostgreSQL cục bộ (Localhost):
-# DATABASE_URL=postgresql://postgres:123456@localhost:5432/postgres
+# DATABASE_URL=postgresql://postgres:[PASSWORD]@localhost:5432/postgres
 ```
+
+> [!CAUTION]
+> **Không bao giờ commit chuỗi kết nối thật vào repo.** File `.env` đã nằm trong
+> `.gitignore` — hãy điền thông tin thật ở đó, hoặc ở `~/.config/crwl/.env`, hoặc qua
+> mục cấu hình của ứng dụng. Tài liệu này chỉ chứa giá trị mẫu.
 
 > [!TIP]
 > Nếu mật khẩu của bạn có ký tự đặc biệt như `@` hay `#`, hãy URL-encode chúng (ví dụ: `@` thành `%40`, `#` thành `%23`).

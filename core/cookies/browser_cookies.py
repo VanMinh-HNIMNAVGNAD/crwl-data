@@ -11,6 +11,8 @@ import shutil
 import sqlite3
 import hashlib
 import tempfile
+import threading
+import time
 from typing import Dict, List, Optional, Tuple, Set
 
 # Try importing cryptography & secretstorage
@@ -75,6 +77,44 @@ _SESSION_COOKIE_NAMES = {
 def _host_matches(host: str, base_domain: str) -> bool:
     h = host.strip().lower().lstrip(".")
     return h == base_domain or h.endswith("." + base_domain)
+
+
+# Thời gian sống của cache cookie đã xuất (giây)
+_EXPORT_CACHE_TTL = float(os.environ.get("CRWL_COOKIE_CACHE_TTL", "120"))
+_export_cache: Dict[Tuple[str, Optional[str]], Tuple[float, str]] = {}
+_export_cache_lock = threading.Lock()
+
+
+def _cache_get(key: Tuple[str, Optional[str]]) -> Optional[str]:
+    with _export_cache_lock:
+        hit = _export_cache.get(key)
+        if hit and (time.monotonic() - hit[0]) < _EXPORT_CACHE_TTL:
+            return hit[1]
+        if hit:
+            _export_cache.pop(key, None)
+    return None
+
+
+def _cache_put(key: Tuple[str, Optional[str]], value: str) -> None:
+    with _export_cache_lock:
+        if len(_export_cache) > 64:
+            _export_cache.clear()
+        _export_cache[key] = (time.monotonic(), value)
+
+
+# Cache riêng cho bước TỐN KÉM nhất: đọc + giải mã toàn bộ cookie DB của một
+# trình duyệt. Bước lọc theo domain thì rẻ, nên chỉ cần cache dữ liệu thô là đủ
+# dùng lại cho mọi domain khác nhau trong cùng một phiên làm việc.
+_raw_cache: Dict[str, Tuple[float, List[Tuple[str, str, str, str, int, str, str]]]] = {}
+_raw_cache_lock = threading.Lock()
+
+
+def clear_cookie_cache() -> None:
+    """Xoá cache cookie (gọi sau khi người dùng đăng nhập lại trên trình duyệt)."""
+    with _export_cache_lock:
+        _export_cache.clear()
+    with _raw_cache_lock:
+        _raw_cache.clear()
 
 
 class BrowserCookieExporter:
@@ -326,19 +366,40 @@ class BrowserCookieExporter:
 
         return None
 
+    def _raw_cookies_cached(self, b: str) -> List[Tuple[str, str, str, str, int, str, str]]:
+        """Đọc + giải mã cookie DB của một trình duyệt, có cache ngắn hạn."""
+        with _raw_cache_lock:
+            hit = _raw_cache.get(b)
+            if hit and (time.monotonic() - hit[0]) < _EXPORT_CACHE_TTL:
+                return hit[1]
+
+        rows = self.extract_firefox_cookies() if "firefox" in b else self.extract_chromium_cookies(b)
+
+        with _raw_cache_lock:
+            _raw_cache[b] = (time.monotonic(), rows)
+        return rows
+
     def export_cookies_netscape(self, browser: str, domain_filter: Optional[str] = None) -> str:
-        """Xuất cookies sang chuỗi định dạng Netscape chuẩn"""
+        """Xuất cookies sang chuỗi định dạng Netscape chuẩn (có cache ngắn hạn)."""
         b = browser.lower()
+        filter_key = registrable_domain(domain_filter) if domain_filter else None
+
+        cached = _cache_get((b, filter_key))
+        if cached is not None:
+            return cached
+
         if b in ("auto", ""):
             best = self.find_best_browser(domain_filter)
             if not best:
+                _cache_put((b, filter_key), "")
                 return ""
-            b = best
+            # find_best_browser đã xuất và cache nội dung của trình duyệt này rồi,
+            # nên lần gọi dưới đây lấy thẳng từ cache thay vì giải mã DB lần hai.
+            result = self.export_cookies_netscape(best, domain_filter)
+            _cache_put((b, filter_key), result)
+            return result
 
-        if "firefox" in b:
-            raw_cookies = self.extract_firefox_cookies()
-        else:
-            raw_cookies = self.extract_chromium_cookies(b)
+        raw_cookies = self._raw_cookies_cached(b)
 
         lines = [
             "# Netscape HTTP Cookie File",
@@ -356,7 +417,9 @@ class BrowserCookieExporter:
                 continue
             lines.append(f"{host}\t{domain_flag}\t{path}\t{sec_flag}\t{exp_unix}\t{name}\t{val}")
 
-        return "\n".join(lines) + "\n"
+        result = "\n".join(lines) + "\n"
+        _cache_put((b, filter_clean), result)
+        return result
 
 
 # Ánh xạ domain → tên platform để tìm file cookie thủ công

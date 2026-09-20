@@ -63,13 +63,10 @@ class GalleryDlExtractor(BaseExtractor):
         cmd = [self.binary_path, *args, "-j", url]
 
         self.log(f"gallery-dl extract: {url}")
-        code, stdout, stderr = self.run_process(cmd, timeout=timeout)
-
-        if tmp_cookie and os.path.exists(tmp_cookie):
-            try:
-                os.remove(tmp_cookie)
-            except Exception:
-                pass
+        try:
+            code, stdout, stderr = self.run_process(cmd, timeout=timeout)
+        finally:
+            self._cleanup_cookie(tmp_cookie)
 
         if code != 0 and not stdout.strip():
             raise RuntimeError(f"gallery-dl extract thất bại: {stderr.strip() or f'Exit code {code}'}")
@@ -119,13 +116,10 @@ class GalleryDlExtractor(BaseExtractor):
         cmd.append(profile_url)
 
         self.log(f"gallery-dl crawl ({range_spec or 'all'}): {profile_url}")
-        code, stdout, stderr = self.run_process(cmd, timeout=timeout)
-
-        if tmp_cookie and os.path.exists(tmp_cookie):
-            try:
-                os.remove(tmp_cookie)
-            except Exception:
-                pass
+        try:
+            code, stdout, stderr = self.run_process(cmd, timeout=timeout)
+        finally:
+            self._cleanup_cookie(tmp_cookie)
 
         raw_entries = self._parse_json(stdout)
 
@@ -377,6 +371,15 @@ class GalleryDlExtractor(BaseExtractor):
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _cleanup_cookie(path: Optional[str]) -> None:
+        """Xoá file cookie tạm dù request thành công hay ném lỗi."""
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    @staticmethod
     def _timeout_for(limit: int, range_start: Optional[int], range_end: Optional[int]) -> int:
         """Ước lượng thời gian chờ theo số lượng mục cần quét (giây)."""
         if range_start and range_end and range_end >= range_start:
@@ -397,7 +400,7 @@ class GalleryDlExtractor(BaseExtractor):
         "authentication required", "authenticated cookies needed",
         "login required", "please login", "must be logged in",
         "401 unauthorized", "403 forbidden", "http 401", "http 403",
-        "keyerror: 'username'", "'username'",
+        "keyerror: 'username'",
         "account is private", "private account",
     )
 
@@ -407,8 +410,18 @@ class GalleryDlExtractor(BaseExtractor):
         haystacks: List[str] = []
 
         for x in (raw_entries or []):
-            if isinstance(x, list) and len(x) >= 2 and x[0] == -1:
-                haystacks.append(str(x[1]))
+            if not (isinstance(x, list) and len(x) >= 2 and x[0] == -1):
+                continue
+            payload = x[1]
+            if isinstance(payload, dict):
+                # gallery-dl trả lỗi dạng {"error": "KeyError", "message": "'username'"}.
+                # Ghép lại thành "keyerror: 'username'" để so khớp CHÍNH XÁC, thay vì
+                # bắt bừa chuỗi 'username' ở bất kỳ đâu (gây báo nhầm "cần đăng nhập").
+                err = str(payload.get("error") or "")
+                msg = str(payload.get("message") or "")
+                haystacks.append(f"{err}: {msg}".strip(": ") or str(payload))
+            else:
+                haystacks.append(str(payload))
 
         if stderr:
             haystacks.append(stderr)
@@ -492,11 +505,16 @@ class GalleryDlExtractor(BaseExtractor):
         return None
 
     @staticmethod
-    def format_bytes(b: int) -> str:
-        if not b or b <= 0:
+    def format_bytes(b: Any) -> str:
+        try:
+            b = int(b)
+        except (TypeError, ValueError):
             return "0 B"
-        sizes = ["B", "KB", "MB", "GB"]
-        i = int(math.floor(math.log(b, 1024)))
+        if b <= 0:
+            return "0 B"
+        sizes = ["B", "KB", "MB", "GB", "TB", "PB"]
+        # Kẹp chỉ số trong phạm vi `sizes`, nếu không tệp >= 1 TB sẽ gây IndexError
+        i = max(0, min(int(math.floor(math.log(b, 1024))), len(sizes) - 1))
         p = math.pow(1024, i)
         s = round(b / p, 1)
         return f"{s} {sizes[i]}"

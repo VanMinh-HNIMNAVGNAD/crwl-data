@@ -2819,4 +2819,140 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   padding: 16px;
 }
 
+/* Cảnh báo khi Python sidecar worker đã dừng vì lỗi */
+.tools-sidecar-alert {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(244, 63, 94, 0.45);
+  border-radius: 8px;
+  background: rgba(244, 63, 94, 0.08);
+  color: #fda4af;
+  font-size: 12px;
+  line-height: 1.5;
+}
 
+.tools-sidecar-alert strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #fb7185;
+}
+
+.tools-sidecar-alert p {
+  margin: 0;
+  color: #cbd5e1;
+}
+
+.tools-sidecar-error {
+  display: block;
+  margin-top: 6px;
+  max-height: 72px;
+  overflow: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.6);
+  color: #94a3b8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Banner báo lỗi khi xoá lịch sử thất bại (giữ nguyên bảng dữ liệu bên dưới) */
+.history-clear-error {
+  border-color: rgba(244, 63, 94, 0.45);
+  background: rgba(244, 63, 94, 0.08);
+}
+
+/* ── Nút hành động trên thẻ tiến trình ─────────────────────────────────── */
+.progress-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.progress-open-folder-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 9px;
+  border: 1px solid var(--border-medium);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.progress-open-folder-btn:hover {
+  background: var(--bg-card-hover);
+  color: var(--text-primary);
+  border-color: var(--border-strong, var(--border-medium));
+}
+
+/* ── Khối cấu hình trong modal Công cụ ─────────────────────────────────── */
+.tools-settings-block {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-subtle, var(--border-medium));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tools-settings-heading {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.tools-setting-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tools-setting-label {
+  flex: 0 0 168px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tools-setting-input-group {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tools-setting-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--border-medium);
+  border-radius: 6px;
+  background: var(--bg-input, var(--bg-card));
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.tools-setting-input:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
+.tools-setting-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.tools-setting-save {
+  align-self: flex-start;
+}

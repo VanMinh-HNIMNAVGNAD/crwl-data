@@ -165,13 +165,26 @@ export function isMatchingDomain(hostname, targetDomain) {
 /**
  * Nhận diện nền tảng dựa trên phân tích hostname chuẩn của URL
  */
+/**
+ * URL trỏ thẳng tới manifest/segment luồng phát (HLS/DASH).
+ * `.m3u8`/`.mpd` là token khó trùng nên chấp nhận ở bất kỳ đâu; `.ts`/`.m4s`
+ * quá ngắn nên chỉ tính khi nằm trong PATH — nếu không, một link YouTube dạng
+ * `?list=PLx.ts` cũng bị xếp nhầm vào nhóm phim.
+ * Giữ đồng bộ với `is_direct_stream_url()` trong core/resolver/url_resolver.py.
+ */
+export function isDirectStreamUrl(url = '') {
+  if (!url || typeof url !== 'string') return false
+  if (/\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url)) return true
+  const parsed = parseUrlHostname(url)
+  const path = parsed?.parsedUrl?.pathname || ''
+  return /\.(?:ts|m4s)$/i.test(path) || /\/(?:hls|dash)\//i.test(path)
+}
+
 export function detectPlatform(url = '') {
   if (!url || typeof url !== 'string') return null
-  const lower = url.trim().toLowerCase()
 
   // Direct stream URLs -> movie
-  if (lower.includes('.m3u8') || lower.includes('.mpd') || lower.includes('/hls/') ||
-      lower.includes('.ts?') || lower.includes('.m4s')) {
+  if (isDirectStreamUrl(url)) {
     return 'movie'
   }
 
@@ -291,7 +304,7 @@ export function validatePlatformUrl(url = '', expectedPlatformId = null) {
 
   // 1. Kiểm tra riêng cho nền tảng Phim & HLS
   if (expectedPlatformId === 'movie') {
-    const isStream = url.toLowerCase().includes('.m3u8') || url.toLowerCase().includes('.mpd') || url.toLowerCase().includes('/hls/')
+    const isStream = isDirectStreamUrl(url)
     const detectedOther = detectPlatform(url)
     if (detectedOther && detectedOther !== 'movie') {
       const otherPlatform = PLATFORMS.find((p) => p.id === detectedOther)
@@ -348,46 +361,20 @@ export function validatePlatformUrl(url = '', expectedPlatformId = null) {
   }
 }
 
-export const FORMAT_OPTIONS = [
-  { id: 'mp4', label: 'MP4 (Full HD/4K)', desc: 'Video tiêu chuẩn có âm thanh đầy đủ', type: 'video' },
-  { id: 'mkv', label: 'MKV (Đa phụ đề/Lossless)', desc: 'Container tối ưu giữ trọn vẹn phụ đề và âm thanh gốc', type: 'video' },
-  { id: 'mov', label: 'MOV (Apple QuickTime)', desc: 'Video chuẩn dựng phim Apple / Premiere Pro', type: 'video' },
-  { id: 'webm', label: 'WEBM', desc: 'Video nén dung lượng nhẹ, tối ưu web', type: 'video' },
-  { id: 'avi', label: 'AVI', desc: 'Định dạng tương thích màn hình ô tô và thiết bị cũ', type: 'video' },
-  { id: 'gif', label: 'GIF (Ảnh động)', desc: 'Chuyển đổi video clip thành ảnh động GIF', type: 'video' },
-  { id: 'mp3', label: 'MP3 (320kbps)', desc: 'Âm thanh phổ biến chất lượng cao', type: 'audio' },
-  { id: 'opus', label: 'OPUS (Chuẩn gốc)', desc: 'Âm thanh chất lượng gốc YouTube không bị nén lại', type: 'audio' },
-  { id: 'm4a', label: 'M4A / AAC', desc: 'Âm thanh chuẩn nén cho thiết bị Apple / Mobile', type: 'audio' },
-  { id: 'flac', label: 'FLAC (Lossless)', desc: 'Âm thanh phòng thu chất lượng cao nhất', type: 'audio' },
-  { id: 'wav', label: 'WAV (Uncompressed)', desc: 'Bản ghi âm thanh không nén chất lượng cao', type: 'audio' },
-  { id: 'ogg', label: 'OGG (Vorbis)', desc: 'Âm thanh mã nguồn mở chất lượng cao', type: 'audio' },
-  { id: 'aac', label: 'AAC', desc: 'Luồng âm thanh AAC nguyên bản', type: 'audio' },
-  { id: 'alac', label: 'ALAC (Apple Lossless)', desc: 'Âm thanh chất lượng cao cho Apple Music', type: 'audio' },
-]
-
-export const AUDIO_BITRATES = [
-  { id: '320k', label: '320 kbps (Chất lượng cao nhất)' },
-  { id: '256k', label: '256 kbps (Chuẩn Studio)' },
-  { id: '192k', label: '192 kbps (Chuẩn Phổ biến)' },
-  { id: '128k', label: '128 kbps (Tiết kiệm dung lượng)' },
-]
-
 /**
- * Danh sách trình duyệt hỗ trợ cookies (phải khớp với backend SupportedBrowser)
+ * Định dạng container video — NGUỒN DUY NHẤT cho cả dãy pill nhanh lẫn ô select
+ * trong "Tùy chọn tải".
+ *
+ * Trước đây pill lấy từ `FORMAT_OPTIONS.slice(0, 3)` (mp4/mkv/mov) còn select
+ * liệt kê auto/mp4/mkv/webm/gif. Hai danh sách lệch nhau nên: chọn "MOV" bằng
+ * pill làm ô select rỗng (không có option khớp), và không có cách nào quay về
+ * "Tự động" sau khi đã bấm một pill.
  */
-export const BROWSER_OPTIONS = [
-  { id: 'firefox', label: 'Firefox', desc: 'Mozilla Firefox' },
-  { id: 'chrome', label: 'Chrome', desc: 'Google Chrome' },
-  { id: 'chromium', label: 'Chromium', desc: 'Chromium (open source)' },
-  { id: 'edge', label: 'Edge', desc: 'Microsoft Edge' },
-  { id: 'brave', label: 'Brave', desc: 'Brave Browser' },
-  { id: 'opera', label: 'Opera', desc: 'Opera Browser' },
-  { id: 'vivaldi', label: 'Vivaldi', desc: 'Vivaldi Browser' },
-  { id: 'safari', label: 'Safari', desc: 'Apple Safari (macOS)' },
-  { id: 'none', label: 'Không dùng', desc: 'Không sử dụng cookies trình duyệt' },
+export const VIDEO_CONTAINER_OPTIONS = [
+  { id: 'auto', label: 'Tự động', desc: 'Giữ định dạng gốc (khuyên dùng)' },
+  { id: 'mp4', label: 'MP4', desc: 'Tương thích cao' },
+  { id: 'mkv', label: 'MKV', desc: 'Chất lượng gốc, đa phụ đề' },
+  { id: 'mov', label: 'MOV', desc: 'Chuẩn dựng phim Apple' },
+  { id: 'webm', label: 'WebM', desc: 'Nhẹ, tối ưu web' },
+  { id: 'gif', label: 'GIF', desc: 'Ảnh động' },
 ]
-
-/**
- * Nền tảng hỗ trợ live stream
- */
-export const LIVE_PLATFORMS = ['youtube', 'twitch', 'facebook', 'instagram', 'tiktok']

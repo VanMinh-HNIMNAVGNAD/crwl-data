@@ -526,77 +526,38 @@ class PlaywrightStreamSniffer(BaseExtractor):
         lower = url.lower()
         return any(re.search(pat, lower) for pat in EMBED_PLAYER_PATTERNS)
 
+    # Phân loại theo phần mở rộng THẬT. Dùng substring trần (`".ts" in url`,
+    # `"dash" in url`) khiến một URL .mp4 trên host "x.ts.cdn.com" hay bất kỳ URL
+    # nào chứa chữ "dash" bị gắn nhãn sai loại.
+    _KIND_RULES = [
+        ("hls", r"\.m3u8(?:[?#]|$)|mpegurl", "HLS", "HLS Stream (Chất lượng tốt nhất)", "full", 0),
+        ("dash", r"\.mpd(?:[?#]|$)|/dash/", "DASH", "DASH Stream (Adaptive)", "full", 1),
+        ("mp4", r"\.mp4(?:[?#]|$)", "MP4", "MP4 Video (Nguồn gốc)", "full", 2),
+        ("ts", r"\.ts(?:[?#]|$)", "TS", "TS Segment Stream", "stream", 3),
+        ("m4s", r"\.m4s(?:[?#]|$)", "M4S", "DASH Segment (M4S)", "stream", 3),
+        ("webm", r"\.webm(?:[?#]|$)", "WEBM", "WebM Video", "full", 4),
+        ("mp3", r"\.mp3(?:[?#]|$)", "MP3", "MP3 Audio", "audio", 5),
+        ("aac", r"\.aac(?:[?#]|$)", "AAC", "AAC Audio", "audio", 5),
+    ]
+
+    @classmethod
+    def _classify(cls, url: str) -> Tuple[str, str, str, str, int]:
+        """(key, fmt, quality, stream_type, priority) cho một URL media."""
+        lower = url.lower()
+        for key, pattern, fmt, quality, stype, prio in cls._KIND_RULES:
+            if re.search(pattern, lower):
+                return key, fmt, quality, stype, prio
+        return "other", "STREAM", "Media Stream", "full", 6
+
     def _build_streams(self, urls: List[str]) -> List[StreamFormat]:
         """Chuyển danh sách URL raw thành StreamFormat objects"""
         streams: List[StreamFormat] = []
         seen_types: set = set()
 
-        # Sắp xếp ưu tiên
-        def priority(u: str) -> int:
-            l = u.lower()
-            if ".m3u8" in l or "mpegurl" in l:
-                return 0
-            if ".mpd" in l or "dash" in l:
-                return 1
-            if ".mp4" in l:
-                return 2
-            if ".ts" in l or ".m4s" in l:
-                return 3
-            if ".webm" in l:
-                return 4
-            if ".mp3" in l or ".aac" in l or ".ogg" in l:
-                return 5
-            return 6
-
-        sorted_urls = sorted(urls, key=priority)
+        sorted_urls = sorted(urls, key=lambda u: self._classify(u)[4])
 
         for url in sorted_urls:
-            lower = url.lower()
-            if ".m3u8" in lower or "mpegurl" in lower:
-                fmt = "HLS"
-                quality = "HLS Stream (Chất lượng tốt nhất)"
-                stype = "full"
-                key = "hls"
-            elif ".mpd" in lower or "dash" in lower:
-                fmt = "DASH"
-                quality = "DASH Stream (Adaptive)"
-                stype = "full"
-                key = "dash"
-            elif ".mp4" in lower:
-                fmt = "MP4"
-                quality = "MP4 Video (Nguồn gốc)"
-                stype = "full"
-                key = "mp4"
-            elif ".ts" in lower:
-                fmt = "TS"
-                quality = "TS Segment Stream"
-                stype = "stream"
-                key = "ts"
-            elif ".m4s" in lower:
-                fmt = "M4S"
-                quality = "DASH Segment (M4S)"
-                stype = "stream"
-                key = "m4s"
-            elif ".webm" in lower:
-                fmt = "WEBM"
-                quality = "WebM Video"
-                stype = "full"
-                key = "webm"
-            elif ".mp3" in lower:
-                fmt = "MP3"
-                quality = "MP3 Audio"
-                stype = "audio"
-                key = "mp3"
-            elif ".aac" in lower:
-                fmt = "AAC"
-                quality = "AAC Audio"
-                stype = "audio"
-                key = "aac"
-            else:
-                fmt = "STREAM"
-                quality = "Media Stream"
-                stype = "full"
-                key = "other"
+            key, fmt, quality, stype, _ = self._classify(url)
 
             # Chỉ lấy 1 stream mỗi loại chính (hls, mp4, dash...)
             if key in seen_types and key not in ("ts", "m4s", "other"):

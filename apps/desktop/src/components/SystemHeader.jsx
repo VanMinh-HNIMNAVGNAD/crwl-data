@@ -19,6 +19,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
   const [cookieCount, setCookieCount] = useState(0)
   const browserDropdownRef = useRef(null)
   const toastTimer = useRef(null)
+  const autoPickedRef = useRef(Boolean(getActiveBrowser()))
 
   const showToast = (msg) => {
     setToastMsg(msg)
@@ -51,7 +52,8 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
         if (!active) return
         if (b?.browsers) {
           setBrowsersData(b)
-          if (!selectedBrowser) {
+          if (!autoPickedRef.current) {
+            autoPickedRef.current = true
             const detectedOne = b.browsers.find((item) => item.installed || item.detected)
             if (detectedOne) {
               setSelectedBrowser(detectedOne.id)
@@ -69,7 +71,14 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
     return () => {
       active = false
     }
-  }, [selectedBrowser, cookieRefreshKey])
+    // Cố tình KHÔNG phụ thuộc vào `selectedBrowser`: đổi trình duyệt không cần
+    // quét lại toàn bộ hệ thống, và việc tự động chọn lúc khởi động từng khiến
+    // effect chạy hai lần liên tiếp.
+  }, [cookieRefreshKey])
+
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+  }, [])
 
   const handleSelectFolder = async () => {
     try {

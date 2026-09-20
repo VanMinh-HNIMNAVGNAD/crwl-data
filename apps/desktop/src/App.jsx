@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import SystemHeader from './components/SystemHeader'
 import LinkDownloader from './components/LinkDownloader'
 import AccountDownloader from './components/AccountDownloader'
@@ -24,6 +24,10 @@ function App() {
       setToastMessage('')
     }, 3000)
   }
+
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+  }, [])
 
   const handleCookieUpdated = () => {
     setCookieRefreshKey((k) => k + 1)

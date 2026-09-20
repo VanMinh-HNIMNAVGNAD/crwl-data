@@ -3,7 +3,6 @@ mod commands;
 mod cookies;
 mod db;
 mod downloader;
-mod extractor;
 mod settings;
 mod sidecar;
 mod system;
@@ -40,15 +39,17 @@ pub fn run() {
             let cli_path = SidecarManager::find_cli_path(res_dir.as_ref())
                 .unwrap_or_else(|_| std::path::PathBuf::from("core/extractor_cli.py"));
 
-            // Khởi động Python Sidecar IPC worker
-            let sidecar = tauri::async_runtime::block_on(async {
-                SidecarManager::new(cli_path).await
+            // Khởi động Python Sidecar IPC worker ở NỀN. Trước đây dùng block_on
+            // nên cửa sổ chỉ hiện sau khi Python spawn xong; nếu Python lỗi/chậm
+            // thì người dùng nhìn màn hình trắng. send_request() đã tự chờ worker
+            // sẵn sàng nên việc hoãn khởi động là an toàn.
+            let sidecar = Arc::new(SidecarManager::new_idle(cli_path));
+            let sidecar_boot = Arc::clone(&sidecar);
+            tauri::async_runtime::spawn(async move {
+                sidecar_boot.start_worker().await;
             });
 
-            app.manage(AppState {
-                db,
-                sidecar: Arc::new(sidecar),
-            });
+            app.manage(AppState { db, sidecar });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -56,6 +57,10 @@ pub fn run() {
             commands::extract_media,
             commands::crawl_profile,
             commands::resolve_short_url,
+            // ── Python Sidecar lifecycle ──────────────────────────────────
+            commands::cancel_extraction,
+            commands::get_sidecar_status,
+            commands::restart_sidecar,
             // ── Downloads (yt-dlp native Rust) ────────────────────────────
             commands::start_download,
             commands::download_thumbnail,
@@ -68,7 +73,6 @@ pub fn run() {
             commands::get_download_history,
             commands::clear_download_history,
             // ── System ────────────────────────────────────────────────────
-            commands::get_system_health,
             commands::get_browsers_list,
             // ── Cookie Manager (native file) ──────────────────────────────
             commands::save_platform_cookies,

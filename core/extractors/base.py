@@ -11,6 +11,12 @@ import shutil
 import subprocess
 from typing import List, Optional, Tuple, Dict, Any
 
+from ..cancellation import (
+    raise_if_cancelled,
+    register_process,
+    unregister_process,
+)
+
 
 class BaseExtractor:
     """Lớp cơ sở cho các engine trích xuất"""
@@ -80,6 +86,9 @@ class BaseExtractor:
         else:
             popen_kwargs["start_new_session"] = True
 
+        # Đã bị huỷ trước khi kịp chạy thì đừng khởi động tiến trình nào nữa.
+        raise_if_cancelled()
+
         try:
             # Tạo process group riêng (CREATE_NEW_PROCESS_GROUP trên Windows, start_new_session trên POSIX) để kill cả nhóm khi timeout
             proc = subprocess.Popen(
@@ -91,8 +100,13 @@ class BaseExtractor:
                 env=merged_env,
                 **popen_kwargs,
             )
+            # Đăng ký để lệnh huỷ có thể kill cả nhóm tiến trình này.
+            register_process(proc)
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
+                # Tiến trình vừa kết thúc có thể vì BỊ KILL do huỷ, chứ không phải
+                # chạy xong. Ném RequestCancelled để dispatcher không thử engine kế tiếp.
+                raise_if_cancelled()
                 return proc.returncode, stdout, stderr
             except subprocess.TimeoutExpired:
                 self.warn(f"Command timed out ({timeout}s): {' '.join(cmd[:4])}...")
@@ -121,7 +135,10 @@ class BaseExtractor:
                     proc.communicate(timeout=3)
                 except Exception:
                     pass
+                raise_if_cancelled()
                 return -1, "", f"Timeout after {timeout} seconds"
+            finally:
+                unregister_process(proc)
         except Exception as e:
             self.error(f"Failed to run command: {e}")
             return -1, "", str(e)

@@ -75,9 +75,13 @@ class TikTokExtractor(BaseExtractor):
                 except Exception:
                     continue
 
+        # limit <= 0 nghĩa là "Tất cả". Trước đây `video_list[:0]` trả về rỗng nên
+        # lựa chọn "Tất cả" luôn làm TikTok embed resolver thất bại.
+        effective_limit = limit if limit and limit > 0 else len(video_list)
+
         # Tạo danh sách CrawlMediaItem
         media_entries: List[CrawlMediaItem] = []
-        for idx, item in enumerate(video_list[:limit], 1):
+        for idx, item in enumerate(video_list[:effective_limit], 1):
             vid_id = item.get("id") or str(idx)
             title = (item.get("desc") or "").strip() or None
             w = item.get("width")
@@ -102,7 +106,9 @@ class TikTokExtractor(BaseExtractor):
             )
 
         # Nếu cần nhiều hơn số item từ Embed (thường là 10), thử lấy secUid qua yt-dlp
-        if limit > len(media_entries) and video_list:
+        # Với "Tất cả", vẫn nên thử phân trang qua secUid để lấy quá 10 video của embed
+        want_more = (limit <= 0) or (limit > len(media_entries))
+        if want_more and video_list:
             sec_uid = None
             for item in video_list[:3]:
                 vid_id = item.get("id")
@@ -128,7 +134,7 @@ class TikTokExtractor(BaseExtractor):
                     "--ignore-errors",
                     "--flat-playlist",
                     "--playlist-end",
-                    str(limit),
+                    str(limit if limit and limit > 0 else 200),
                     "--print",
                     "%(id)s|||%(title)s|||%(thumbnail)s|||%(duration)s|||%(width)s|||%(height)s",
                     f"tiktokuser:{sec_uid}",
