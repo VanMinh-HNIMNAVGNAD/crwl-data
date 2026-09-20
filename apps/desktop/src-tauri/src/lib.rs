@@ -65,6 +65,7 @@ pub fn run() {
             commands::start_download,
             commands::download_thumbnail,
             commands::download_subtitle,
+            commands::cancel_download,
             // ── File System ───────────────────────────────────────────────
             commands::select_download_directory,
             commands::get_default_download_directory,

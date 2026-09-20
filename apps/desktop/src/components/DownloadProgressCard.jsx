@@ -50,12 +50,14 @@ export default function DownloadProgressCard({
   title,
   startTime,
   onDismiss,
+  onCancel,
   customStatusText,
 }) {
   const status = progress?.status
   const isDone = status === 'completed'
   const isError = status === 'error'
-  const isFinished = isDone || isError
+  const isCancelled = status === 'cancelled'
+  const isFinished = isDone || isError || isCancelled
 
   if (!progress && !customStatusText) return null
 
@@ -76,6 +78,8 @@ export default function DownloadProgressCard({
     customStatusText ||
     (isDone
       ? '✓ Tải hoàn tất thành công!'
+      : isCancelled
+      ? (progress?.message || '✕ Đã hủy tải xuống (toàn bộ tệp dở dang đã được xoá sạch)')
       : isError
       ? `✕ ${progress?.message || 'Có lỗi xảy ra trong quá trình tải'}`
       : // Ưu tiên mô tả thật do tiến trình tải gửi lên thay vì đoán theo phần trăm
@@ -83,12 +87,14 @@ export default function DownloadProgressCard({
         (isPreparing ? 'Đang lấy thông tin tệp...' : 'Đang nhận dữ liệu từ máy chủ...'))
 
   return (
-    <div className={`download-progress-card ${isDone ? 'is-completed' : ''} ${isError ? 'is-error' : ''}`}>
+    <div className={`download-progress-card ${isDone ? 'is-completed' : ''} ${isError ? 'is-error' : ''} ${isCancelled ? 'is-cancelled' : ''}`}>
       <div className="progress-card-header">
         <div className="progress-card-title-group">
           <div className="progress-status-icon">
             {isDone ? (
               <IconCheck className="w-4 h-4 text-emerald-400" />
+            ) : isCancelled ? (
+              <IconClose className="w-4 h-4 text-amber-400" />
             ) : isError ? (
               <IconClose className="w-4 h-4 text-rose-400" />
             ) : (
@@ -100,7 +106,7 @@ export default function DownloadProgressCard({
               {title ? (title.length > 50 ? `${title.slice(0, 48)}...` : title) : 'Đang xử lý tải xuống...'}
             </h4>
             <span className="progress-sub-status">{statusText}</span>
-            {isFinished && savedPath && (
+            {isFinished && savedPath && !isCancelled && (
               <span className="progress-saved-path" title={savedPath}>
                 {isError ? 'Tệp đã tải nằm tại: ' : 'Đã lưu tại: '}
                 {savedPath}
@@ -110,7 +116,18 @@ export default function DownloadProgressCard({
         </div>
 
         <div className="progress-card-actions">
-          {isFinished && savedPath && (
+          {!isFinished && onCancel && (
+            <button
+              type="button"
+              className="progress-card-cancel-btn"
+              onClick={onCancel}
+              title="Hủy tải xuống và xoá sạch tệp đang tải"
+            >
+              <IconClose className="w-3.5 h-3.5" />
+              <span>Hủy tải</span>
+            </button>
+          )}
+          {isFinished && savedPath && !isCancelled && (
             <button
               type="button"
               className="progress-open-folder-btn"
@@ -141,9 +158,9 @@ export default function DownloadProgressCard({
       <div className="progress-bar-container">
         <div
           className={`progress-bar-fill ${isDone ? 'done-fill' : ''} ${
-            isIndeterminate ? 'is-indeterminate' : ''
-          }`}
-          style={{ width: `${percent}%` }}
+            isCancelled ? 'cancelled-fill' : ''
+          } ${isIndeterminate ? 'is-indeterminate' : ''}`}
+          style={{ width: isCancelled ? '100%' : `${percent}%` }}
         />
       </div>
 
@@ -151,8 +168,8 @@ export default function DownloadProgressCard({
       <div className="progress-metrics-grid">
         <div className="progress-metric-item">
           <span className="metric-label">Tiến trình</span>
-          <strong className="metric-value text-blue-400">
-            {isIndeterminate ? '--' : `${percent.toFixed(1)}%`}
+          <strong className={`metric-value ${isCancelled ? 'text-amber-400' : 'text-blue-400'}`}>
+            {isCancelled ? 'Đã hủy' : isIndeterminate ? '--' : `${percent.toFixed(1)}%`}
           </strong>
         </div>
 

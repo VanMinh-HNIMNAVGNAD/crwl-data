@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use log::{info, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,7 @@ pub struct DownloadProgressPayload {
     pub percent: f64,
     pub speed: String,
     pub eta: String,
-    /// preparing | downloading | processing | completed | error
+    /// preparing | downloading | processing | completed | error | cancelled
     pub status: String,
     /// Mô tả bước đang chạy để UI hiển thị đúng thay vì đoán theo phần trăm
     pub phase: String,
@@ -124,6 +125,122 @@ pub struct DownloadResult {
     pub file_path: Option<String>,
     pub file_name: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug)]
+pub struct ActiveTaskState {
+    pub pids: Vec<u32>,
+    pub dest_dir: Option<PathBuf>,
+    pub known_paths: Vec<PathBuf>,
+    pub known_dirs: Vec<PathBuf>,
+    pub start_time: std::time::SystemTime,
+    pub cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+static DOWNLOAD_REGISTRY: OnceLock<AsyncMutex<HashMap<String, ActiveTaskState>>> = OnceLock::new();
+
+fn get_download_registry() -> &'static AsyncMutex<HashMap<String, ActiveTaskState>> {
+    DOWNLOAD_REGISTRY.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{pid}"))
+            .output();
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .output();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+    }
+}
+
+pub fn cleanup_task_files(
+    dest_dir: Option<&Path>,
+    known_paths: &[PathBuf],
+    known_dirs: &[PathBuf],
+    start_time: std::time::SystemTime,
+) {
+    // 1. Xoá toàn bộ các thư mục album / thư mục tạm đã đăng ký
+    for dir in known_dirs {
+        if dir.exists() {
+            info!("Hủy tải: Xoá thư mục album {:?}", dir);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    // 2. Xoá mọi file cụ thể đã được ghi nhận
+    let mut candidate_stems: Vec<String> = Vec::new();
+
+    for path in known_paths {
+        if path.exists() {
+            info!("Hủy tải: Xoá file đã biết {:?}", path);
+            let _ = std::fs::remove_file(path);
+        }
+        let part_file = PathBuf::from(format!("{}.part", path.display()));
+        if part_file.exists() {
+            let _ = std::fs::remove_file(&part_file);
+        }
+        let ytdl_file = PathBuf::from(format!("{}.ytdl", path.display()));
+        if ytdl_file.exists() {
+            let _ = std::fs::remove_file(&ytdl_file);
+        }
+        let aria2_file = PathBuf::from(format!("{}.aria2", path.display()));
+        if aria2_file.exists() {
+            let _ = std::fs::remove_file(&aria2_file);
+        }
+
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let clean_stem = if let Some(idx) = stem.rfind(".f") {
+                &stem[..idx]
+            } else {
+                stem
+            };
+            if !clean_stem.is_empty() && !candidate_stems.contains(&clean_stem.to_string()) {
+                candidate_stems.push(clean_stem.to_string());
+            }
+        }
+    }
+
+    // 3. Quét dest_dir để dọn sạch bất kỳ tệp dở dang nào
+    if let Some(dir) = dest_dir {
+        if dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if !entry_path.is_file() {
+                        continue;
+                    }
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+
+                    let matches_stem = candidate_stems.iter().any(|st| file_name.starts_with(st));
+
+                    let is_partial_ext = file_name.ends_with(".part")
+                        || file_name.ends_with(".ytdl")
+                        || file_name.ends_with(".aria2")
+                        || file_name.ends_with(".temp");
+
+                    let is_recent = entry.metadata().ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| t >= start_time.checked_sub(std::time::Duration::from_secs(5)).unwrap_or(start_time))
+                        .unwrap_or(false);
+
+                    if matches_stem || (is_partial_ext && is_recent) {
+                        info!("Hủy tải: Xoá tệp tạm/dở dang trong thư mục {:?}", entry_path);
+                        let _ = std::fs::remove_file(&entry_path);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct DownloaderService;
@@ -249,6 +366,90 @@ impl DownloaderService {
             return Some("tumblr");
         }
         None
+    }
+
+    pub async fn register_task(
+        task_id: &str,
+        dest_dir: Option<PathBuf>,
+        cancel_tx: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut reg = get_download_registry().lock().await;
+        reg.insert(
+            task_id.to_string(),
+            ActiveTaskState {
+                pids: Vec::new(),
+                dest_dir,
+                known_paths: Vec::new(),
+                known_dirs: Vec::new(),
+                start_time: std::time::SystemTime::now(),
+                cancel_tx: Some(cancel_tx),
+            },
+        );
+    }
+
+    pub async fn register_pid(task_id: &str, pid: u32) {
+        let mut reg = get_download_registry().lock().await;
+        if let Some(state) = reg.get_mut(task_id) {
+            if !state.pids.contains(&pid) {
+                state.pids.push(pid);
+            }
+        }
+    }
+
+    pub async fn record_file_path(task_id: &str, path: PathBuf) {
+        let mut reg = get_download_registry().lock().await;
+        if let Some(state) = reg.get_mut(task_id) {
+            if !state.known_paths.contains(&path) {
+                state.known_paths.push(path);
+            }
+        }
+    }
+
+    pub async fn record_dir_path(task_id: &str, path: PathBuf) {
+        let mut reg = get_download_registry().lock().await;
+        if let Some(state) = reg.get_mut(task_id) {
+            if !state.known_dirs.contains(&path) {
+                state.known_dirs.push(path);
+            }
+        }
+    }
+
+    pub async fn unregister_task(task_id: &str) {
+        let mut reg = get_download_registry().lock().await;
+        reg.remove(task_id);
+    }
+
+    pub async fn cancel_download(task_id: &str) -> Result<bool, String> {
+        info!("Yêu cầu hủy tác vụ tải xuống: {task_id}");
+        let mut reg = get_download_registry().lock().await;
+        let matching_keys: Vec<String> = reg
+            .keys()
+            .filter(|k| *k == task_id || k.starts_with(&format!("{task_id}_")))
+            .cloned()
+            .collect();
+
+        if matching_keys.is_empty() {
+            warn!("Không tìm thấy tác vụ [{task_id}] để hủy (có thể đã hoàn tất hoặc chưa bắt đầu)");
+            return Ok(false);
+        }
+
+        for key in matching_keys {
+            if let Some(mut state) = reg.remove(&key) {
+                if let Some(tx) = state.cancel_tx.take() {
+                    let _ = tx.send(());
+                }
+                for pid in &state.pids {
+                    kill_process_tree(*pid);
+                }
+                cleanup_task_files(
+                    state.dest_dir.as_deref(),
+                    &state.known_paths,
+                    &state.known_dirs,
+                    state.start_time,
+                );
+            }
+        }
+        Ok(true)
     }
 
     /// Thực thi tiến trình tải xuống bằng yt-dlp và stream % tiến trình về UI
@@ -491,6 +692,11 @@ impl DownloaderService {
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        cmd.kill_on_drop(true);
 
         // Mã tác vụ: UI lọc sự kiện tiến trình theo mã này nên nhiều tệp tải
         // song song không còn ghi đè lên nhau trên cùng một thanh tiến trình.
@@ -500,8 +706,22 @@ impl DownloaderService {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        Self::register_task(&task_id, Some(dest_folder.clone()), cancel_tx).await;
+        let start_time = std::time::SystemTime::now();
+
         info!("Bắt đầu tải tệp với yt-dlp [{task_id}]: {}", opts.url);
-        let mut child = cmd.spawn().map_err(|e| format!("Không thể khởi chạy yt-dlp: {e}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                Self::unregister_task(&task_id).await;
+                return Err(format!("Không thể khởi chạy yt-dlp: {e}"));
+            }
+        };
+
+        if let Some(pid) = child.id() {
+            Self::register_pid(&task_id, pid).await;
+        }
 
         let stdout = child.stdout.take().ok_or("Không thể đọc stdout của yt-dlp")?;
         let stderr = child.stderr.take().ok_or("Không thể đọc stderr của yt-dlp")?;
@@ -561,146 +781,232 @@ impl DownloaderService {
         let mut current_format: Option<String> = None;
         let mut downloaded_file_path: Option<String> = None;
         let mut printed_final_path: Option<String> = None;
+        let mut is_cancelled = false;
 
         // Tối đa 96% dành cho giai đoạn tải, 4% còn lại cho ghép/hậu xử lý
         const DOWNLOAD_SHARE: f64 = 96.0;
 
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(rest) = line.strip_prefix("download-progress:") {
-                let parts: Vec<&str> = rest.split('|').collect();
-                let percent_str = parts.first().copied().unwrap_or("").trim();
-                // yt-dlp trả "Unknown B/s" / "Unknown" lúc mới khởi động — đừng
-                // hiển thị nguyên văn, để UI tự rơi về dấu "--".
-                let clean = |v: &str| {
-                    let t = v.trim();
-                    if t.is_empty() || t.starts_with("Unknown") || t == "N/A" || t == "NA" {
-                        String::new()
-                    } else {
-                        t.to_string()
-                    }
-                };
-                let speed = clean(parts.get(1).copied().unwrap_or(""));
-                let eta = clean(parts.get(2).copied().unwrap_or(""));
-                let format_id = parts.get(3).copied().unwrap_or("").trim().to_string();
-
-                // Đổi format_id nghĩa là yt-dlp đã chuyển sang lượt tải kế tiếp
-                if !format_id.is_empty() && format_id != "NA" {
-                    match current_format {
-                        Some(ref f) if f == &format_id => {}
-                        Some(_) => {
-                            pass_index = (pass_index + 1).min(expected_passes.saturating_sub(1));
-                            current_format = Some(format_id.clone());
+        loop {
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    info!("Nhận được lệnh hủy tác vụ yt-dlp [{task_id}]");
+                    is_cancelled = true;
+                    break;
+                }
+                line_res = reader.next_line() => {
+                    let line = match line_res {
+                        Ok(Some(l)) => l,
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!("Lỗi đọc stdout của yt-dlp: {e}");
+                            break;
                         }
-                        None => current_format = Some(format_id.clone()),
+                    };
+
+                    if let Some(rest) = line.strip_prefix("download-progress:") {
+                        let parts: Vec<&str> = rest.split('|').collect();
+                        let percent_str = parts.first().copied().unwrap_or("").trim();
+                        let clean = |v: &str| {
+                            let t = v.trim();
+                            if t.is_empty() || t.starts_with("Unknown") || t == "N/A" || t == "NA" {
+                                String::new()
+                            } else {
+                                t.to_string()
+                            }
+                        };
+                        let speed = clean(parts.get(1).copied().unwrap_or(""));
+                        let eta = clean(parts.get(2).copied().unwrap_or(""));
+                        let format_id = parts.get(3).copied().unwrap_or("").trim().to_string();
+
+                        // Đổi format_id nghĩa là yt-dlp đã chuyển sang lượt tải kế tiếp
+                        if !format_id.is_empty() && format_id != "NA" {
+                            match current_format {
+                                Some(ref f) if f == &format_id => {}
+                                Some(_) => {
+                                    pass_index = (pass_index + 1).min(expected_passes.saturating_sub(1));
+                                    current_format = Some(format_id.clone());
+                                }
+                                None => current_format = Some(format_id.clone()),
+                            }
+                        }
+
+                        let pass_percent = percent_regex
+                            .captures(percent_str)
+                            .and_then(|c| c.get(1))
+                            .and_then(|m| m.as_str().parse::<f64>().ok())
+                            .unwrap_or(0.0)
+                            .clamp(0.0, 100.0);
+
+                        let raw = Self::weighted_percent(pass_index, expected_passes, pass_percent);
+                        overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
+
+                        let phase = if expected_passes > 1 {
+                            format!("Đang tải luồng {}/{}", pass_index + 1, expected_passes)
+                        } else {
+                            "Đang tải dữ liệu".to_string()
+                        };
+
+                        progress_emit(DownloadProgressPayload {
+                            id: task_id.clone(),
+                            percent: overall_percent,
+                            speed,
+                            eta,
+                            status: "downloading".to_string(),
+                            phase,
+                            file_path: None,
+                            message: None,
+                            is_indeterminate: false,
+                        });
+                        continue;
+                    }
+
+                    if let Some(n) = Self::parse_expected_passes(&formats_regex, &line) {
+                        expected_passes = n;
+                        pass_index = 0;
+                        continue;
+                    }
+
+                    if let Some(rest) = line.strip_prefix("[download] Destination: ") {
+                        let path_str = rest.trim().trim_matches('"').to_string();
+                        Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
+                        downloaded_file_path = Some(path_str);
+                        continue;
+                    }
+
+                    if let Some(rest) = line.strip_prefix("[ExtractAudio] Destination: ") {
+                        let path_str = rest.trim().trim_matches('"').to_string();
+                        Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
+                        downloaded_file_path = Some(path_str);
+                        continue;
+                    }
+
+                    if let Some(rest) = line.strip_prefix("[Merger] Merging formats into ") {
+                        let path_str = rest.trim().trim_matches('"').to_string();
+                        Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
+                        downloaded_file_path = Some(path_str);
+                        overall_percent = overall_percent.max(DOWNLOAD_SHARE);
+                        progress_emit(DownloadProgressPayload {
+                            id: task_id.clone(),
+                            percent: overall_percent,
+                            speed: String::new(),
+                            eta: String::new(),
+                            status: "processing".to_string(),
+                            phase: "Đang ghép hình và tiếng qua FFmpeg...".to_string(),
+                            file_path: None,
+                            message: None,
+                            is_indeterminate: opts.use_aria2c,
+                        });
+                        continue;
+                    }
+
+                    // Các bước hậu xử lý còn lại — báo đúng trạng thái thay vì đoán theo %
+                    if let Some(phase) = Self::postprocess_phase(&line) {
+                        overall_percent = overall_percent.max(DOWNLOAD_SHARE);
+                        progress_emit(DownloadProgressPayload {
+                            id: task_id.clone(),
+                            percent: overall_percent,
+                            speed: String::new(),
+                            eta: String::new(),
+                            status: "processing".to_string(),
+                            phase: phase.to_string(),
+                            file_path: None,
+                            message: None,
+                            is_indeterminate: opts.use_aria2c,
+                        });
+                        continue;
+                    }
+
+                    if line.contains("Writing video thumbnail")
+                        || line.contains("Writing video subtitles to:")
+                        || line.contains("[Thumbnails] Writing thumbnail to:")
+                    {
+                        if let Some(pos) = line.rfind(": ") {
+                            let path = line[pos + 2..].trim().trim_matches('"').to_string();
+                            if !path.is_empty() {
+                                Self::record_file_path(&task_id, PathBuf::from(&path)).await;
+                                downloaded_file_path = Some(path);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Dòng trần còn lại là kết quả của `--print after_move:filepath`,
+                    // tức đường dẫn cuối cùng sau khi đã merge/remux xong.
+                    let candidate = line.trim().trim_matches('"');
+                    if !candidate.is_empty() && Path::new(candidate).is_absolute() {
+                        Self::record_file_path(&task_id, PathBuf::from(candidate)).await;
+                        printed_final_path = Some(candidate.to_string());
                     }
                 }
-
-                let pass_percent = percent_regex
-                    .captures(percent_str)
-                    .and_then(|c| c.get(1))
-                    .and_then(|m| m.as_str().parse::<f64>().ok())
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 100.0);
-
-                let raw = Self::weighted_percent(pass_index, expected_passes, pass_percent);
-                overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
-
-                let phase = if expected_passes > 1 {
-                    format!("Đang tải luồng {}/{}", pass_index + 1, expected_passes)
-                } else {
-                    "Đang tải dữ liệu".to_string()
-                };
-
-                progress_emit(DownloadProgressPayload {
-                    id: task_id.clone(),
-                    percent: overall_percent,
-                    speed,
-                    eta,
-                    status: "downloading".to_string(),
-                    phase,
-                    file_path: None,
-                    message: None,
-                    is_indeterminate: false,
-                });
-                continue;
-            }
-
-            if let Some(n) = Self::parse_expected_passes(&formats_regex, &line) {
-                expected_passes = n;
-                pass_index = 0;
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("[download] Destination: ") {
-                downloaded_file_path = Some(rest.trim().trim_matches('"').to_string());
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("[ExtractAudio] Destination: ") {
-                downloaded_file_path = Some(rest.trim().trim_matches('"').to_string());
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("[Merger] Merging formats into ") {
-                downloaded_file_path = Some(rest.trim().trim_matches('"').to_string());
-                overall_percent = overall_percent.max(DOWNLOAD_SHARE);
-                progress_emit(DownloadProgressPayload {
-                    id: task_id.clone(),
-                    percent: overall_percent,
-                    speed: String::new(),
-                    eta: String::new(),
-                    status: "processing".to_string(),
-                    phase: "Đang ghép hình và tiếng qua FFmpeg...".to_string(),
-                    file_path: None,
-                    message: None,
-                    is_indeterminate: opts.use_aria2c,
-                });
-                continue;
-            }
-
-            // Các bước hậu xử lý còn lại — báo đúng trạng thái thay vì đoán theo %
-            if let Some(phase) = Self::postprocess_phase(&line) {
-                overall_percent = overall_percent.max(DOWNLOAD_SHARE);
-                progress_emit(DownloadProgressPayload {
-                    id: task_id.clone(),
-                    percent: overall_percent,
-                    speed: String::new(),
-                    eta: String::new(),
-                    status: "processing".to_string(),
-                    phase: phase.to_string(),
-                    file_path: None,
-                    message: None,
-                    is_indeterminate: opts.use_aria2c,
-                });
-                continue;
-            }
-
-            if line.contains("Writing video thumbnail")
-                || line.contains("Writing video subtitles to:")
-                || line.contains("[Thumbnails] Writing thumbnail to:")
-            {
-                if let Some(pos) = line.rfind(": ") {
-                    let path = line[pos + 2..].trim().trim_matches('"').to_string();
-                    if !path.is_empty() {
-                        downloaded_file_path = Some(path);
-                    }
-                }
-                continue;
-            }
-
-            // Dòng trần còn lại là kết quả của `--print after_move:filepath`,
-            // tức đường dẫn cuối cùng sau khi đã merge/remux xong.
-            let candidate = line.trim().trim_matches('"');
-            if !candidate.is_empty() && Path::new(candidate).is_absolute() {
-                printed_final_path = Some(candidate.to_string());
             }
         }
 
-        let status = child.wait().await.map_err(|e| format!("Lỗi chờ yt-dlp: {e}"))?;
+        let status = if is_cancelled {
+            None
+        } else {
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    is_cancelled = true;
+                    None
+                }
+                res = child.wait() => {
+                    Some(res.map_err(|e| format!("Lỗi chờ yt-dlp: {e}"))?)
+                }
+            }
+        };
+
+        if is_cancelled {
+            info!("Hủy tác vụ tải yt-dlp [{task_id}], dừng tiến trình và xoá sạch tệp dở dang...");
+            if let Some(pid) = child.id() {
+                kill_process_tree(pid);
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stderr_task.await;
+
+            let mut known = Vec::new();
+            if let Some(ref p) = downloaded_file_path {
+                known.push(PathBuf::from(p));
+            }
+            if let Some(ref p) = printed_final_path {
+                known.push(PathBuf::from(p));
+            }
+            cleanup_task_files(Some(&dest_folder), &known, &[], start_time);
+
+            progress_emit(DownloadProgressPayload {
+                id: task_id.clone(),
+                percent: 0.0,
+                speed: String::new(),
+                eta: String::new(),
+                status: "cancelled".to_string(),
+                phase: "Đã hủy tải xuống".to_string(),
+                file_path: None,
+                message: Some("Đã hủy tải xuống và xoá sạch tệp dở dang".to_string()),
+                is_indeterminate: false,
+            });
+
+            db.record_download_history(
+                &opts.device_id,
+                opts.title.as_deref().unwrap_or("Untitled"),
+                "cancelled_download",
+                "auto",
+                None,
+                None,
+                "cancelled",
+                Some("Người dùng đã hủy tải xuống"),
+                opts.client_ip.as_deref(),
+            ).await;
+
+            Self::unregister_task(&task_id).await;
+            return Err("Tác vụ tải đã bị hủy".to_string());
+        }
+
+        let status = status.unwrap();
         let _ = stderr_task.await;
         let collected_stderr = stderr_lines.lock().await.clone();
 
         if !status.success() {
+            Self::unregister_task(&task_id).await;
             // Báo đúng nguyên nhân từ yt-dlp thay vì một câu chung chung
             let detail = Self::summarize_ytdlp_error(&collected_stderr);
             let err_msg = if detail.is_empty() {
@@ -773,6 +1079,8 @@ impl DownloaderService {
             None,
             opts.client_ip.as_deref(),
         ).await;
+
+        Self::unregister_task(&task_id).await;
 
         Ok(DownloadResult {
             success: true,
@@ -898,6 +1206,7 @@ impl DownloaderService {
         dest_dir: Option<&str>,
         device_id: &str,
         client_ip: Option<&str>,
+        task_id: Option<String>,
         db: Arc<Database>,
     ) -> Result<DownloadResult, String> {
         let dest_folder = dest_dir
@@ -920,9 +1229,38 @@ impl DownloaderService {
         );
         let referer_header = Self::get_referer_for_url(url, referer);
 
+        let mut cancel_rx_opt = None;
+        if let Some(ref tid) = task_id {
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            Self::register_task(tid, Some(dest_folder.clone()), cancel_tx).await;
+            Self::record_file_path(tid, target_path.clone()).await;
+            cancel_rx_opt = Some(cancel_rx);
+        }
+
         info!("Đang tải tệp trực tiếp qua curl: {url} -> {:?}", target_path);
-        let (ok, content_type) = Self::curl_to_file_with_meta(url, &referer_header, &target_path).await;
+        let curl_fut = Self::curl_to_file_with_meta(url, &referer_header, &target_path);
+        let (ok, content_type) = if let Some(mut cancel_rx) = cancel_rx_opt {
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    info!("Hủy tải tệp trực tiếp: Xoá {:?}", target_path);
+                    if target_path.exists() {
+                        let _ = std::fs::remove_file(&target_path);
+                    }
+                    if let Some(ref tid) = task_id {
+                        Self::unregister_task(tid).await;
+                    }
+                    return Err("Tác vụ tải tệp đã bị người dùng hủy và tệp tạm đã được xoá sạch".to_string());
+                }
+                res = curl_fut => res,
+            }
+        } else {
+            curl_fut.await
+        };
+
         if !ok {
+            if let Some(ref tid) = task_id {
+                Self::unregister_task(tid).await;
+            }
             return Err(
                 "Tải tệp thất bại — liên kết có thể đã hết hạn hoặc bị chặn. Hãy quét lại rồi thử."
                     .to_string(),
@@ -961,6 +1299,10 @@ impl DownloaderService {
             None,
             client_ip,
         ).await;
+
+        if let Some(ref tid) = task_id {
+            Self::unregister_task(tid).await;
+        }
 
         Ok(DownloadResult {
             success: true,
@@ -1034,6 +1376,10 @@ impl DownloaderService {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        Self::register_task(&task_id, Some(base_dest.clone()), cancel_tx).await;
+        Self::record_dir_path(&task_id, target_dir.clone()).await;
+
         let emit = |percent: f64, status: &str, phase: String, file_path: Option<String>| {
             let _ = app_handle.emit(
                 "download-progress",
@@ -1057,6 +1403,7 @@ impl DownloaderService {
 
         if total == 0 {
             if !as_zip {
+                Self::unregister_task(&task_id).await;
                 let dir_str = target_dir.to_string_lossy().to_string();
                 return Ok(DownloadResult {
                     success: true,
@@ -1075,6 +1422,7 @@ impl DownloaderService {
             }
 
             if downloaded_files.is_empty() {
+                Self::unregister_task(&task_id).await;
                 return Err("Danh sách tệp cần tải đang trống".to_string());
             }
         } else {
@@ -1154,21 +1502,41 @@ impl DownloaderService {
                 }));
             }
 
-            for handle in handles {
-                if let Ok(Some(path)) = handle.await {
-                    downloaded_files.push(path);
+            let mut is_cancelled = false;
+            for mut handle in handles {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        is_cancelled = true;
+                        break;
+                    }
+                    res = &mut handle => {
+                        if let Ok(Some(path)) = res {
+                            downloaded_files.push(path);
+                        }
+                        let done = completed.load(std::sync::atomic::Ordering::SeqCst);
+                        let percent = (done as f64 / total as f64) * if as_zip { 90.0 } else { 100.0 };
+                        emit(
+                            percent,
+                            "downloading",
+                            format!("Đã tải {done}/{total} tệp"),
+                            None,
+                        );
+                    }
                 }
-                let done = completed.load(std::sync::atomic::Ordering::SeqCst);
-                let percent = (done as f64 / total as f64) * if as_zip { 90.0 } else { 100.0 };
-                emit(
-                    percent,
-                    "downloading",
-                    format!("Đã tải {done}/{total} tệp"),
-                    None,
-                );
+            }
+
+            if is_cancelled {
+                info!("Hủy album batch: Xoá sạch thư mục {:?}", target_dir);
+                if target_dir.exists() {
+                    let _ = tokio::fs::remove_dir_all(&target_dir).await;
+                }
+                emit(0.0, "cancelled", "Đã hủy tải album và xoá tệp".to_string(), None);
+                Self::unregister_task(&task_id).await;
+                return Err("Tác vụ tải album đã bị người dùng hủy và tệp tạm đã được xoá".to_string());
             }
 
             if downloaded_files.is_empty() {
+                Self::unregister_task(&task_id).await;
                 emit(0.0, "error", "Không tải được tệp nào".to_string(), None);
                 return Err(format!(
                     "Không tải được tệp nào trong {total} tệp. Liên kết có thể đã hết hạn — hãy quét lại tài khoản."
@@ -1196,6 +1564,8 @@ impl DownloaderService {
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| format!("{clean_title}.zip"));
 
+            Self::record_file_path(&task_id, zip_path.clone()).await;
+
             let target_dir_clone = target_dir.clone();
             let zip_path_clone = zip_path.clone();
 
@@ -1205,11 +1575,38 @@ impl DownloaderService {
                     let _ = std::fs::remove_file(&zip_path_clone);
                 }
                 res
-            })
-            .await;
+            });
 
-            match zip_status {
-                Ok(Ok(())) => {
+            let mut zip_cancelled = false;
+            let zip_res = tokio::select! {
+                _ = &mut cancel_rx => {
+                    zip_cancelled = true;
+                    Err("Cancelled".to_string())
+                }
+                res = zip_status => {
+                    match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(err)) => Err(err),
+                        Err(join_err) => Err(format!("tiến trình nén bị gián đoạn: {join_err}")),
+                    }
+                }
+            };
+
+            if zip_cancelled {
+                info!("Hủy nén ZIP album: Xoá tệp ZIP và thư mục {:?}", target_dir);
+                if zip_path.exists() {
+                    let _ = std::fs::remove_file(&zip_path);
+                }
+                if target_dir.exists() {
+                    let _ = tokio::fs::remove_dir_all(&target_dir).await;
+                }
+                emit(0.0, "cancelled", "Đã hủy nén ZIP và xoá tệp".to_string(), None);
+                Self::unregister_task(&task_id).await;
+                return Err("Tác vụ nén ZIP đã bị người dùng hủy và tệp tạm đã được xoá".to_string());
+            }
+
+            match zip_res {
+                Ok(()) => {
                     let zip_size = zip_path.metadata().map(|m| m.len() as i64).ok();
                     let zip_str = zip_path.to_string_lossy().to_string();
 
@@ -1229,6 +1626,7 @@ impl DownloaderService {
                     ).await;
 
                     emit(100.0, "completed", "Hoàn tất".to_string(), Some(zip_str.clone()));
+                    Self::unregister_task(&task_id).await;
 
                     return Ok(DownloadResult {
                         success: true,
@@ -1237,13 +1635,9 @@ impl DownloaderService {
                         message: Self::batch_summary(downloaded_files.len(), failed, "vào tệp ZIP"),
                     });
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     warn!("Nén ZIP thất bại: {err} — giữ nguyên thư mục ảnh đã tải");
                     zip_error = Some(err);
-                }
-                Err(join_err) => {
-                    warn!("Tiến trình nén ZIP bị gián đoạn: {join_err} — giữ nguyên thư mục ảnh đã tải");
-                    zip_error = Some(format!("tiến trình nén bị gián đoạn: {join_err}"));
                 }
             }
         }
@@ -1285,6 +1679,8 @@ impl DownloaderService {
                 },
             );
 
+            Self::unregister_task(&task_id).await;
+
             return Ok(DownloadResult {
                 success: false,
                 file_path: Some(dir_str),
@@ -1306,6 +1702,7 @@ impl DownloaderService {
         ).await;
 
         emit(100.0, "completed", "Hoàn tất".to_string(), Some(dir_str.clone()));
+        Self::unregister_task(&task_id).await;
 
         Ok(DownloadResult {
             success: true,
@@ -2822,5 +3219,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         println!("TEST #2: PASS");
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_registry_and_partial_cleanup() {
+        let temp_dir = std::env::temp_dir().join(format!("test_cancel_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let partial_file = temp_dir.join("sample_video.mp4.part");
+        let ytdl_file = temp_dir.join("sample_video.mp4.ytdl");
+        let direct_file = temp_dir.join("direct_download.jpg");
+        let album_dir = temp_dir.join("Album_Test");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        let album_inner = album_dir.join("photo_1.jpg");
+
+        std::fs::write(&partial_file, b"partial video bytes").unwrap();
+        std::fs::write(&ytdl_file, b"ytdl metadata").unwrap();
+        std::fs::write(&direct_file, b"jpeg bytes").unwrap();
+        std::fs::write(&album_inner, b"album inner bytes").unwrap();
+
+        assert!(partial_file.exists());
+        assert!(ytdl_file.exists());
+        assert!(direct_file.exists());
+        assert!(album_inner.exists());
+
+        let task_id = format!("task_test_cleanup_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
+        let _state = D::register_task(
+            &task_id,
+            Some(temp_dir.clone()),
+            cancel_tx,
+        ).await;
+
+        D::record_file_path(&task_id, direct_file.clone()).await;
+        D::record_dir_path(&task_id, album_dir.clone()).await;
+
+        // Cancel the task
+        let cancelled = D::cancel_download(&task_id).await.unwrap();
+        assert!(cancelled, "cancel_download should return true for registered task");
+
+        // Verify that partial files, known files, and album dirs are wiped clean
+        assert!(!partial_file.exists(), ".part file must be deleted");
+        assert!(!ytdl_file.exists(), ".ytdl file must be deleted");
+        assert!(!direct_file.exists(), "direct file must be deleted");
+        assert!(!album_dir.exists(), "album directory must be deleted");
+
+        // Clean up temp dir
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_batch_prefix_matching() {
+        let temp_dir = std::env::temp_dir().join(format!("test_cancel_prefix_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let parent_id = format!("batch_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let sub1_id = format!("{}_vid_0", parent_id);
+        let sub2_id = format!("{}_vid_1", parent_id);
+
+        let sub1_file = temp_dir.join("video_1.mp4.part");
+        let sub2_file = temp_dir.join("video_2.mp4.part");
+        std::fs::write(&sub1_file, b"sub 1 bytes").unwrap();
+        std::fs::write(&sub2_file, b"sub 2 bytes").unwrap();
+
+        let (cancel_tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (cancel_tx2, _rx2) = tokio::sync::oneshot::channel();
+        D::register_task(&sub1_id, Some(temp_dir.clone()), cancel_tx1).await;
+        D::register_task(&sub2_id, Some(temp_dir.clone()), cancel_tx2).await;
+
+        // Cancelling by parent_id should match and cancel all subtasks
+        let cancelled = D::cancel_download(&parent_id).await.unwrap();
+        assert!(cancelled, "Cancelling parent batch id must succeed");
+
+        assert!(!sub1_file.exists(), "sub1 .part file must be deleted");
+        assert!(!sub2_file.exists(), "sub2 .part file must be deleted");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

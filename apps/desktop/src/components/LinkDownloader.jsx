@@ -15,6 +15,7 @@ import { VIDEO_CONTAINER_OPTIONS, detectPlatform, validatePlatformUrl, getPlatfo
 import {
   extractMedia,
   cancelExtraction,
+  cancelDownload,
   resolveShortUrl,
   startNativeDownload,
   createTaskId,
@@ -124,6 +125,7 @@ export default function LinkDownloader({ onShowToast }) {
   const [isZipDownloading, setIsZipDownloading] = useState(false)
   const cancelRef = useRef(false)         // chặn xử lý kết quả sau khi đã hủy
   const activeExtractTaskRef = useRef(null) // task đang chạy, để huỷ thật ở backend
+  const currentDownloadTaskIdRef = useRef(null) // task download đang chạy, để huỷ và dọn dẹp tệp
   const [isCancelling, setIsCancelling] = useState(false)
 
   // Trimmer tool state
@@ -346,6 +348,31 @@ export default function LinkDownloader({ onShowToast }) {
     onShowToast?.('Đã hủy giải mã.')
   }
 
+  // Hủy tải xuống hiện tại và xoá sạch tệp dở dang
+  const handleCancelDownload = async () => {
+    const taskId = currentDownloadTaskIdRef.current
+    if (!taskId) return
+    try {
+      await cancelDownload(taskId)
+      setNativeProgress({
+        id: taskId,
+        percent: 0,
+        speed: '',
+        eta: '',
+        status: 'cancelled',
+        phase: 'Đã hủy tải xuống',
+        message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
+      })
+      onShowToast?.('Đã hủy tải và dọn dẹp tệp dở dang')
+    } catch (err) {
+      console.error('Cancel download error:', err)
+    } finally {
+      currentDownloadTaskIdRef.current = null
+      setDownloadingId(null)
+      setIsZipDownloading(false)
+    }
+  }
+
   // Tải stream video/audio đơn
   const handleDownloadStream = async (stream, media = singleMedia) => {
     if (!media) return
@@ -371,6 +398,7 @@ export default function LinkDownloader({ onShowToast }) {
     }
 
     const taskId = createTaskId()
+    currentDownloadTaskIdRef.current = taskId
     setDownloadTaskTitle(media.title || stream.quality || 'Video')
     setNativeProgress({
       id: taskId,
@@ -440,20 +468,38 @@ export default function LinkDownloader({ onShowToast }) {
       }
     } catch (err) {
       const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải stream'
-      setNativeProgress({
-        id: taskId,
-        percent: 0,
-        speed: '',
-        eta: '',
-        status: 'error',
-        phase: 'Tải thất bại',
-        message: errMsg,
-      })
-      onShowToast?.(errMsg)
+      if (errMsg.includes('cancelled') || errMsg.includes('hủy') || errMsg.includes('abort')) {
+        setNativeProgress({
+          id: taskId,
+          percent: 0,
+          speed: '',
+          eta: '',
+          status: 'cancelled',
+          phase: 'Đã hủy tải xuống',
+          message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
+        })
+      } else {
+        setNativeProgress((prev) => {
+          if (prev?.status === 'cancelled') return prev
+          return {
+            id: taskId,
+            percent: 0,
+            speed: '',
+            eta: '',
+            status: 'error',
+            phase: 'Tải thất bại',
+            message: errMsg,
+          }
+        })
+        onShowToast?.(errMsg)
+      }
     } finally {
       // Gỡ listener trong mọi trường hợp — trước đây khi tải lỗi listener bị rò rỉ,
       // tích lũy dần và làm thanh tiến trình nhảy loạn ở các lần tải sau.
       if (typeof unlisten === 'function') unlisten()
+      if (currentDownloadTaskIdRef.current === taskId) {
+        currentDownloadTaskIdRef.current = null
+      }
       setDownloadingId(null)
     }
   }
@@ -496,21 +542,95 @@ export default function LinkDownloader({ onShowToast }) {
 
   // Tải ảnh album đơn lẻ
   const handleDownloadImage = async (img) => {
+    let targetDir = undefined
+    if (alwaysAskDir) {
+      try {
+        targetDir = await selectDownloadDirectory()
+        if (!targetDir) {
+          onShowToast?.('Đã hủy tải do chưa chọn thư mục lưu')
+          return
+        }
+      } catch (err) {
+        console.warn('Lỗi chọn thư mục:', err)
+      }
+    }
+
+    const taskId = createTaskId()
+    currentDownloadTaskIdRef.current = taskId
+    setDownloadTaskTitle(img.title || 'Ảnh')
+    setNativeProgress({
+      id: taskId,
+      percent: 0,
+      speed: '',
+      eta: '',
+      status: 'downloading',
+      phase: 'Đang tải ảnh...',
+    })
+
+    let unlisten = null
     try {
+      try {
+        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+      } catch (e) {
+        console.warn('Cannot attach progress listener:', e)
+      }
+
       const generated = generateBatchMediaFilenames([img], singleMedia?.originalUrl)
       const filename = generated[0]?.filename || `${sanitizeFilenamePart(img.title || 'photo')}.${img.ext || 'jpg'}`
       onShowToast?.(`Đang tải ảnh: ${filename}...`)
       const res = await downloadDirectFile({
         url: img.url,
         filename,
+        destDir: targetDir,
         referer: singleMedia?.originalUrl,
         platform: singleMedia?.platform,
+        taskId,
       })
       if (res?.file_name) {
+        setNativeProgress({
+          id: taskId,
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'completed',
+          phase: 'Hoàn tất',
+          filePath: res.file_path,
+          fileName: res.file_name,
+        })
         onShowToast?.(`Đã lưu: ${res.file_name}`)
       }
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải ảnh')
+      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải ảnh'
+      if (errMsg.includes('cancelled') || errMsg.includes('hủy') || errMsg.includes('abort')) {
+        setNativeProgress({
+          id: taskId,
+          percent: 0,
+          speed: '',
+          eta: '',
+          status: 'cancelled',
+          phase: 'Đã hủy tải xuống',
+          message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
+        })
+      } else {
+        setNativeProgress((prev) => {
+          if (prev?.status === 'cancelled') return prev
+          return {
+            id: taskId,
+            percent: 0,
+            speed: '',
+            eta: '',
+            status: 'error',
+            phase: 'Tải thất bại',
+            message: errMsg,
+          }
+        })
+        onShowToast?.(errMsg)
+      }
+    } finally {
+      if (typeof unlisten === 'function') unlisten()
+      if (currentDownloadTaskIdRef.current === taskId) {
+        currentDownloadTaskIdRef.current = null
+      }
     }
   }
 
@@ -553,6 +673,7 @@ export default function LinkDownloader({ onShowToast }) {
     }
 
     const taskId = createTaskId()
+    currentDownloadTaskIdRef.current = taskId
     setIsZipDownloading(true)
     setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} ảnh`)
     setNativeProgress({
@@ -616,18 +737,36 @@ export default function LinkDownloader({ onShowToast }) {
       onShowToast?.(res?.message || (res?.file_path ? `Đã lưu tại: ${res.file_path}` : `Đã tải xong ${itemsToDownload.length} ảnh!`))
     } catch (err) {
       const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải album'
-      setNativeProgress({
-        id: taskId,
-        percent: 0,
-        speed: '',
-        eta: '',
-        status: 'error',
-        phase: 'Tải thất bại',
-        message: errMsg,
-      })
-      onShowToast?.(errMsg)
+      if (errMsg.includes('cancelled') || errMsg.includes('hủy') || errMsg.includes('abort')) {
+        setNativeProgress({
+          id: taskId,
+          percent: 0,
+          speed: '',
+          eta: '',
+          status: 'cancelled',
+          phase: 'Đã hủy tải xuống',
+          message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
+        })
+      } else {
+        setNativeProgress((prev) => {
+          if (prev?.status === 'cancelled') return prev
+          return {
+            id: taskId,
+            percent: 0,
+            speed: '',
+            eta: '',
+            status: 'error',
+            phase: 'Tải thất bại',
+            message: errMsg,
+          }
+        })
+        onShowToast?.(errMsg)
+      }
     } finally {
       if (typeof unlisten === 'function') unlisten()
+      if (currentDownloadTaskIdRef.current === taskId) {
+        currentDownloadTaskIdRef.current = null
+      }
       setIsZipDownloading(false)
     }
   }
@@ -1059,6 +1198,7 @@ export default function LinkDownloader({ onShowToast }) {
               <DownloadProgressCard
                 progress={nativeProgress}
                 title={downloadTaskTitle}
+                onCancel={handleCancelDownload}
                 onDismiss={() => setNativeProgress(null)}
               />
             )}
@@ -1325,6 +1465,7 @@ export default function LinkDownloader({ onShowToast }) {
               <DownloadProgressCard
                 progress={nativeProgress}
                 title={downloadTaskTitle}
+                onCancel={handleCancelDownload}
                 onDismiss={() => setNativeProgress(null)}
               />
             )}

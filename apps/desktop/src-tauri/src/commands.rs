@@ -177,6 +177,7 @@ pub async fn download_thumbnail(
     title: Option<String>,
     browser: Option<String>,
     device_id: Option<String>,
+    task_id: Option<String>,
 ) -> Result<DownloadResult, String> {
     let opts = DownloadOptions {
         url,
@@ -184,6 +185,7 @@ pub async fn download_thumbnail(
         title,
         browser,
         device_id: device_id.unwrap_or_default(),
+        task_id,
         ..Default::default()
     };
     DownloaderService::start_download(app, Arc::clone(&state.db), opts).await
@@ -203,6 +205,7 @@ pub async fn download_subtitle(
     title: Option<String>,
     browser: Option<String>,
     device_id: Option<String>,
+    task_id: Option<String>,
 ) -> Result<DownloadResult, String> {
     let opts = DownloadOptions {
         url,
@@ -210,6 +213,7 @@ pub async fn download_subtitle(
         title,
         browser,
         device_id: device_id.unwrap_or_default(),
+        task_id,
         ..Default::default()
     };
     DownloaderService::start_download(app, Arc::clone(&state.db), opts).await
@@ -326,6 +330,7 @@ pub async fn download_direct_file(
     referer: Option<String>,
     dest_dir: Option<String>,
     device_id: Option<String>,
+    task_id: Option<String>,
     client_ip: Option<String>,
 ) -> Result<DownloadResult, String> {
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
@@ -336,6 +341,7 @@ pub async fn download_direct_file(
         dest_dir.as_deref(),
         &dev_id,
         client_ip.as_deref(),
+        task_id,
         Arc::clone(&state.db),
     ).await
 }
@@ -366,4 +372,10 @@ pub async fn download_album_batch(
         client_ip.as_deref(),
         Arc::clone(&state.db),
     ).await
+}
+
+/// Hủy một tác vụ tải xuống đang chạy (yt-dlp, curl, nén zip) và dọn dẹp sạch sẽ toàn bộ tệp tạm.
+#[tauri::command]
+pub async fn cancel_download(task_id: String) -> Result<bool, String> {
+    DownloaderService::cancel_download(&task_id).await
 }

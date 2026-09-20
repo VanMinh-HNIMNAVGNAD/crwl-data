@@ -182,6 +182,20 @@ export async function cancelExtraction(taskId) {
   }
 }
 
+/**
+ * Huỷ tác vụ tải xuống đang chạy (video, audio, ảnh, album ZIP).
+ * Lệnh này kill toàn bộ tiến trình con (yt-dlp, ffmpeg, curl) và xoá sạch 100% tệp tạm dở dang.
+ */
+export async function cancelDownload(taskId) {
+  if (!taskId) return false
+  try {
+    return await invoke('cancel_download', { taskId })
+  } catch (err) {
+    console.warn('Không gửi được lệnh huỷ tải:', err)
+    return false
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Native Downloads (Video / Audio / Thumbnail / Subtitle)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,7 +275,7 @@ export async function startNativeDownload({
 /**
  * Tải ảnh bìa (thumbnail) — thay thế /api/media/download/thumbnail
  */
-export async function downloadThumbnail({ url, title, browser = null }) {
+export async function downloadThumbnail({ url, title, browser = null, taskId = null }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
   try {
     return await invoke('download_thumbnail', {
@@ -269,6 +283,7 @@ export async function downloadThumbnail({ url, title, browser = null }) {
       title: title || null,
       browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
       deviceId: getDeviceId(),
+      taskId: taskId || null,
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải thumbnail', { cause: err })
@@ -278,7 +293,7 @@ export async function downloadThumbnail({ url, title, browser = null }) {
 /**
  * Tải phụ đề (subtitle) — thay thế /api/media/download/subtitle
  */
-export async function downloadSubtitle({ url, lang, format = 'vtt', title, browser = null }) {
+export async function downloadSubtitle({ url, lang, format = 'vtt', title, browser = null, taskId = null }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
   try {
     return await invoke('download_subtitle', {
@@ -288,6 +303,7 @@ export async function downloadSubtitle({ url, lang, format = 'vtt', title, brows
       title: title || null,
       browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
       deviceId: getDeviceId(),
+      taskId: taskId || null,
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải phụ đề', { cause: err })
@@ -432,7 +448,7 @@ export async function deletePlatformCookies(platform = null) {
 /**
  * Tải một tệp ảnh trực tiếp về thư mục Downloads với header chống chặn 403
  */
-export async function downloadDirectFile({ url, filename, referer, destDir, platform = null }) {
+export async function downloadDirectFile({ url, filename, referer, destDir, taskId = null, platform = null }) {
   const customDir = destDir || getCustomDownloadDir() || null
 
   try {
@@ -442,6 +458,7 @@ export async function downloadDirectFile({ url, filename, referer, destDir, plat
       referer: referer || null,
       destDir: customDir,
       deviceId: getDeviceId(),
+      taskId: taskId || null,
       platform: platform || null,
     })
   } catch (err) {
