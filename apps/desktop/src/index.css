@@ -122,3 +122,14 @@ svg {
 .text-slate-400 { color: #94a3b8; }
 .text-white { color: #ffffff; }
 
+
+.btn-success {
+  background-color: var(--accent-success) !important;
+  color: #ffffff !important;
+  border-color: #059669 !important;
+}
+
+.btn-success:hover:not(:disabled) {
+  background-color: #059669 !important;
+}
+

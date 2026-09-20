@@ -659,6 +659,21 @@ export default function LinkDownloader({ onShowToast }) {
       return
     }
 
+    let customAlbumName = `${singleMedia?.title || 'Album'}_Media`
+    if (asZip) {
+      const promptResult = window.prompt(
+        'Tên file quá dài có thể gây lỗi nén ZIP. Nhập tên file ZIP bạn muốn (để trống sẽ dùng tên mặc định):',
+        customAlbumName
+      )
+      if (promptResult === null) {
+        // Người dùng ấn Cancel
+        return
+      }
+      if (promptResult.trim() !== '') {
+        customAlbumName = promptResult.trim()
+      }
+    }
+
     let targetDir = undefined
     if (alwaysAskDir) {
       try {
@@ -702,7 +717,7 @@ export default function LinkDownloader({ onShowToast }) {
       )
       const res = await downloadAlbumBatch({
         items: itemsPayload,
-        albumName: `${singleMedia?.title || 'Album'}_Media`,
+        albumName: customAlbumName,
         destDir: targetDir,
         asZip: asZip,
         taskId,
@@ -1272,7 +1287,7 @@ export default function LinkDownloader({ onShowToast }) {
                       <>
                         <button
                           type="button"
-                          className="minimal-small-btn"
+                          className="minimal-small-btn btn-success"
                           onClick={() => handleDownloadAlbum(false)}
                           disabled={isZipDownloading}
                           title="Tải ảnh trực tiếp vào một thư mục riêng biệt"
@@ -1281,7 +1296,7 @@ export default function LinkDownloader({ onShowToast }) {
                         </button>
                         <button
                           type="button"
-                          className="minimal-small-btn"
+                          className="minimal-small-btn btn-success"
                           onClick={() => handleDownloadAlbum(true)}
                           disabled={isZipDownloading}
                           title="Đóng gói toàn bộ ảnh đã chọn thành file nén ZIP"
@@ -1421,7 +1436,7 @@ export default function LinkDownloader({ onShowToast }) {
 
                         <button
                           type="button"
-                          className="stream-download-btn"
+                          className="stream-download-btn btn-success"
                           onClick={() => handleDownloadStream(stream)}
                           disabled={isCurrentDownloading}
                         >
@@ -1491,7 +1506,7 @@ export default function LinkDownloader({ onShowToast }) {
                   </div>
                   <button
                     type="button"
-                    className="minimal-small-btn"
+                    className="minimal-small-btn btn-success"
                     onClick={() => {
                       const topStream = m.streams?.[0] || { quality: 'Tự động' }
                       handleDownloadStream(topStream, m)

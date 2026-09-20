@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -138,9 +138,14 @@ pub struct ActiveTaskState {
 }
 
 static DOWNLOAD_REGISTRY: OnceLock<AsyncMutex<HashMap<String, ActiveTaskState>>> = OnceLock::new();
+static CANCELLED_DOWNLOADS: OnceLock<AsyncMutex<HashSet<String>>> = OnceLock::new();
 
 fn get_download_registry() -> &'static AsyncMutex<HashMap<String, ActiveTaskState>> {
     DOWNLOAD_REGISTRY.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+fn get_cancelled_downloads() -> &'static AsyncMutex<HashSet<String>> {
+    CANCELLED_DOWNLOADS.get_or_init(|| AsyncMutex::new(HashSet::new()))
 }
 
 fn kill_process_tree(pid: u32) {
@@ -373,6 +378,12 @@ impl DownloaderService {
         dest_dir: Option<PathBuf>,
         cancel_tx: tokio::sync::oneshot::Sender<()>,
     ) {
+        let already_cancelled = {
+            let cancelled = get_cancelled_downloads().lock().await;
+            cancelled.iter().any(|parent| {
+                task_id == parent || task_id.starts_with(&format!("{parent}_"))
+            })
+        };
         let mut reg = get_download_registry().lock().await;
         reg.insert(
             task_id.to_string(),
@@ -385,6 +396,20 @@ impl DownloaderService {
                 cancel_tx: Some(cancel_tx),
             },
         );
+        if already_cancelled {
+            if let Some(mut state) = reg.remove(task_id) {
+                if let Some(tx) = state.cancel_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    }
+
+    pub async fn is_download_cancelled(task_id: &str) -> bool {
+        let cancelled = get_cancelled_downloads().lock().await;
+        cancelled.iter().any(|parent| {
+            task_id == parent || task_id.starts_with(&format!("{parent}_"))
+        })
     }
 
     pub async fn register_pid(task_id: &str, pid: u32) {
@@ -421,6 +446,7 @@ impl DownloaderService {
 
     pub async fn cancel_download(task_id: &str) -> Result<bool, String> {
         info!("Yêu cầu hủy tác vụ tải xuống: {task_id}");
+        get_cancelled_downloads().lock().await.insert(task_id.to_string());
         let mut reg = get_download_registry().lock().await;
         let matching_keys: Vec<String> = reg
             .keys()
@@ -429,8 +455,8 @@ impl DownloaderService {
             .collect();
 
         if matching_keys.is_empty() {
-            warn!("Không tìm thấy tác vụ [{task_id}] để hủy (có thể đã hoàn tất hoặc chưa bắt đầu)");
-            return Ok(false);
+            info!("Đánh dấu hủy [{task_id}] trong lúc tác vụ đang khởi tạo");
+            return Ok(true);
         }
 
         for key in matching_keys {
@@ -469,9 +495,10 @@ impl DownloaderService {
             let _ = tokio::fs::create_dir_all(&dest_folder).await;
         }
 
-        // Định dạng tên file đầu ra: dest_folder/%(title)s [%(id)s].%(ext)s
+        // Giới hạn cả title và id ngay trong template: yt-dlp mở file trước khi
+        // backend có cơ hội đổi tên sau đó, nên chỉ sanitize ở Rust là chưa đủ.
         let output_template = dest_folder
-            .join("%(title).100s [%(id)s].%(ext)s")
+            .join("%(title).60s [%(id).50s].%(ext)s")
             .to_string_lossy()
             .to_string();
 
@@ -479,6 +506,7 @@ impl DownloaderService {
         cmd.arg(&opts.url);
         cmd.arg("-o").arg(&output_template);
         cmd.arg("--no-playlist");
+        cmd.arg("--trim-filenames").arg("140");
         cmd.arg("--newline");
         cmd.arg("--progress-template").arg(
             "download-progress:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.format_id)s",
@@ -708,6 +736,10 @@ impl DownloaderService {
 
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
         Self::register_task(&task_id, Some(dest_folder.clone()), cancel_tx).await;
+        if Self::is_download_cancelled(&task_id).await {
+            Self::unregister_task(&task_id).await;
+            return Err("Tác vụ tải đã bị hủy trong lúc khởi tạo".to_string());
+        }
         let start_time = std::time::SystemTime::now();
 
         info!("Bắt đầu tải tệp với yt-dlp [{task_id}]: {}", opts.url);
@@ -1503,13 +1535,13 @@ impl DownloaderService {
             }
 
             let mut is_cancelled = false;
-            for mut handle in handles {
+            for handle in handles.iter_mut() {
                 tokio::select! {
                     _ = &mut cancel_rx => {
                         is_cancelled = true;
                         break;
                     }
-                    res = &mut handle => {
+                    res = &mut *handle => {
                         if let Ok(Some(path)) = res {
                             downloaded_files.push(path);
                         }
@@ -1526,6 +1558,12 @@ impl DownloaderService {
             }
 
             if is_cancelled {
+                for handle in &mut handles {
+                    handle.abort();
+                }
+                for handle in handles {
+                    let _ = handle.await;
+                }
                 info!("Hủy album batch: Xoá sạch thư mục {:?}", target_dir);
                 if target_dir.exists() {
                     let _ = tokio::fs::remove_dir_all(&target_dir).await;
@@ -1722,6 +1760,7 @@ impl DownloaderService {
 
     /// Loại bỏ ký tự không hợp lệ trong tên tệp trên Linux và ngăn chặn path traversal
     pub fn sanitize_file_name(raw: &str, fallback: &str) -> String {
+        const MAX_FILENAME_BYTES: usize = 120;
         let cleaned: String = raw
             .replace(
                 [
@@ -1734,15 +1773,26 @@ impl DownloaderService {
             .trim_matches('.')
             .chars()
             .filter(|c| !c.is_control())
-            .take(120)
             .collect();
         let cleaned = cleaned.replace("..", "_");
         let trimmed = cleaned.trim().trim_matches('.');
         if trimmed.is_empty() {
-            fallback.to_string()
+            Self::truncate_utf8_bytes(fallback, MAX_FILENAME_BYTES)
         } else {
-            trimmed.to_string()
+            Self::truncate_utf8_bytes(trimmed, MAX_FILENAME_BYTES)
         }
+    }
+
+    fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+        if value.len() <= max_bytes {
+            return value.to_string();
+        }
+
+        let mut end = max_bytes;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value[..end].trim_end_matches('.').to_string()
     }
 
     /// Cấp phát đường dẫn đích duy nhất trong thư mục để tránh ghi đè (collision-free & race-safe)
@@ -2450,6 +2500,17 @@ mod tests {
         assert_eq!(D::sanitize_file_name("....", "fb"), "fb");
         assert_eq!(D::sanitize_file_name("../../etc/passwd", "fb"), "___etc_passwd");
         assert_eq!(D::sanitize_file_name("a\0b", "fb"), "a_b");
+    }
+
+    #[test]
+    fn long_utf8_file_names_are_truncated_by_bytes_without_breaking_characters() {
+        let name = "Ảnh mùa thu Việt Nam ".repeat(30);
+        let safe = D::sanitize_file_name(&name, "media");
+
+        assert!(safe.len() <= 120);
+        assert!(safe.is_char_boundary(safe.len()));
+        assert!(!safe.ends_with('.'));
+        assert!(!safe.is_empty());
     }
 
     #[tokio::test]
@@ -3295,5 +3356,26 @@ mod tests {
         assert!(!sub2_file.exists(), "sub2 .part file must be deleted");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_catches_late_subtask_registration() {
+        let parent_id = format!(
+            "late_cancel_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let child_id = format!("{parent_id}_vid_0");
+
+        // Hủy ngay trong khoảng task con chưa kịp đăng ký.
+        assert!(D::cancel_download(&parent_id).await.unwrap());
+
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        D::register_task(&child_id, None, cancel_tx).await;
+
+        assert!(D::is_download_cancelled(&child_id).await);
+        assert!(cancel_rx.try_recv().is_ok());
     }
 }

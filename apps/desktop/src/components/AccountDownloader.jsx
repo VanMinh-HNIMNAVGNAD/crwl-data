@@ -22,6 +22,16 @@ import {
 } from '../services/api'
 import DownloadProgressCard from './DownloadProgressCard'
 
+function safeMediaTitle(item, fallback = 'media') {
+  const raw = `${item?.title || fallback}_${item?.id || ''}`
+  const cleaned = raw
+    .replace(/[/\0\\:*?"<>|;&$!`\n\r\t]/g, '_')
+    .replace(/\.{2,}/g, '_')
+    .trim()
+    .replace(/^\.+|\.+$/g, '')
+  return Array.from(cleaned || fallback).slice(0, 80).join('') || fallback
+}
+
 export default function AccountDownloader({ onShowToast }) {
   const [accountInput, setAccountInput] = useState('')
   const [selectedPlatform, setSelectedPlatform] = useState('auto')
@@ -232,7 +242,7 @@ export default function AccountDownloader({ onShowToast }) {
         // Ảnh là liên kết CDN trực tiếp — tải thẳng, không cần cho qua yt-dlp
         res = await downloadDirectFile({
           url: item.url,
-          filename: item.title || 'image',
+          filename: safeMediaTitle(item, 'image'),
           referer: profileResult?.url,
           destDir: targetDir,
           platform: profileResult?.platform || item.platform,
@@ -241,7 +251,7 @@ export default function AccountDownloader({ onShowToast }) {
       } else {
         res = await startNativeDownload({
           url: item.url,
-          title: item.title,
+          title: safeMediaTitle(item),
           destDir: targetDir,
           taskId,
           platform: profileResult?.platform || item.platform,
@@ -318,6 +328,21 @@ export default function AccountDownloader({ onShowToast }) {
       return
     }
 
+    let customAlbumName = `${profileResult?.username || 'Profile'}_Media`
+    if (asZip) {
+      const promptResult = window.prompt(
+        'Tên file quá dài có thể gây lỗi nén ZIP. Nhập tên file ZIP bạn muốn (để trống sẽ dùng tên mặc định):',
+        customAlbumName
+      )
+      if (promptResult === null) {
+        // Người dùng ấn Cancel
+        return
+      }
+      if (promptResult.trim() !== '') {
+        customAlbumName = promptResult.trim()
+      }
+    }
+
     let targetDir = undefined
     if (getAlwaysAskDownloadDir()) {
       try {
@@ -335,7 +360,7 @@ export default function AccountDownloader({ onShowToast }) {
     const videoItems = itemsToDownload.filter((it) => it.type === 'video')
     const imageItems = itemsToDownload.filter((it) => it.type !== 'video')
 
-    const albumName = `Profile_${profileResult?.name || 'Media'}`
+    const albumName = customAlbumName
     const taskId = createTaskId()
     currentDownloadTaskIdRef.current = taskId
     setIsZipDownloading(true)
@@ -364,7 +389,7 @@ export default function AccountDownloader({ onShowToast }) {
 
         const zipPayload = imageItems.map((it) => ({
           url: it.url,
-          filename: `${it.title || 'media'}_${it.id}`,
+          filename: safeMediaTitle(it),
           referer: profileResult?.url,
         }))
 
@@ -477,47 +502,70 @@ export default function AccountDownloader({ onShowToast }) {
       let lastVideoRes = null
       if (videoItems.length > 0) {
         const videoDestDir = albumFolder || targetDir
-        for (let i = 0; i < videoItems.length; i++) {
-          if (isCancelledRef.current) break
-          const item = videoItems[i]
-          const vidTaskId = `${taskId}_vid_${i}`
+        const maxParallelVideos = 3
+        let nextVideoIndex = 0
+        let completedVideos = 0
+        const videoResults = new Array(videoItems.length)
+        const videoErrors = []
 
-          setNativeProgress({
-            id: vidTaskId,
-            percent: Math.round((i / videoItems.length) * 100),
-            speed: '',
-            eta: '',
-            status: 'downloading',
-            phase: `Đang tải video [${i + 1}/${videoItems.length}]...`,
-          })
+        const downloadNextVideo = async () => {
+          while (!isCancelledRef.current) {
+            const index = nextVideoIndex++
+            if (index >= videoItems.length) return
 
-          try {
-            unlisten = await onDownloadProgress((payload) => {
-              setNativeProgress({
-                ...payload,
-                id: vidTaskId,
-                phase: `Đang tải video [${i + 1}/${videoItems.length}]...`,
+            const item = videoItems[index]
+            const vidTaskId = `${taskId}_vid_${index}`
+            let videoUnlisten = null
+
+            try {
+              videoUnlisten = await onDownloadProgress((payload) => {
+                setNativeProgress({
+                  ...payload,
+                  id: vidTaskId,
+                  phase: `Đang tải video [${index + 1}/${videoItems.length}]...`,
+                })
+              }, vidTaskId)
+
+              videoResults[index] = await startNativeDownload({
+                url: item.url,
+                title: safeMediaTitle(item),
+                destDir: videoDestDir,
+                taskId: vidTaskId,
+                platform: profileResult?.platform || item.platform,
               })
-            }, vidTaskId)
-          } catch (e) {
-            console.warn('Cannot attach progress listener:', e)
-          }
-
-          try {
-            lastVideoRes = await startNativeDownload({
-              url: item.url,
-              title: item.title,
-              destDir: videoDestDir,
-              taskId: vidTaskId,
-              platform: profileResult?.platform || item.platform,
-            })
-          } finally {
-            if (typeof unlisten === 'function') {
-              unlisten()
-              unlisten = null
+            } catch (error) {
+              videoErrors.push(error)
+            } finally {
+              if (typeof videoUnlisten === 'function') videoUnlisten()
+              completedVideos++
+              setNativeProgress((prev) => ({
+                ...(prev || {}),
+                id: taskId,
+                percent: Math.round((completedVideos / videoItems.length) * 90),
+                status: 'downloading',
+                phase: `Đã tải ${completedVideos}/${videoItems.length} video`,
+              }))
             }
           }
         }
+
+        await Promise.all(
+          Array.from(
+            { length: Math.min(maxParallelVideos, videoItems.length) },
+            () => downloadNextVideo()
+          )
+        )
+
+        if (isCancelledRef.current) return
+        const failedVideo = videoResults.find((result) => result && !result.success)
+        if (failedVideo || videoErrors.length > 0) {
+          throw new Error(
+            failedVideo?.message ||
+              videoErrors[0]?.message ||
+              'Một hoặc nhiều video tải thất bại'
+          )
+        }
+        lastVideoRes = videoResults[videoResults.length - 1]
       }
 
       if (isCancelledRef.current) return
