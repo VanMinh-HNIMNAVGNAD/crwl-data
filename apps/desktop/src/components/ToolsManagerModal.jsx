@@ -15,6 +15,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
       if (data) setToolsData(data)
     } catch (err) {
       console.warn('Lỗi khi tải trạng thái công cụ:', err)
+      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải trạng thái công cụ')
     } finally {
       setLoading(false)
     }
@@ -28,7 +29,10 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
         if (active && data) setToolsData(data)
       })
       .catch((err) => {
-        console.warn('Lỗi khi tải trạng thái công cụ:', err)
+        if (active) {
+          console.warn('Lỗi khi tải trạng thái công cụ:', err)
+          onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải trạng thái công cụ')
+        }
       })
       .finally(() => {
         if (active) setLoading(false)

@@ -79,10 +79,11 @@ class TikTokExtractor(BaseExtractor):
         media_entries: List[CrawlMediaItem] = []
         for idx, item in enumerate(video_list[:limit], 1):
             vid_id = item.get("id") or str(idx)
-            title = (item.get("desc") or "").strip() or f"TikTok video by @{username} ({vid_id})"
-            w = item.get("width") or 576
-            h = item.get("height") or 1024
-            thumb = item.get("coverUrl") or item.get("originCoverUrl") or item.get("dynamicCoverUrl") or ""
+            title = (item.get("desc") or "").strip() or None
+            w = item.get("width")
+            h = item.get("height")
+            quality = f"{w}x{h}" if w and h else None
+            thumb = item.get("coverUrl") or item.get("originCoverUrl") or item.get("dynamicCoverUrl") or None
             play_url = item.get("playAddr") or f"https://www.tiktok.com/@{username}/video/{vid_id}"
 
             media_entries.append(
@@ -90,9 +91,9 @@ class TikTokExtractor(BaseExtractor):
                     id=idx,
                     type="video",
                     title=title,
-                    duration="Tự động",
-                    quality=f"{w}x{h}",
-                    size="Tự động",
+                    duration=None,
+                    quality=quality,
+                    size=None,
                     thumb=thumb,
                     url=play_url,
                     author=username,
@@ -139,11 +140,14 @@ class TikTokExtractor(BaseExtractor):
                     for i, l in enumerate(lines, 1):
                         parts = l.split("|||")
                         v_id = parts[0] if len(parts) > 0 else str(i)
-                        v_title = parts[1] if len(parts) > 1 and parts[1] else f"TikTok video by @{username}"
-                        v_thumb = parts[2] if len(parts) > 2 and parts[2] != "NA" else ""
-                        v_dur = parts[3] if len(parts) > 3 and parts[3] != "NA" else "Tự động"
-                        v_w = parts[4] if len(parts) > 4 and parts[4] != "NA" else "576"
-                        v_h = parts[5] if len(parts) > 5 and parts[5] != "NA" else "1024"
+                        v_title = parts[1] if len(parts) > 1 and parts[1] and parts[1] != "NA" else None
+                        v_thumb = parts[2] if len(parts) > 2 and parts[2] != "NA" else None
+                        dur_sec = parts[3] if len(parts) > 3 and parts[3] != "NA" else None
+                        from .ytdlp import YtDlpExtractor
+                        v_dur = YtDlpExtractor.format_duration(float(dur_sec)) if dur_sec and dur_sec.replace(".", "", 1).isdigit() else None
+                        v_w = parts[4] if len(parts) > 4 and parts[4] != "NA" else None
+                        v_h = parts[5] if len(parts) > 5 and parts[5] != "NA" else None
+                        v_quality = f"{v_w}x{v_h}" if v_w and v_h else None
 
                         more_entries.append(
                             CrawlMediaItem(
@@ -151,8 +155,8 @@ class TikTokExtractor(BaseExtractor):
                                 type="video",
                                 title=v_title,
                                 duration=v_dur,
-                                quality=f"{v_w}x{v_h}",
-                                size="Tự động",
+                                quality=v_quality,
+                                size=None,
                                 thumb=v_thumb,
                                 url=f"https://www.tiktok.com/@{username}/video/{v_id}",
                                 author=username,

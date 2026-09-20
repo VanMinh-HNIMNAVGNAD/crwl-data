@@ -95,7 +95,6 @@ impl CookieService {
         } else {
             Self::platform_to_domain(platform).to_string()
         };
-        let expiry = (chrono::Utc::now().timestamp() + 30 * 86400).to_string();
 
         // 2. Định dạng JSON (từ extension Cookie-Editor hoặc EditThisCookie)
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
@@ -117,9 +116,15 @@ impl CookieService {
                         let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("/");
                         let secure = if obj.get("secure").and_then(|v| v.as_bool()).unwrap_or(false) { "TRUE" } else { "FALSE" };
                         let item_exp = obj.get("expirationDate")
-                            .and_then(|v| v.as_i64())
+                            .and_then(|v| {
+                                if let Some(n) = v.as_f64() {
+                                    Some(n.trunc() as i64)
+                                } else {
+                                    v.as_i64()
+                                }
+                            })
                             .map(|e| e.to_string())
-                            .unwrap_or_else(|| expiry.clone());
+                            .unwrap_or_else(|| "0".to_string());
 
                         let is_domain = if domain.starts_with('.') { "TRUE" } else { "FALSE" };
                         lines.push(format!("{domain}\t{is_domain}\t{path}\t{secure}\t{item_exp}\t{name}\t{value}"));
@@ -150,7 +155,7 @@ impl CookieService {
                 let n = name.trim();
                 let v = val.trim();
                 if !n.is_empty() {
-                    lines.push(format!("{default_domain}\tTRUE\t/\tFALSE\t{expiry}\t{n}\t{v}"));
+                    lines.push(format!("{default_domain}\tTRUE\t/\tFALSE\t0\t{n}\t{v}"));
                     count += 1;
                 }
             }
@@ -582,6 +587,30 @@ mod tests {
         let empty_res = CookieService::save_cookies("pixiv.net", "   ");
         assert!(empty_res.is_err());
         assert!(empty_res.unwrap_err().contains("không được để trống"));
+    }
+
+    #[test]
+    fn test_cookie_expiry_semantics() {
+        // Test 1: persistent cookie + expirationDate
+        let json_persistent = r#"[{"name": "persist", "value": "1", "expirationDate": 1790000000}]"#;
+        let (out_persist, _) = CookieService::convert_to_netscape("test.com", json_persistent);
+        assert!(out_persist.contains("\t1790000000\tpersist\t1"));
+
+        // Test 1: session cookie + no expirationDate
+        let json_session = r#"[{"name": "sess", "value": "2"}]"#;
+        let (out_sess, _) = CookieService::convert_to_netscape("test.com", json_session);
+        assert!(out_sess.contains("\t0\tsess\t2"));
+        
+        // Test 1: expired cookie
+        let json_expired = r#"[{"name": "exp", "value": "3", "expirationDate": 1200000000}]"#;
+        let (out_exp, _) = CookieService::convert_to_netscape("test.com", json_expired);
+        assert!(out_exp.contains("\t1200000000\texp\t3"));
+        
+        // Test 1: cookie header string -> session cookie
+        let header_str = "cookie: sess=abc; another=123";
+        let (out_hdr, _) = CookieService::convert_to_netscape("test.com", header_str);
+        assert!(out_hdr.contains("\t0\tsess\tabc"));
+        assert!(out_hdr.contains("\t0\tanother\t123"));
     }
 }
 

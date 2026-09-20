@@ -30,17 +30,20 @@ function formatDate(isoStr) {
 
 export default function DownloadHistoryModal({ isOpen, onClose }) {
   const [data, setData] = useState(null)
+  const [error, setError] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
   const [isClearing, setIsClearing] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
 
   const loadHistory = async () => {
     setIsLoading(true)
+    setError(null)
     try {
       const res = await getDownloadHistory(50)
       setData(res)
     } catch (err) {
       console.error('Lỗi khi tải lịch sử:', err)
+      setError(err.message || 'Lỗi khi tải lịch sử')
     } finally {
       setIsLoading(false)
     }
@@ -59,19 +62,25 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
     }
   }
 
-  // Tự động tải dữ liệu khi mở modal
   useEffect(() => {
     let active = true
     if (isOpen) {
+      setIsLoading(true)
+      setError(null)
       getDownloadHistory(50)
         .then((res) => {
           if (active) {
             setConfirmClear(false)
             setData(res)
+            setIsLoading(false)
           }
         })
         .catch((err) => {
-          console.warn('Lỗi khi tải lịch sử:', err)
+          if (active) {
+            console.warn('Lỗi khi tải lịch sử:', err)
+            setError(err.message || 'Lỗi khi tải lịch sử')
+            setIsLoading(false)
+          }
         })
     }
     return () => {
@@ -203,10 +212,18 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
 
         {/* Nội dung danh sách */}
         <div className="history-modal-body">
-          {isLoading && !data ? (
+          {isLoading && !data && !error ? (
             <div className="history-empty-state">
               <span className="spinner-dots" />
               <p>Đang tải dữ liệu từ cơ sở dữ liệu...</p>
+            </div>
+          ) : error ? (
+            <div className="history-empty-state">
+              <div className="empty-icon-wrap">
+                <IconAlertCircle className="w-8 h-8 text-rose-500" />
+              </div>
+              <p className="empty-state-text text-rose-400">Không thể tải lịch sử</p>
+              <span className="empty-state-hint">{error}</span>
             </div>
           ) : items.length === 0 ? (
             <div className="history-empty-state">

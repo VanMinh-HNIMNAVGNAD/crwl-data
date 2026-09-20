@@ -10,10 +10,10 @@ from typing import List, Optional, Union, Dict, Any
 @dataclass
 class StreamFormat:
     format_id: str
-    quality: str
-    format: str
-    size: str
-    stream_type: str  # 'full' | 'mute' | 'audio' | 'stream' | 'muxed'
+    quality: Optional[str] = None
+    format: Optional[str] = None
+    size: Optional[str] = None
+    stream_type: str = "full"  # 'full' | 'mute' | 'audio' | 'stream' | 'muxed'
     raw_size: Optional[int] = None
     has_audio: Optional[bool] = None
     has_video: Optional[bool] = None
@@ -87,7 +87,7 @@ class ChapterItem:
 class MediaImage:
     id: Union[str, int]
     url: str
-    title: str
+    title: Optional[str] = None
     resolution: Optional[str] = None
     size: Optional[str] = None
     type: Optional[str] = "image"  # 'image' | 'video' | 'gif'
@@ -116,9 +116,9 @@ class MediaImage:
 class CrawlMediaItem:
     id: Union[str, int]
     type: str  # 'video' | 'image' | 'audio'
-    title: str
-    thumb: str
-    url: str
+    title: Optional[str] = None
+    thumb: Optional[str] = None
+    url: Optional[str] = None
     duration: Optional[str] = None
     quality: Optional[str] = None
     size: Optional[str] = None
@@ -165,14 +165,14 @@ class CrawlMediaItem:
 class MediaMetadata:
     id: str
     platform: str
-    title: str
-    author: str
-    author_url: str
-    duration: str
-    views: str
-    thumbnail: str
-    type: str  # 'video' | 'album' | 'audio' | 'playlist' | 'live'
-    original_url: str
+    title: Optional[str] = None
+    author: Optional[str] = None
+    author_url: Optional[str] = None
+    duration: Optional[str] = None
+    views: Optional[str] = None
+    thumbnail: Optional[str] = None
+    type: str = "video"  # 'video' | 'album' | 'audio' | 'playlist' | 'live'
+    original_url: str = ""
     likes: Optional[str] = None
     comments: Optional[str] = None
     high_res_thumbnail: Optional[str] = None
@@ -241,12 +241,12 @@ class MediaMetadata:
 @dataclass
 class ProfileCrawlResult:
     platform: str
-    name: str
-    handle: str
-    url: str
-    avatar: str
-    stats: str
-    media: List[CrawlMediaItem]
+    name: Optional[str] = None
+    handle: Optional[str] = None
+    url: str = ""
+    avatar: Optional[str] = None
+    stats: Optional[str] = None
+    media: List[CrawlMediaItem] = field(default_factory=list)
     total_count: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:

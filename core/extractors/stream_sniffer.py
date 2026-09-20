@@ -594,7 +594,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
                 key = "aac"
             else:
                 fmt = "STREAM"
-                quality = "Media Stream (Phát hiện tự động)"
+                quality = "Media Stream"
                 stype = "full"
                 key = "other"
 
@@ -606,9 +606,10 @@ class PlaywrightStreamSniffer(BaseExtractor):
             streams.append(
                 StreamFormat(
                     format_id=f"sniff_{key}_{len(streams)+1}",
-                    quality=f"🔍 {quality}",
+                    quality=quality,
                     format=fmt,
-                    size="Tự động (Stream)",
+                    size=None,
+                    raw_size=None,
                     stream_type=stype,
                     has_audio=stype != "mute",
                     has_video=stype not in ("audio",),

@@ -900,32 +900,47 @@ impl DownloaderService {
             let _ = tokio::fs::create_dir_all(&dest_folder).await;
         }
 
-        let ext = Self::guess_extension(url);
-        let clean_name = file_name
-            .map(|f| Self::sanitize_file_name(f, ""))
-            .filter(|f| !f.is_empty())
-            .map(|f| {
-                if Path::new(&f).extension().is_some() {
-                    f
-                } else {
-                    format!("{f}.{ext}")
-                }
-            })
-            .unwrap_or_else(|| format!("media_{}.{ext}", chrono::Utc::now().timestamp()));
+        let ext = Self::determine_extension(url, None);
+        let initial_name = Self::build_target_filename(url, file_name, None);
 
-        let target_path = dest_folder.join(&clean_name);
+        let mut reserved_paths = std::collections::HashSet::new();
+        let target_path = Self::resolve_collision_free_path(
+            &dest_folder,
+            &initial_name,
+            ext,
+            &mut reserved_paths,
+        );
         let referer_header = Self::get_referer_for_url(url, referer);
 
         info!("Đang tải tệp trực tiếp qua curl: {url} -> {:?}", target_path);
-        if !Self::curl_to_file(url, &referer_header, &target_path).await {
+        let (ok, content_type) = Self::curl_to_file_with_meta(url, &referer_header, &target_path).await;
+        if !ok {
             return Err(
                 "Tải tệp thất bại — liên kết có thể đã hết hạn hoặc bị chặn. Hãy quét lại rồi thử."
                     .to_string(),
             );
         }
 
-        let file_size = target_path.metadata().map(|m| m.len() as i64).ok();
-        let path_str = target_path.to_string_lossy().to_string();
+        // Priority 1: Nếu trước khi tải chưa có đuôi mở rộng, nhưng HTTP response trả về Content-Type cụ thể
+        let mut final_path = target_path;
+        if final_path.extension().is_none() {
+            if let Some(ct) = content_type.as_deref() {
+                if let Some(ct_ext) = Self::extension_from_content_type(ct) {
+                    let candidate = final_path.with_extension(ct_ext);
+                    if !candidate.exists() && std::fs::rename(&final_path, &candidate).is_ok() {
+                        final_path = candidate;
+                    }
+                }
+            }
+        }
+
+        let file_size = final_path.metadata().map(|m| m.len() as i64).ok();
+        let path_str = final_path.to_string_lossy().to_string();
+        let clean_name = final_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&initial_name)
+            .to_string();
 
         db.record_download_history(
             device_id,
@@ -977,11 +992,6 @@ impl DownloaderService {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let total = items.len();
-        if total == 0 {
-            return Err("Danh sách tệp cần tải đang trống".to_string());
-        }
-
         let emit = |percent: f64, status: &str, phase: String, file_path: Option<String>| {
             let _ = app_handle.emit(
                 "download-progress",
@@ -999,78 +1009,132 @@ impl DownloaderService {
             );
         };
 
-        emit(0.0, "downloading", format!("Chuẩn bị tải {total} tệp..."), None);
+        let total = items.len();
+        let mut downloaded_files = Vec::new();
+        let mut failed = 0;
 
-        // Tải song song có giới hạn. Trước đây các tệp tải tuần tự nên một album
-        // vài chục ảnh mất rất lâu và không hề có phản hồi tiến trình.
-        const MAX_PARALLEL: usize = 5;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
-        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut handles = Vec::with_capacity(total);
+        if total == 0 {
+            if !as_zip {
+                let dir_str = target_dir.to_string_lossy().to_string();
+                return Ok(DownloadResult {
+                    success: true,
+                    file_path: Some(dir_str),
+                    file_name: Some(clean_title),
+                    message: "Thư mục album đã sẵn sàng".to_string(),
+                });
+            }
 
-        for (idx, item) in items.into_iter().enumerate() {
-            let permit_src = Arc::clone(&semaphore);
-            let counter = Arc::clone(&completed);
-            let dir = target_dir.clone();
-            let album = clean_title.clone();
+            // as_zip = true: Thu thập các tệp đã có trong thư mục (ví dụ: video hoặc ảnh đã tải)
+            let walker = walkdir::WalkDir::new(&target_dir);
+            for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                if entry.file_type().is_file() {
+                    downloaded_files.push(entry.into_path());
+                }
+            }
 
-            handles.push(tokio::spawn(async move {
-                let _permit = match permit_src.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return None,
-                };
+            if downloaded_files.is_empty() {
+                return Err("Danh sách tệp cần tải đang trống".to_string());
+            }
+        } else {
+            emit(0.0, "downloading", format!("Chuẩn bị tải {total} tệp..."), None);
 
+            // Tải song song có giới hạn. Cấp phát trước đường dẫn độc nhất cho từng tệp
+            // để tránh race condition và ghi đè khi nhiều tệp có cùng tên hoặc chạy concurrent.
+            const MAX_PARALLEL: usize = 5;
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
+            let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut handles = Vec::with_capacity(total);
+
+            let mut reserved_paths = std::collections::HashSet::new();
+            let mut planned_items = Vec::with_capacity(total);
+
+            for (idx, item) in items.into_iter().enumerate() {
                 let ext = Self::guess_extension(&item.url);
                 let raw_fname = item.filename.as_deref().unwrap_or("");
-                let fname = if raw_fname.trim().is_empty() {
-                    format!("{album}_{:03}.{ext}", idx + 1)
+                let initial_fname = if raw_fname.trim().is_empty() {
+                    if !ext.is_empty() {
+                        format!("{clean_title}_{:03}.{ext}", idx + 1)
+                    } else {
+                        format!("{clean_title}_{:03}", idx + 1)
+                    }
                 } else {
                     let safe = Self::sanitize_file_name(raw_fname, &format!("media_{}", idx + 1));
                     // Chỉ bổ sung đuôi khi tên chưa có — không nối chồng thành "anh.jpg.heic"
                     if Path::new(&safe).extension().is_some() {
                         safe
-                    } else {
+                    } else if !ext.is_empty() {
                         format!("{safe}.{ext}")
+                    } else {
+                        safe
                     }
                 };
 
-                let dest_file = dir.join(&fname);
-                let referer_header = Self::get_referer_for_url(&item.url, item.referer.as_deref());
-
-                let ok = Self::curl_to_file(&item.url, &referer_header, &dest_file).await;
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if ok {
-                    Some(dest_file)
-                } else {
-                    warn!("Không tải được tệp album: {}", item.url);
-                    None
-                }
-            }));
-        }
-
-        let mut downloaded_files = Vec::new();
-        for handle in handles {
-            if let Ok(Some(path)) = handle.await {
-                downloaded_files.push(path);
+                let dest_file = Self::resolve_collision_free_path(
+                    &target_dir,
+                    &initial_fname,
+                    ext,
+                    &mut reserved_paths,
+                );
+                planned_items.push((item, dest_file));
             }
-            let done = completed.load(std::sync::atomic::Ordering::SeqCst);
-            let percent = (done as f64 / total as f64) * if as_zip { 90.0 } else { 100.0 };
-            emit(
-                percent,
-                "downloading",
-                format!("Đã tải {done}/{total} tệp"),
-                None,
-            );
-        }
 
-        if downloaded_files.is_empty() {
-            emit(0.0, "error", "Không tải được tệp nào".to_string(), None);
-            return Err(format!(
-                "Không tải được tệp nào trong {total} tệp. Liên kết có thể đã hết hạn — hãy quét lại tài khoản."
-            ));
-        }
+            for (item, dest_file) in planned_items {
+                let permit_src = Arc::clone(&semaphore);
+                let counter = Arc::clone(&completed);
 
-        let failed = total - downloaded_files.len();
+                handles.push(tokio::spawn(async move {
+                    let _permit = match permit_src.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return None,
+                    };
+
+                    let referer_header = Self::get_referer_for_url(&item.url, item.referer.as_deref());
+
+                    let (ok, content_type) = Self::curl_to_file_with_meta(&item.url, &referer_header, &dest_file).await;
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if ok {
+                        let mut final_dest = dest_file;
+                        if final_dest.extension().is_none() {
+                            if let Some(ct) = content_type.as_deref() {
+                                if let Some(ct_ext) = Self::extension_from_content_type(ct) {
+                                    let candidate = final_dest.with_extension(ct_ext);
+                                    if !candidate.exists() && std::fs::rename(&final_dest, &candidate).is_ok() {
+                                        final_dest = candidate;
+                                    }
+                                }
+                            }
+                        }
+                        Some(final_dest)
+                    } else {
+                        warn!("Không tải được tệp album: {}", item.url);
+                        None
+                    }
+                }));
+            }
+
+            for handle in handles {
+                if let Ok(Some(path)) = handle.await {
+                    downloaded_files.push(path);
+                }
+                let done = completed.load(std::sync::atomic::Ordering::SeqCst);
+                let percent = (done as f64 / total as f64) * if as_zip { 90.0 } else { 100.0 };
+                emit(
+                    percent,
+                    "downloading",
+                    format!("Đã tải {done}/{total} tệp"),
+                    None,
+                );
+            }
+
+            if downloaded_files.is_empty() {
+                emit(0.0, "error", "Không tải được tệp nào".to_string(), None);
+                return Err(format!(
+                    "Không tải được tệp nào trong {total} tệp. Liên kết có thể đã hết hạn — hãy quét lại tài khoản."
+                ));
+            }
+
+            failed = total - downloaded_files.len();
+        }
 
         if as_zip {
             emit(93.0, "processing", "Đang nén thành tệp ZIP...".to_string(), None);
@@ -1158,55 +1222,532 @@ impl DownloaderService {
         }
     }
 
-    /// Loại bỏ ký tự không hợp lệ trong tên tệp trên Linux
-    fn sanitize_file_name(raw: &str, fallback: &str) -> String {
+    /// Loại bỏ ký tự không hợp lệ trong tên tệp trên Linux và ngăn chặn path traversal
+    pub fn sanitize_file_name(raw: &str, fallback: &str) -> String {
         let cleaned: String = raw
-            .replace(['/', '\\', '?', '%', '*', ':', '|', '"', '<', '>', '\n', '\r', '\t'], "_")
+            .replace(
+                [
+                    '/', '\\', '\0', '?', '%', '*', ':', '|', '"', '<', '>', '\n', '\r', '\t',
+                    ';', '&', '$', '`', '!',
+                ],
+                "_",
+            )
             .trim()
             .trim_matches('.')
             .chars()
+            .filter(|c| !c.is_control())
             .take(120)
             .collect();
-        if cleaned.is_empty() {
+        let cleaned = cleaned.replace("..", "_");
+        let trimmed = cleaned.trim().trim_matches('.');
+        if trimmed.is_empty() {
             fallback.to_string()
         } else {
-            cleaned
+            trimmed.to_string()
         }
     }
 
-    /// Đoán phần mở rộng THẬT của tệp sẽ nhận được.
+    /// Cấp phát đường dẫn đích duy nhất trong thư mục để tránh ghi đè (collision-free & race-safe)
+    /// - Không path traversal (chỉ dùng filename)
+    /// - Không ghi đè file có sẵn trên đĩa hoặc file đã được cấp phát trong cùng batch
+    /// - Nếu trùng tên, tự động đánh số _1, _2, ... trước phần mở rộng
+    pub fn resolve_collision_free_path(
+        dir: &Path,
+        initial_fname: &str,
+        default_ext: &str,
+        reserved_paths: &mut std::collections::HashSet<PathBuf>,
+    ) -> PathBuf {
+        let file_name_only = Path::new(initial_fname)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(initial_fname);
+
+        let safe_name = Self::sanitize_file_name(file_name_only, "media");
+        let p = Path::new(&safe_name);
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("media");
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or(default_ext);
+
+        let initial_cand = if !ext.is_empty() {
+            format!("{stem}.{ext}")
+        } else {
+            stem.to_string()
+        };
+        let mut cand_path = dir.join(&initial_cand);
+
+        if !reserved_paths.contains(&cand_path) && !cand_path.exists() {
+            reserved_paths.insert(cand_path.clone());
+            return cand_path;
+        }
+
+        let mut counter = 1;
+        loop {
+            let next_cand = if !ext.is_empty() {
+                format!("{stem}_{counter}.{ext}")
+            } else {
+                format!("{stem}_{counter}")
+            };
+            cand_path = dir.join(&next_cand);
+            if !reserved_paths.contains(&cand_path) && !cand_path.exists() {
+                reserved_paths.insert(cand_path.clone());
+                return cand_path;
+            }
+            counter += 1;
+        }
+    }
+
+    /// Ánh xạ Content-Type HTTP sang phần mở rộng tệp tương ứng
+    pub fn extension_from_content_type(content_type: &str) -> Option<&'static str> {
+        let mime = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+
+        match mime.as_str() {
+            "image/jpeg" => Some("jpg"),
+            "image/png" => Some("png"),
+            "image/webp" => Some("webp"),
+            "image/avif" => Some("avif"),
+            "image/gif" => Some("gif"),
+            "image/svg+xml" => Some("svg"),
+            "image/heic" | "image/heif" => Some("heic"),
+            "image/bmp" | "image/x-ms-bmp" => Some("bmp"),
+            "image/tiff" => Some("tiff"),
+            "video/mp4" => Some("mp4"),
+            "video/webm" => Some("webm"),
+            "video/quicktime" => Some("mov"),
+            "video/x-matroska" => Some("mkv"),
+            "video/x-m4v" => Some("m4v"),
+            "video/mp2t" => Some("ts"),
+            "video/iso.segment" => Some("m4s"),
+            "application/vnd.apple.mpegurl" | "application/x-mpegurl" | "audio/x-mpegurl" => Some("m3u8"),
+            "application/dash+xml" => Some("mpd"),
+            "audio/mpeg" | "audio/mp3" => Some("mp3"),
+            "audio/mp4" | "audio/x-m4a" => Some("m4a"),
+            "audio/ogg" | "application/ogg" => Some("ogg"),
+            "audio/wav" | "audio/x-wav" => Some("wav"),
+            "audio/flac" | "audio/x-flac" => Some("flac"),
+            "audio/aac" => Some("aac"),
+            _ => None,
+        }
+    }
+
+    /// Xác định phần mở rộng theo thứ tự ưu tiên:
+    /// 1. Content-Type nếu đã có từ HTTP response
+    /// 2. URL extension nếu đáng tin cậy
+    /// 3. Fallback: không có đuôi (""), tuyệt đối không mặc định ép thành "jpg"
+    pub fn determine_extension(url: &str, content_type: Option<&str>) -> &'static str {
+        if let Some(ct) = content_type {
+            if let Some(ext) = Self::extension_from_content_type(ct) {
+                return ext;
+            }
+        }
+        Self::guess_extension(url)
+    }
+
+    /// Tạo tên tệp đích an toàn dựa trên URL, tên tuỳ chọn và Content-Type
+    pub fn build_target_filename(url: &str, file_name: Option<&str>, content_type: Option<&str>) -> String {
+        let ext = Self::determine_extension(url, content_type);
+        file_name
+            .map(|f| Self::sanitize_file_name(f, ""))
+            .filter(|f| !f.is_empty())
+            .map(|f| {
+                if Path::new(&f).extension().is_some() {
+                    f
+                } else if !ext.is_empty() {
+                    format!("{f}.{ext}")
+                } else {
+                    f
+                }
+            })
+            .unwrap_or_else(|| {
+                if !ext.is_empty() {
+                    format!("media_{}.{ext}", chrono::Utc::now().timestamp())
+                } else {
+                    format!("media_{}", chrono::Utc::now().timestamp())
+                }
+            })
+    }
+
+    /// Đoán phần mở rộng THẬT của tệp sẽ nhận được từ URL.
     ///
     /// CDN của Instagram/Facebook hay phục vụ URL đuôi `.heic` nhưng kèm tham số
     /// `stp=dst-jpg`, và thứ trả về là JPEG. Đặt tên theo đuôi URL sẽ tạo ra tệp
     /// `.heic` mà máy không mở được, nên phải ưu tiên chỉ dẫn `dst-<fmt>`.
-    fn guess_extension(url: &str) -> &'static str {
+    ///
+    /// Nếu không thể nhận diện được phần mở rộng, trả về "" (không có đuôi).
+    /// Tuyệt đối không mặc định ép thành "jpg" để tránh làm sai loại file.
+    pub fn guess_extension(url: &str) -> &'static str {
         let lower = url.to_lowercase();
-        let mut split = lower.splitn(2, '?');
+        let without_hash = lower.split('#').next().unwrap_or("");
+        let mut split = without_hash.splitn(2, '?');
         let path = split.next().unwrap_or("");
         let query = split.next().unwrap_or("");
 
-        for (marker, ext) in [("dst-jpg", "jpg"), ("dst-png", "png"), ("dst-webp", "webp")] {
+        for (marker, ext) in [
+            ("dst-jpg", "jpg"),
+            ("dst-jpeg", "jpg"),
+            ("dst-png", "png"),
+            ("dst-webp", "webp"),
+            ("dst-avif", "avif"),
+            ("dst-heic", "heic"),
+        ] {
             if query.contains(marker) {
                 return ext;
             }
         }
 
         const KNOWN: &[(&str, &str)] = &[
-            (".mp4", "mp4"), (".webm", "webm"), (".mov", "mov"), (".m4v", "m4v"),
-            (".mp3", "mp3"), (".m4a", "m4a"), (".png", "png"), (".webp", "webp"),
-            (".gif", "gif"), (".heic", "heic"), (".jpeg", "jpg"), (".jpg", "jpg"),
+            (".mp4", "mp4"),
+            (".webm", "webm"),
+            (".m4s", "m4s"),
+            (".ts", "ts"),
+            (".m3u8", "m3u8"),
+            (".mpd", "mpd"),
+            (".mov", "mov"),
+            (".m4v", "m4v"),
+            (".mkv", "mkv"),
+            (".avi", "avi"),
+            (".mp3", "mp3"),
+            (".m4a", "m4a"),
+            (".aac", "aac"),
+            (".wav", "wav"),
+            (".flac", "flac"),
+            (".ogg", "ogg"),
+            (".opus", "opus"),
+            (".png", "png"),
+            (".webp", "webp"),
+            (".avif", "avif"),
+            (".gif", "gif"),
+            (".svg", "svg"),
+            (".heic", "heic"),
+            (".heif", "heif"),
+            (".jpeg", "jpg"),
+            (".jpg", "jpg"),
+            (".bmp", "bmp"),
+            (".tiff", "tiff"),
+            (".tif", "tiff"),
+            (".ico", "ico"),
         ];
         KNOWN
             .iter()
             .find(|(suffix, _)| path.ends_with(suffix))
             .map(|(_, ext)| *ext)
-            .unwrap_or("jpg")
+            .unwrap_or("")
     }
 
-    /// Tải 1 URL về đúng đường dẫn bằng curl, trả về true nếu tệp có nội dung
-    async fn curl_to_file(url: &str, referer: &str, dest: &Path) -> bool {
+    /// Kiểm tra xem chuỗi byte có khớp với chữ ký (magic bytes) của các định dạng media phổ biến không
+    pub(crate) fn is_known_media_bytes(buf: &[u8]) -> bool {
+        if buf.len() < 2 {
+            return false;
+        }
+
+        // JPEG: FF D8 FF
+        if buf.len() >= 3 && buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF {
+            return true;
+        }
+
+        // PNG: 89 50 4E 47 0D 0A 1A 0A
+        if buf.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+            return true;
+        }
+
+        // GIF: GIF87a hoặc GIF89a
+        if buf.starts_with(b"GIF87a") || buf.starts_with(b"GIF89a") {
+            return true;
+        }
+
+        // WebP: RIFF....WEBP
+        if buf.len() >= 12 && &buf[0..4] == b"RIFF" && &buf[8..12] == b"WEBP" {
+            return true;
+        }
+
+        // MP4 / MOV / M4V / M4A / HEIC / AVIF (ISO Base Media File Format box)
+        if buf.len() >= 8 {
+            let tag = &buf[4..8];
+            if tag == b"ftyp" || tag == b"moov" || tag == b"mdat" || tag == b"wide" || tag == b"free" || tag == b"skip" {
+                return true;
+            }
+        }
+        if buf.len() >= 4 && (buf.starts_with(b"moov") || buf.starts_with(b"mdat")) {
+            return true;
+        }
+
+        // WebM / MKV: 1A 45 DF A3 (EBML)
+        if buf.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+            return true;
+        }
+
+        // MP3: ID3 header hoặc frame sync 0xFF 0xFB/0xF3/0xF2
+        if buf.starts_with(b"ID3") {
+            return true;
+        }
+        if buf.len() >= 2 && buf[0] == 0xFF && (buf[1] & 0xE0) == 0xE0 {
+            return true;
+        }
+
+        // Ogg: OggS
+        if buf.starts_with(b"OggS") {
+            return true;
+        }
+
+        // FLAC: fLaC
+        if buf.starts_with(b"fLaC") {
+            return true;
+        }
+
+        // WAV / AVI: RIFF....WAVE / RIFF....AVI
+        if buf.len() >= 12 && &buf[0..4] == b"RIFF" && (&buf[8..12] == b"WAVE" || &buf[8..12] == b"AVI ") {
+            return true;
+        }
+
+        // BMP: BM
+        if buf.starts_with(b"BM") {
+            return true;
+        }
+
+        // TIFF
+        if buf.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || buf.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+            return true;
+        }
+
+        false
+    }
+
+    /// Xác thực tệp đã tải về: HTTP status, Content-Type, nội dung phản hồi và extension
+    pub(crate) fn validate_downloaded_media(
+        dest: &Path,
+        http_status: u16,
+        content_type: &str,
+        url: &str,
+    ) -> Result<(), String> {
+        // 1. Kiểm tra HTTP Status
+        if http_status != 0 && !(200..=299).contains(&http_status) {
+            return Err(format!("Mã HTTP phản hồi không hợp lệ ({http_status}) từ {url}"));
+        }
+
+        // 2. Kiểm tra Content-Type
+        let mime = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+
+        let is_non_media_mime = mime == "text/html"
+            || mime == "application/xhtml+xml"
+            || mime == "application/json"
+            || mime == "text/json"
+            || mime.ends_with("+json")
+            || mime == "application/xml"
+            || mime == "text/xml"
+            || mime == "application/javascript"
+            || mime == "text/javascript"
+            || mime == "application/x-javascript"
+            || mime == "text/css";
+
+        if is_non_media_mime {
+            return Err(format!(
+                "Content-Type không hợp lệ cho tệp media: '{mime}' (server trả về tài liệu HTML/JSON/script thay vì media) từ {url}"
+            ));
+        }
+
+        // 3. Kiểm tra sự tồn tại và kích thước tệp
+        let metadata = std::fs::metadata(dest)
+            .map_err(|e| format!("Không thể kiểm tra tệp tải về {:?}: {e}", dest))?;
+
+        let file_size = metadata.len();
+        if file_size == 0 {
+            return Err(format!("Tệp tải về rỗng (0 byte) từ {url}"));
+        }
+
+        // 4. Đọc mẫu đầu tệp để phân tích nội dung
+        let sample = {
+            use std::io::Read;
+            let f = std::fs::File::open(dest)
+                .map_err(|e| format!("Không thể mở tệp {:?} để kiểm tra: {e}", dest))?;
+            let mut buf = Vec::with_capacity(8192);
+            let mut take = f.take(8192);
+            take.read_to_end(&mut buf)
+                .map_err(|e| format!("Không thể đọc nội dung tệp {:?}: {e}", dest))?;
+            buf
+        };
+
+        // Bỏ qua BOM và khoảng trắng đầu dòng
+        let mut trimmed = sample.as_slice();
+        if trimmed.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            trimmed = &trimmed[3..];
+        }
+        while let Some((first, rest)) = trimmed.split_first() {
+            if first.is_ascii_whitespace() {
+                trimmed = rest;
+            } else {
+                break;
+            }
+        }
+
+        // Kiểm tra HTML/XML tag ở đầu nội dung
+        let trimmed_lower_slice = if trimmed.len() > 100 {
+            &trimmed[..100]
+        } else {
+            trimmed
+        };
+        let trimmed_lower_str = String::from_utf8_lossy(trimmed_lower_slice).to_lowercase();
+
+        if trimmed_lower_str.starts_with("<!doctype")
+            || trimmed_lower_str.starts_with("<html")
+            || trimmed_lower_str.starts_with("<head")
+            || trimmed_lower_str.starts_with("<body")
+            || trimmed_lower_str.starts_with("<script")
+            || trimmed_lower_str.starts_with("<?xml")
+            || trimmed_lower_str.starts_with("<!--")
+        {
+            return Err(format!(
+                "Nội dung tệp là trang web HTML/XML thay vì dữ liệu media từ {url}"
+            ));
+        }
+
+        // Kiểm tra các dấu hiệu Cloudflare Challenge, anti-bot, WAF, trang đăng nhập hoặc lỗi HTML
+        let sample_text = String::from_utf8_lossy(&sample).to_lowercase();
+
+        let challenge_markers = [
+            "cloudflare",
+            "cf-browser-verification",
+            "challenge-platform",
+            "cf-turnstile",
+            "__cf_chl",
+            "cf-chl-",
+            "just a moment...",
+            "checking your browser",
+            "verify you are human",
+            "verifying you are human",
+            "ddos-guard",
+            "bot detection",
+            "access denied",
+            "attention required!",
+            "<title>error",
+            "<title>40",
+            "<title>50",
+            "<title>login",
+            "<title>sign in",
+            "<title>just a moment",
+            "<title>attention required",
+            "<title>security check",
+            "please enable javascript",
+            "g-recaptcha",
+            "hcaptcha",
+            "window._cf_chl_opt",
+        ];
+
+        if sample_text.contains("<html") || sample_text.contains("<!doctype") {
+            return Err(format!(
+                "Phát hiện cấu trúc HTML trong nội dung tải về từ {url}"
+            ));
+        }
+
+        for marker in challenge_markers {
+            if sample_text.contains(marker) {
+                return Err(format!(
+                    "Phát hiện nội dung lỗi / chống bot / challenge ('{marker}') từ {url}"
+                ));
+            }
+        }
+
+        // Kiểm tra phản hồi JSON
+        if trimmed.starts_with(b"{") || trimmed.starts_with(b"[") {
+            if file_size <= 65536 {
+                if let Ok(full_bytes) = std::fs::read(dest) {
+                    if serde_json::from_slice::<serde_json::Value>(&full_bytes).is_ok() {
+                        return Err(format!(
+                            "Nội dung tệp là dữ liệu JSON thay vì media từ {url}"
+                        ));
+                    }
+                }
+            }
+            if sample_text.contains("\"error\"")
+                || sample_text.contains("\"message\"")
+                || sample_text.contains("\"status\"")
+                || sample_text.contains("\"code\"")
+                || sample_text.contains("\"detail\"")
+            {
+                return Err(format!(
+                    "Nội dung tệp chứa cấu trúc JSON thông báo lỗi từ {url}"
+                ));
+            }
+        }
+
+        // Kiểm tra thông báo lỗi dạng văn bản thuần
+        let is_pure_ascii_text = sample.iter().all(|&b| b == b'\r' || b == b'\n' || b == b'\t' || (32..=126).contains(&b));
+        if is_pure_ascii_text && !sample.is_empty() {
+            let text_lower = sample_text.trim();
+            if text_lower.starts_with("error")
+                || text_lower.starts_with("unauthorized")
+                || text_lower.starts_with("forbidden")
+                || text_lower.starts_with("access denied")
+                || text_lower.contains("rate limit")
+            {
+                return Err(format!(
+                    "Nội dung tệp là thông báo lỗi dạng văn bản ('{text_lower}') từ {url}"
+                ));
+            }
+        }
+
+        // 5. Kiểm tra chữ ký số Media và extension
+        let has_known_media_magic = Self::is_known_media_bytes(&sample);
+        if has_known_media_magic {
+            return Ok(());
+        }
+
+        let is_media_content_type = mime.starts_with("image/")
+            || mime.starts_with("video/")
+            || mime.starts_with("audio/");
+
+        let ext = dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        const STRICT_MEDIA_EXTS: &[&str] = &[
+            "jpg", "jpeg", "png", "gif", "webp", "mp4", "webm", "mov", "m4v", "mp3", "m4a", "heic",
+        ];
+
+        if STRICT_MEDIA_EXTS.contains(&ext.as_str()) {
+            return Err(format!(
+                "Tệp có đuôi .{ext} nhưng nội dung không khớp với bất kỳ chữ ký (magic bytes) media nào từ {url}"
+            ));
+        }
+
+        if !is_media_content_type {
+            return Err(format!(
+                "Tệp không có Content-Type media (nhận được '{mime}') và không khớp chữ ký media từ {url}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Tải 1 URL về đúng đường dẫn bằng curl, kiểm tra tính hợp lệ của media và trả về true nếu thành công
+    #[allow(dead_code)]
+    pub(crate) async fn curl_to_file(url: &str, referer: &str, dest: &Path) -> bool {
+        Self::curl_to_file_with_meta(url, referer, dest).await.0
+    }
+
+    /// Tải 1 URL về đường dẫn bằng curl, trả về (kết_quả, Content-Type_nhận_được)
+    pub(crate) async fn curl_to_file_with_meta(
+        url: &str,
+        referer: &str,
+        dest: &Path,
+    ) -> (bool, Option<String>) {
         const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-        let ok = Command::new("curl")
+        let output = match Command::new("curl")
             .arg("-sSL")
             .arg("-f")
             .arg("--retry").arg("2")
@@ -1215,20 +1756,50 @@ impl DownloaderService {
             .arg("--max-time").arg("300")
             .arg("-A").arg(USER_AGENT)
             .arg("-e").arg(referer)
+            .arg("-w").arg("\n---CURL_META---\n%{http_code}\n%{content_type}\n")
             .arg(url)
             .arg("-o").arg(dest)
-            .status()
+            .output()
             .await
-            .map(|s| s.success())
-            .unwrap_or(false);
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Không thể thực thi lệnh curl cho {url}: {e}");
+                let _ = std::fs::remove_file(dest);
+                return (false, None);
+            }
+        };
 
-        // curl -f vẫn có thể để lại tệp 0 byte khi kết nối đứt giữa chừng
-        if ok && std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false) {
-            true
-        } else {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("curl thất bại khi tải {url} (code {:?}): {}", output.status.code(), stderr.trim());
             let _ = std::fs::remove_file(dest);
-            false
+            return (false, None);
         }
+
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let mut http_status = 0u16;
+        let mut content_type = String::new();
+
+        if let Some(pos) = stdout_str.rfind("---CURL_META---") {
+            let meta_part = &stdout_str[pos + "---CURL_META---".len()..];
+            let mut lines = meta_part.lines().filter(|l| !l.trim().is_empty());
+            if let Some(code_line) = lines.next() {
+                http_status = code_line.trim().parse::<u16>().unwrap_or(0);
+            }
+            if let Some(ct_line) = lines.next() {
+                content_type = ct_line.trim().to_string();
+            }
+        }
+
+        if let Err(reason) = Self::validate_downloaded_media(dest, http_status, &content_type, url) {
+            warn!("Tải tệp media không hợp lệ: {reason}");
+            let _ = std::fs::remove_file(dest);
+            return (false, None);
+        }
+
+        let opt_ct = if content_type.is_empty() { None } else { Some(content_type) };
+        (true, opt_ct)
     }
 
     /// Nén toàn bộ tệp và thư mục con trong `src_dir` thành tệp ZIP tại `zip_path` bằng crate native `zip`
@@ -1366,7 +1937,12 @@ mod tests {
         assert_eq!(D::guess_extension("https://cdn/x/photo.heic?stp=dst-jpg_e35_tt6"), "jpg");
         assert_eq!(D::guess_extension("https://cdn/x/photo.heic"), "heic");
         assert_eq!(D::guess_extension("https://cdn/x/photo.JPEG"), "jpg");
-        assert_eq!(D::guess_extension("https://cdn/x/nostem"), "jpg");
+        assert_eq!(D::guess_extension("https://cdn/x/video.m4s"), "m4s");
+        assert_eq!(D::guess_extension("https://cdn/x/video.ts"), "ts");
+        assert_eq!(D::guess_extension("https://cdn/x/manifest.m3u8"), "m3u8");
+        assert_eq!(D::guess_extension("https://cdn/x/image.avif"), "avif");
+        assert_eq!(D::guess_extension("https://cdn/x/image.svg"), "svg");
+        assert_eq!(D::guess_extension("https://cdn/x/nostem"), "");
     }
 
     #[test]
@@ -1374,6 +1950,123 @@ mod tests {
         assert_eq!(D::sanitize_file_name("a/b:c*d", "fb"), "a_b_c_d");
         assert_eq!(D::sanitize_file_name("   ", "fb"), "fb");
         assert_eq!(D::sanitize_file_name("....", "fb"), "fb");
+        assert_eq!(D::sanitize_file_name("../../etc/passwd", "fb"), "___etc_passwd");
+        assert_eq!(D::sanitize_file_name("a\0b", "fb"), "a_b");
+    }
+
+    #[tokio::test]
+    async fn test_batch_collision_same_title_no_overwrite_and_unique_titles() {
+        let temp_dir = std::env::temp_dir().join(format!("test_batch_collision_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Part A: 3 media có CÙNG title "image"
+        let mut reserved = std::collections::HashSet::new();
+        let items_same_title = vec![
+            ("image", "jpg", "content 1"),
+            ("image", "jpg", "content 2"),
+            ("image", "jpg", "content 3"),
+        ];
+
+        let mut paths_same_title = Vec::new();
+        for (title, ext, content) in &items_same_title {
+            let path = D::resolve_collision_free_path(&temp_dir, title, ext, &mut reserved);
+            std::fs::write(&path, content.as_bytes()).unwrap();
+            paths_same_title.push(path);
+        }
+
+        // Kiểm tra tất cả file đều tồn tại, có đường dẫn riêng biệt và KHÔNG bị overwrite
+        assert_eq!(paths_same_title.len(), 3);
+        assert_ne!(paths_same_title[0], paths_same_title[1]);
+        assert_ne!(paths_same_title[1], paths_same_title[2]);
+        assert_ne!(paths_same_title[0], paths_same_title[2]);
+
+        for (idx, path) in paths_same_title.iter().enumerate() {
+            assert!(path.exists(), "Tệp phải tồn tại: {:?}", path);
+            let read_content = std::fs::read_to_string(path).unwrap();
+            assert_eq!(read_content, format!("content {}", idx + 1), "Nội dung tệp không được bị ghi đè");
+        }
+
+        // Part B: Media có normal unique titles
+        let items_unique = vec![
+            ("sunset_101", "jpg", "sunset bytes"),
+            ("portrait_102", "jpg", "portrait bytes"),
+        ];
+        let mut paths_unique = Vec::new();
+        for (title, ext, content) in &items_unique {
+            let path = D::resolve_collision_free_path(&temp_dir, title, ext, &mut reserved);
+            std::fs::write(&path, content.as_bytes()).unwrap();
+            paths_unique.push(path);
+        }
+
+        assert_eq!(paths_unique[0], temp_dir.join("sunset_101.jpg"));
+        assert_eq!(paths_unique[1], temp_dir.join("portrait_102.jpg"));
+        assert_eq!(std::fs::read_to_string(&paths_unique[0]).unwrap(), "sunset bytes");
+        assert_eq!(std::fs::read_to_string(&paths_unique[1]).unwrap(), "portrait bytes");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        println!("TEST #1: PASS");
+    }
+
+    #[tokio::test]
+    async fn test_batch_collision_clean_state_concurrent_race_conditions() {
+        // Lặp lại test batch collision từ TRẠNG THÁI SẠCH
+        let temp_dir = std::env::temp_dir().join(format!("test_race_condition_{}", uuid::Uuid::new_v4()));
+        if temp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        }
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Giả lập 8 media đều có cùng title "image" hoặc "image.jpg" tải concurrent
+        let total_items = 8;
+        let mut reserved = std::collections::HashSet::new();
+        let mut planned = Vec::with_capacity(total_items);
+
+        for i in 0..total_items {
+            let path = D::resolve_collision_free_path(&temp_dir, "image.jpg", "jpg", &mut reserved);
+            planned.push((i, path));
+        }
+
+        // Kiểm tra toàn bộ path đã cấp phát trước đều độc nhất
+        let distinct_paths: std::collections::HashSet<_> = planned.iter().map(|(_, p)| p.clone()).collect();
+        assert_eq!(distinct_paths.len(), total_items, "Tất cả các path được cấp phát phải độc nhất");
+
+        // Chạy concurrent qua tokio::spawn mô phỏng MAX_PARALLEL tải cùng lúc để kiểm tra race condition
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(5));
+        let mut handles = Vec::new();
+
+        for (item_id, target_file) in planned {
+            let sem = std::sync::Arc::clone(&semaphore);
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+                tokio::time::sleep(tokio::time::Duration::from_millis(5 * (item_id as u64 % 3 + 1))).await;
+                std::fs::write(&target_file, format!("unique payload data for item {item_id}")).unwrap();
+                target_file
+            }));
+        }
+
+        let mut completed_paths = Vec::new();
+        for handle in handles {
+            let path = handle.await.unwrap();
+            completed_paths.push(path);
+        }
+
+        assert_eq!(completed_paths.len(), total_items);
+
+        // Kiểm tra tất cả file đều tồn tại và nội dung nguyên vẹn, không bị race condition ghi đè
+        for i in 0..total_items {
+            let expected_name = if i == 0 {
+                "image.jpg".to_string()
+            } else {
+                format!("image_{i}.jpg")
+            };
+            let expected_file = temp_dir.join(&expected_name);
+            assert!(expected_file.exists(), "Tệp {:?} phải tồn tại sau khi tải concurrent", expected_file);
+            let content = std::fs::read_to_string(&expected_file).unwrap();
+            assert_eq!(content, format!("unique payload data for item {i}"));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        println!("TEST #2: PASS");
     }
 
     #[test]
@@ -1457,5 +2150,503 @@ mod tests {
         let ind_payload = DownloadProgressPayload::indeterminate("task-2", "processing", "Đang xử lý...");
         assert!(ind_payload.is_indeterminate);
         assert_eq!(ind_payload.percent, 0.0);
+    }
+
+    #[test]
+    fn test_zip_packaging_images_only() {
+        use std::io::Read;
+
+        let temp_dir = std::env::temp_dir().join(format!("test_album_img_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        for i in 1..=5 {
+            let file_path = temp_dir.join(format!("image_{i}.jpg"));
+            std::fs::write(&file_path, format!("fake image content {i}").as_bytes()).unwrap();
+        }
+
+        let zip_path = std::env::temp_dir().join(format!("test_album_img_{}.zip", uuid::Uuid::new_v4()));
+        let res = D::compress_dir_to_zip(&temp_dir, &zip_path);
+        assert!(res.is_ok(), "Nén ZIP images only phải thành công: {:?}", res.err());
+
+        // Dọn dẹp thư mục nguồn giống logic backend
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert!(!temp_dir.exists(), "Thư mục tạm phải được xóa sau khi nén");
+        assert!(zip_path.exists(), "Tệp ZIP phải tồn tại");
+
+        let zip_file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+        assert_eq!(archive.len(), 5, "Số lượng tệp trong ZIP phải là 5");
+
+        for i in 1..=5 {
+            let mut f = archive.by_name(&format!("image_{i}.jpg")).unwrap();
+            let mut content = String::new();
+            f.read_to_string(&mut content).unwrap();
+            assert_eq!(content, format!("fake image content {i}"));
+        }
+
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn test_zip_packaging_videos_only() {
+        use std::io::Read;
+
+        let temp_dir = std::env::temp_dir().join(format!("test_album_vid_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        for i in 1..=3 {
+            let file_path = temp_dir.join(format!("video_{i}.mp4"));
+            std::fs::write(&file_path, format!("fake video mp4 stream {i}").as_bytes()).unwrap();
+        }
+
+        let zip_path = std::env::temp_dir().join(format!("test_album_vid_{}.zip", uuid::Uuid::new_v4()));
+        let res = D::compress_dir_to_zip(&temp_dir, &zip_path);
+        assert!(res.is_ok(), "Nén ZIP videos only phải thành công: {:?}", res.err());
+
+        // Dọn dẹp thư mục nguồn
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert!(!temp_dir.exists(), "Thư mục tạm phải được xóa sau khi nén");
+        assert!(zip_path.exists(), "Tệp ZIP phải tồn tại");
+
+        let zip_file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+        assert_eq!(archive.len(), 3, "Số lượng tệp trong ZIP phải là 3");
+
+        for i in 1..=3 {
+            let mut f = archive.by_name(&format!("video_{i}.mp4")).unwrap();
+            let mut content = String::new();
+            f.read_to_string(&mut content).unwrap();
+            assert_eq!(content, format!("fake video mp4 stream {i}"));
+        }
+
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn test_zip_packaging_mixed_images_and_videos() {
+        use std::io::Read;
+
+        let temp_dir = std::env::temp_dir().join(format!("test_album_mixed_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 5 images
+        for i in 1..=5 {
+            let file_path = temp_dir.join(format!("image_{i}.jpg"));
+            std::fs::write(&file_path, format!("image bytes {i}").as_bytes()).unwrap();
+        }
+
+        // 3 videos
+        for i in 1..=3 {
+            let file_path = temp_dir.join(format!("video_{i}.mp4"));
+            std::fs::write(&file_path, format!("video stream bytes {i}").as_bytes()).unwrap();
+        }
+
+        let zip_path = std::env::temp_dir().join(format!("test_album_mixed_{}.zip", uuid::Uuid::new_v4()));
+        let res = D::compress_dir_to_zip(&temp_dir, &zip_path);
+        assert!(res.is_ok(), "Nén ZIP mixed media phải thành công: {:?}", res.err());
+
+        // Dọn dẹp thư mục nguồn
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Kiểm tra không có tệp nào rải rác bên ngoài ZIP
+        assert!(!temp_dir.exists(), "Thư mục nguồn phải bị xóa hoàn toàn");
+        assert!(zip_path.exists(), "Tệp ZIP duy nhất phải tồn tại");
+
+        let zip_file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+        assert_eq!(archive.len(), 8, "Số lượng tệp trong ZIP phải chính xác 8 (5 images + 3 videos)");
+
+        for i in 1..=5 {
+            let mut f = archive.by_name(&format!("image_{i}.jpg")).unwrap();
+            let mut content = String::new();
+            f.read_to_string(&mut content).unwrap();
+            assert_eq!(content, format!("image bytes {i}"));
+        }
+
+        for i in 1..=3 {
+            let mut f = archive.by_name(&format!("video_{i}.mp4")).unwrap();
+            let mut content = String::new();
+            f.read_to_string(&mut content).unwrap();
+            assert_eq!(content, format!("video stream bytes {i}"));
+        }
+
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    async fn run_mock_server() -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    Ok((mut socket, _)) = listener.accept() => {
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut buf = [0u8; 1024];
+                            let n = match socket.read(&mut buf).await {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            let first_line = req.lines().next().unwrap_or("");
+                            let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+                            let (status, content_type, body): (&str, &str, Vec<u8>) = match path {
+                                "/valid_image.jpg" => (
+                                    "200 OK",
+                                    "image/jpeg",
+                                    vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01, 0x00, 0x60, 0x00, 0x60, 0x00, 0x00, 0xFF, 0xD9],
+                                ),
+                                "/valid_video.mp4" => (
+                                    "200 OK",
+                                    "video/mp4",
+                                    vec![0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2', 0x00, 0x00, 0x00, 0x00, b'm', b'p', b'4', b'2', b'i', b's', b'o', b'm'],
+                                ),
+                                "/challenge.html" => (
+                                    "200 OK",
+                                    "text/html; charset=utf-8",
+                                    b"<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>Checking your browser before accessing the website. Cloudflare challenge-platform.</body></html>".to_vec(),
+                                ),
+                                "/error.json" => (
+                                    "200 OK",
+                                    "application/json",
+                                    b"{\"error\": \"Invalid authorization credentials\", \"code\": 401, \"status\": \"error\"}".to_vec(),
+                                ),
+                                _ => (
+                                    "404 Not Found",
+                                    "text/plain",
+                                    b"Not found".to_vec(),
+                                ),
+                            };
+
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.write_all(&body).await;
+                            let _ = socket.flush().await;
+                        });
+                    }
+                }
+            }
+        });
+
+        (format!("http://{}", addr), shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn test_red_04_download_validation_flow_test1_and_test2() {
+        let (server_url, _shutdown) = run_mock_server().await;
+        let temp_dir = std::env::temp_dir().join(format!("test_red04_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        for test_iteration in [1, 2] {
+            println!("--- RUNNING TEST #{test_iteration} ---");
+
+            // 1. Valid image (JPEG)
+            let img_path = temp_dir.join(format!("image_run{}.jpg", test_iteration));
+            let img_ok = D::curl_to_file(&format!("{server_url}/valid_image.jpg"), "", &img_path).await;
+            assert!(img_ok, "Test #{test_iteration}: valid image phải tải thành công");
+            assert!(img_path.exists(), "Test #{test_iteration}: file ảnh hợp lệ phải được lưu trên đĩa");
+            assert!(img_path.metadata().unwrap().len() > 0);
+            let _ = std::fs::remove_file(&img_path);
+
+            // 2. Valid video (MP4)
+            let vid_path = temp_dir.join(format!("video_run{}.mp4", test_iteration));
+            let vid_ok = D::curl_to_file(&format!("{server_url}/valid_video.mp4"), "", &vid_path).await;
+            assert!(vid_ok, "Test #{test_iteration}: valid video phải tải thành công");
+            assert!(vid_path.exists(), "Test #{test_iteration}: file video hợp lệ phải được lưu trên đĩa");
+            assert!(vid_path.metadata().unwrap().len() > 0);
+            let _ = std::fs::remove_file(&vid_path);
+
+            // 3. HTML / Cloudflare Challenge response
+            let html_dest = temp_dir.join(format!("challenge_run{}.jpg", test_iteration));
+            let html_ok = D::curl_to_file(&format!("{server_url}/challenge.html"), "", &html_dest).await;
+            assert!(!html_ok, "Test #{test_iteration}: HTML response phải bị từ chối và trả failure");
+            assert!(!html_dest.exists(), "Test #{test_iteration}: HTML response KHÔNG được để lại file rác");
+
+            // 4. JSON Error response
+            let json_dest = temp_dir.join(format!("error_run{}.mp4", test_iteration));
+            let json_ok = D::curl_to_file(&format!("{server_url}/error.json"), "", &json_dest).await;
+            assert!(!json_ok, "Test #{test_iteration}: JSON response phải bị từ chối và trả failure");
+            assert!(!json_dest.exists(), "Test #{test_iteration}: JSON response KHÔNG được để lại file rác");
+
+            println!("TEST #{test_iteration}: PASS");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_unit_validate_downloaded_media_cases() {
+        let temp_dir = std::env::temp_dir().join(format!("test_val_cases_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Valid JPEG with image/jpeg
+        let jpg_path = temp_dir.join("photo.jpg");
+        std::fs::write(&jpg_path, &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00]).unwrap();
+        assert!(D::validate_downloaded_media(&jpg_path, 200, "image/jpeg", "http://test.com/photo.jpg").is_ok());
+
+        // 2. Valid JPEG with application/octet-stream (CDN binary stream)
+        assert!(D::validate_downloaded_media(&jpg_path, 200, "application/octet-stream", "http://test.com/photo.jpg").is_ok());
+
+        // 3. Valid MP4 with video/mp4
+        let mp4_path = temp_dir.join("clip.mp4");
+        std::fs::write(&mp4_path, &[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2']).unwrap();
+        assert!(D::validate_downloaded_media(&mp4_path, 200, "video/mp4", "http://test.com/clip.mp4").is_ok());
+
+        // 4. Valid PNG with image/png
+        let png_path = temp_dir.join("image.png");
+        std::fs::write(&png_path, &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]).unwrap();
+        assert!(D::validate_downloaded_media(&png_path, 200, "image/png", "http://test.com/image.png").is_ok());
+
+        // 5. Valid WebP with application/octet-stream
+        let webp_path = temp_dir.join("image.webp");
+        let webp_bytes = b"RIFF....WEBPVP8 ".to_vec();
+        std::fs::write(&webp_path, &webp_bytes).unwrap();
+        assert!(D::validate_downloaded_media(&webp_path, 200, "application/octet-stream", "http://test.com/image.webp").is_ok());
+
+        // 6. Rejected: text/html Content-Type
+        let html_path = temp_dir.join("fake_img.jpg");
+        std::fs::write(&html_path, b"<!DOCTYPE html><html><body>Error</body></html>").unwrap();
+        let res_html = D::validate_downloaded_media(&html_path, 200, "text/html; charset=utf-8", "http://test.com/fake_img.jpg");
+        assert!(res_html.is_err());
+
+        // 7. Rejected: application/json Content-Type
+        let json_path = temp_dir.join("fake_vid.mp4");
+        std::fs::write(&json_path, b"{\"error\": \"forbidden\"}").unwrap();
+        let res_json = D::validate_downloaded_media(&json_path, 200, "application/json", "http://test.com/fake_vid.mp4");
+        assert!(res_json.is_err());
+
+        // 8. Rejected: HTML content even if Content-Type is generic application/octet-stream
+        let cf_path = temp_dir.join("cf_challenge.jpg");
+        std::fs::write(&cf_path, b"<html><head><title>Just a moment...</title></head><body>cf-browser-verification</body></html>").unwrap();
+        let res_cf = D::validate_downloaded_media(&cf_path, 200, "application/octet-stream", "http://test.com/cf_challenge.jpg");
+        assert!(res_cf.is_err());
+
+        // 9. Rejected: JSON content even if Content-Type is generic
+        let json_octet = temp_dir.join("error_octet.mp4");
+        std::fs::write(&json_octet, b"{\"message\": \"Resource expired\", \"code\": 403}").unwrap();
+        let res_jo = D::validate_downloaded_media(&json_octet, 200, "application/octet-stream", "http://test.com/error_octet.mp4");
+        assert!(res_jo.is_err());
+
+        // 10. Rejected: 0-byte file
+        let empty_path = temp_dir.join("empty.jpg");
+        std::fs::write(&empty_path, b"").unwrap();
+        let res_empty = D::validate_downloaded_media(&empty_path, 200, "image/jpeg", "http://test.com/empty.jpg");
+        assert!(res_empty.is_err());
+
+        // 11. Rejected: HTTP 403 status code
+        assert!(D::validate_downloaded_media(&jpg_path, 403, "image/jpeg", "http://test.com/photo.jpg").is_err());
+
+        // 12. Rejected: .jpg extension with non-media text content
+        let text_path = temp_dir.join("bad_ext.jpg");
+        std::fs::write(&text_path, b"random corrupted text without any magic bytes").unwrap();
+        assert!(D::validate_downloaded_media(&text_path, 200, "application/octet-stream", "http://test.com/bad_ext.jpg").is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_red_15_filename_and_extension_detection_test1() {
+        // Test #1: Test các URL có extension:
+        // .jpg, .png, .webp, .mp4, .m4s, .ts, .m3u8 và URL không có extension.
+        // Kiểm tra output filename.
+        let cases = [
+            ("https://cdn.example.com/media/photo.jpg", "jpg"),
+            ("https://cdn.example.com/media/image.png", "png"),
+            ("https://cdn.example.com/media/graphic.webp", "webp"),
+            ("https://cdn.example.com/media/clip.mp4", "mp4"),
+            ("https://cdn.example.com/media/segment.m4s", "m4s"),
+            ("https://cdn.example.com/media/stream.ts", "ts"),
+            ("https://cdn.example.com/media/playlist.m3u8", "m3u8"),
+            ("https://cdn.example.com/media/vector.svg", "svg"),
+            ("https://cdn.example.com/media/photo.avif", "avif"),
+            ("https://cdn.example.com/media/movie.webm", "webm"),
+            ("https://cdn.example.com/media/anim.gif", "gif"),
+            ("https://cdn.example.com/media/nostem_media", ""),
+            ("https://cdn.example.com/media/12345?token=xyz", ""),
+            ("https://cdn.example.com/media/archive.unknown", ""),
+        ];
+
+        for (url, expected_ext) in cases {
+            let guessed = D::guess_extension(url);
+            assert_eq!(guessed, expected_ext, "URL {url} phải nhận diện extension là '{expected_ext}'");
+
+            let fname_with_title = D::build_target_filename(url, Some("custom_media"), None);
+            if expected_ext.is_empty() {
+                assert_eq!(fname_with_title, "custom_media", "URL không có extension không được tự gán đuôi");
+                assert!(!fname_with_title.ends_with(".jpg"), "URL không có extension tuyệt đối không được là .jpg");
+                assert!(!fname_with_title.ends_with('.'), "Không được có dấu chấm thừa ở cuối");
+            } else {
+                assert_eq!(fname_with_title, format!("custom_media.{expected_ext}"));
+            }
+
+            let fname_auto = D::build_target_filename(url, None, None);
+            if expected_ext.is_empty() {
+                assert!(!fname_auto.ends_with(".jpg"), "media tự sinh cho unknown không được có đuôi .jpg");
+                assert!(!fname_auto.ends_with('.'), "Không được có dấu chấm thừa ở cuối");
+            } else {
+                assert!(fname_auto.ends_with(&format!(".{expected_ext}")));
+            }
+        }
+
+        println!("TEST #1: PASS");
+    }
+
+    #[tokio::test]
+    async fn test_red_15_actual_downloader_flow_test2() {
+        // Test #2: Lặp lại test với actual downloader flow.
+        // Đặc biệt xác nhận: unknown ≠ jpg nếu không có evidence cho JPEG.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    Ok((mut socket, _)) = listener.accept() => {
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut buf = [0u8; 1024];
+                            let n = match socket.read(&mut buf).await {
+                                Ok(n) if n > 0 => n,
+                                _ => return,
+                            };
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            let first_line = req.lines().next().unwrap_or("");
+                            let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+                            let (status, content_type, body): (&str, &str, Vec<u8>) = match path {
+                                "/sample.m4s" => (
+                                    "200 OK",
+                                    "video/iso.segment",
+                                    vec![0x00, 0x00, 0x00, 0x18, b's', b't', b'y', b'p', b'm', b's', b'4', b's', 0x00, 0x00, 0x00, 0x00, b'm', b's', b'4', b's', b'i', b's', b'o', b'm'],
+                                ),
+                                "/sample.ts" => (
+                                    "200 OK",
+                                    "video/mp2t",
+                                    vec![0x47, 0x40, 0x00, 0x10, 0x00, 0x00, 0x01, 0xBA, 0x44, 0x00, 0x04, 0x00, 0x04, 0x01, 0x01, 0x89],
+                                ),
+                                "/sample.m3u8" => (
+                                    "200 OK",
+                                    "application/vnd.apple.mpegurl",
+                                    b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n".to_vec(),
+                                ),
+                                "/photo.avif" => (
+                                    "200 OK",
+                                    "image/avif",
+                                    vec![0x00, 0x00, 0x00, 0x1C, b'f', b't', b'y', b'p', b'a', b'v', b'i', b'f', 0x00, 0x00, 0x00, 0x00, b'a', b'v', b'i', b'f', b'm', b'i', b'a', b'f'],
+                                ),
+                                "/vector.svg" => (
+                                    "200 OK",
+                                    "image/svg+xml",
+                                    b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><circle cx=\"5\" cy=\"5\" r=\"4\"/></svg>".to_vec(),
+                                ),
+                                "/nostem_with_ct_png" => (
+                                    "200 OK",
+                                    "image/png",
+                                    vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00],
+                                ),
+                                "/unknown_octet" => (
+                                    "200 OK",
+                                    "application/octet-stream",
+                                    vec![0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2', 0x00, 0x00, 0x00, 0x00, b'm', b'p', b'4', b'2', b'i', b's', b'o', b'm'],
+                                ),
+                                _ => (
+                                    "404 Not Found",
+                                    "text/plain",
+                                    b"Not found".to_vec(),
+                                ),
+                            };
+
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = socket.write_all(response.as_bytes()).await;
+                            let _ = socket.write_all(&body).await;
+                            let _ = socket.flush().await;
+                        });
+                    }
+                }
+            }
+        });
+
+        let server_url = format!("http://{}", addr);
+        let temp_dir = std::env::temp_dir().join(format!("test_red15_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. Flow test with .m4s URL
+        let m4s_url = format!("{server_url}/sample.m4s");
+        let initial_m4s = D::build_target_filename(&m4s_url, Some("stream_chunk"), None);
+        assert_eq!(initial_m4s, "stream_chunk.m4s");
+        let m4s_dest = temp_dir.join(&initial_m4s);
+        let ok_m4s = D::curl_to_file(&m4s_url, "", &m4s_dest).await;
+        assert!(ok_m4s);
+        assert!(m4s_dest.exists());
+        assert_eq!(m4s_dest.extension().and_then(|e| e.to_str()), Some("m4s"));
+
+        // 2. Flow test with .ts URL
+        let ts_url = format!("{server_url}/sample.ts");
+        let initial_ts = D::build_target_filename(&ts_url, Some("stream_segment"), None);
+        assert_eq!(initial_ts, "stream_segment.ts");
+        let ts_dest = temp_dir.join(&initial_ts);
+        let ok_ts = D::curl_to_file(&ts_url, "", &ts_dest).await;
+        assert!(ok_ts);
+        assert!(ts_dest.exists());
+        assert_eq!(ts_dest.extension().and_then(|e| e.to_str()), Some("ts"));
+
+        // 3. Flow test with .avif URL
+        let avif_url = format!("{server_url}/photo.avif");
+        let initial_avif = D::build_target_filename(&avif_url, Some("avatar"), None);
+        assert_eq!(initial_avif, "avatar.avif");
+        let avif_dest = temp_dir.join(&initial_avif);
+        let ok_avif = D::curl_to_file(&avif_url, "", &avif_dest).await;
+        assert!(ok_avif);
+        assert!(avif_dest.exists());
+        assert_eq!(avif_dest.extension().and_then(|e| e.to_str()), Some("avif"));
+
+        // 4. Flow test with URL without extension but HTTP Content-Type image/png (Priority 1)
+        let ct_url = format!("{server_url}/nostem_with_ct_png");
+        let initial_ct = D::build_target_filename(&ct_url, Some("custom_png"), None);
+        assert_eq!(initial_ct, "custom_png"); // Before download: no extension
+        let ct_dest = temp_dir.join(&initial_ct);
+        let (ok_ct, detected_ct) = D::curl_to_file_with_meta(&ct_url, "", &ct_dest).await;
+        assert!(ok_ct);
+        assert_eq!(detected_ct.as_deref(), Some("image/png"));
+        // Priority 1: Rename based on Content-Type
+        let ext_from_ct = D::extension_from_content_type(detected_ct.as_deref().unwrap()).unwrap();
+        assert_eq!(ext_from_ct, "png");
+        let final_ct_path = ct_dest.with_extension(ext_from_ct);
+        std::fs::rename(&ct_dest, &final_ct_path).unwrap();
+        assert!(final_ct_path.exists());
+        assert_eq!(final_ct_path.extension().and_then(|e| e.to_str()), Some("png"));
+
+        // 5. Flow test with unknown URL & generic octet-stream Content-Type (NO JPEG EVIDENCE)
+        let unk_url = format!("{server_url}/unknown_octet");
+        let initial_unk = D::build_target_filename(&unk_url, Some("raw_blob"), None);
+        assert_eq!(initial_unk, "raw_blob"); // No extension!
+        let unk_dest = temp_dir.join(&initial_unk);
+        let (ok_unk, ct_unk) = D::curl_to_file_with_meta(&unk_url, "", &unk_dest).await;
+        assert!(ok_unk);
+        assert_eq!(ct_unk.as_deref(), Some("application/octet-stream"));
+        assert_eq!(D::extension_from_content_type(ct_unk.as_deref().unwrap()), None);
+        // CRITICAL CHECK: unknown ≠ jpg
+        assert_ne!(unk_dest.extension().and_then(|e| e.to_str()), Some("jpg"), "unknown media KHÔNG được là .jpg");
+        assert_eq!(unk_dest.extension(), None, "unknown media phải giữ nguyên no-extension");
+        assert!(unk_dest.exists());
+
+        let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        println!("TEST #2: PASS");
     }
 }

@@ -19,6 +19,8 @@ export function isTauri() {
   }
 }
 
+let fallbackDeviceId = null
+
 export function getDeviceId() {
   try {
     let id = localStorage.getItem('app_device_id')
@@ -32,7 +34,14 @@ export function getDeviceId() {
     }
     return id
   } catch {
-    return 'dev_fallback'
+    if (!fallbackDeviceId) {
+      fallbackDeviceId =
+        'dev_fallback_' +
+        (typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+          : Math.random().toString(36).slice(2, 14))
+    }
+    return fallbackDeviceId
   }
 }
 
@@ -198,6 +207,7 @@ export async function startNativeDownload({
   referer = null,
   useAria2c = false,
   taskId = null,
+  platform = null,
 }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
   const customDir = destDir || getCustomDownloadDir() || null
@@ -229,6 +239,7 @@ export async function startNativeDownload({
         referer: referer || null,
         use_aria2c: Boolean(useAria2c),
         task_id: taskId || null,
+        platform: platform || null,
       },
     })
   } catch (err) {
@@ -329,16 +340,16 @@ export async function getBrowsersList() {
   try {
     const browsers = await invoke('get_browsers_list')
     return { browsers }
-  } catch {
-    return null
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi lấy danh sách trình duyệt')
   }
 }
 
 export async function getSystemHealth() {
   try {
     return await invoke('get_system_health')
-  } catch {
-    return null
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi kiểm tra hệ thống')
   }
 }
 
@@ -354,8 +365,8 @@ export async function getDownloadHistory(limit = 30) {
       deviceId,
     })
     return { total: list?.length || 0, history: list || [] }
-  } catch {
-    return { total: 0, history: [] }
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi tải lịch sử')
   }
 }
 
@@ -384,16 +395,16 @@ export async function savePlatformCookies(platform, cookieString) {
 export async function getCookieStatus() {
   try {
     return await invoke('get_cookie_status')
-  } catch {
-    return null
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy trạng thái cookie')
   }
 }
 
 export async function getSupportedCookiePlatforms() {
   try {
     return await invoke('get_supported_cookie_platforms')
-  } catch {
-    return []
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy danh sách nền tảng')
   }
 }
 
@@ -422,15 +433,17 @@ export function buildProxyMediaUrl(mediaUrl) {
 /**
  * Tải một tệp ảnh trực tiếp về thư mục Downloads với header chống chặn 403
  */
-export async function downloadDirectFile({ url, filename, referer, destDir }) {
+export async function downloadDirectFile({ url, filename, referer, destDir, platform = null }) {
   const customDir = destDir || getCustomDownloadDir() || null
+
   try {
     return await invoke('download_direct_file', {
-      url: url.trim(),
+      url,
       filename: filename || null,
       referer: referer || null,
       destDir: customDir,
       deviceId: getDeviceId(),
+      platform: platform || null,
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải tệp', { cause: err })
@@ -440,20 +453,18 @@ export async function downloadDirectFile({ url, filename, referer, destDir }) {
 /**
  * Tải album nhiều ảnh hoặc đóng gói thành file ZIP native trên máy
  */
-export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, asZip = false, taskId = null }) {
+export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, asZip = false, taskId = null, platform = null }) {
   const customDir = destDir || getCustomDownloadDir() || null
+
   try {
     return await invoke('download_album_batch', {
-      items: items.map((it) => ({
-        url: it.url,
-        filename: it.filename || it.title || null,
-        referer: it.referer || null,
-      })),
-      albumName: albumName || 'Album_Media',
+      items: items.map((i) => ({ ...i, filename: i.filename || null, referer: i.referer || null })),
+      albumName,
       destDir: customDir,
       asZip: Boolean(asZip),
       deviceId: getDeviceId(),
       taskId: taskId || null,
+      platform: platform || null,
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải album', { cause: err })
@@ -464,7 +475,7 @@ export async function downloadAlbumBatch({ items, albumName = 'Album_Media', des
  * ZIP download: Trong Tauri dùng Native Rust (nhanh, chống 403, lưu trực tiếp ổ cứng).
  * Nếu chạy web thuần thì fallback sang JSZip.
  */
-export async function downloadZipArchive(items, zipName = 'Album_Media', onProgress, taskId = null) {
+export async function downloadZipArchive(items, zipName = 'Album_Media', onProgress, taskId = null, platform = null) {
   if (isTauri()) {
     onProgress?.({ receivedBytes: 0, total: items.length })
     const res = await downloadAlbumBatch({
@@ -472,6 +483,7 @@ export async function downloadZipArchive(items, zipName = 'Album_Media', onProgr
       albumName: zipName,
       asZip: true,
       taskId,
+      platform,
     })
     onProgress?.({ receivedBytes: items.length, total: items.length })
     return res
@@ -526,8 +538,8 @@ export async function downloadZipArchive(items, zipName = 'Album_Media', onProgr
 export async function getBinaryStatus() {
   try {
     return await invoke('get_binary_status')
-  } catch {
-    return null
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi lấy trạng thái binary')
   }
 }
 
@@ -554,8 +566,8 @@ export async function updateGalleryDl() {
 export async function getAppSettings() {
   try {
     return await invoke('get_app_settings')
-  } catch {
-    return null
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi đọc cấu hình')
   }
 }
 

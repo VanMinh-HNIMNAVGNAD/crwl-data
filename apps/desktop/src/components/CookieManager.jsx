@@ -175,7 +175,7 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
       const s = await getCookieStatus()
       setStatus(s)
     } catch (err) {
-      void err
+      showToast('error', typeof err === 'string' ? err : err?.message || 'Lỗi khi tải trạng thái cookie')
     }
   }
 
@@ -186,7 +186,9 @@ export default function CookieManager({ isOpen, onClose, onCookieUpdated }) {
         .then((s) => {
           if (active) setStatus(s)
         })
-        .catch(() => {})
+        .catch((err) => {
+          if (active) showToast('error', typeof err === 'string' ? err : err?.message || 'Lỗi khi tải trạng thái cookie')
+        })
     }
     return () => {
       active = false

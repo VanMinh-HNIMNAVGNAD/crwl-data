@@ -21,6 +21,9 @@ from ..models import (
 from ..cookies.browser_cookies import get_browser_cookies_txt
 
 
+YOUTUBE_VIDEO_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+
+
 class YtDlpExtractor(BaseExtractor):
     """Wrapper cho yt-dlp binary"""
 
@@ -181,14 +184,14 @@ class YtDlpExtractor(BaseExtractor):
         raw_platform = (raw.get("extractor_key") or raw.get("extractor") or "media").lower()
         platform = self._detect_platform_string(raw_platform, original_url)
 
-        title = raw.get("title") or "Không có tiêu đề"
-        author = raw.get("uploader") or raw.get("channel") or raw.get("creator") or "Tác giả"
-        author_url = raw.get("uploader_url") or raw.get("channel_url") or original_url
-        duration_sec = raw.get("duration") or 0
-        duration = self.format_duration(duration_sec)
+        title = raw.get("title") or None
+        author = raw.get("uploader") or raw.get("channel") or raw.get("creator") or None
+        author_url = raw.get("uploader_url") or raw.get("channel_url") or None
+        duration_sec = raw.get("duration")
+        duration = self.format_duration(duration_sec) if duration_sec else None
 
         view_count = raw.get("view_count")
-        views = f"{self.format_number(view_count)} lượt xem" if view_count is not None else "Không xác định"
+        views = f"{self.format_number(view_count)} lượt xem" if view_count is not None else None
 
         like_count = raw.get("like_count")
         likes = f"{self.format_number(like_count)} lượt thích" if like_count is not None else None
@@ -230,8 +233,6 @@ class YtDlpExtractor(BaseExtractor):
                         seen_langs.add(lang)
                         first = s_list[0] if isinstance(s_list, list) and s_list else {}
                         s_name = first.get("name") or lang.upper()
-                        if is_auto:
-                            s_name += " (Tự động)"
                         subtitles.append(
                             SubtitleItem(
                                 lang=lang,
@@ -268,7 +269,7 @@ class YtDlpExtractor(BaseExtractor):
                     format_id="live_best",
                     quality="Live Stream (Chất lượng tốt nhất)",
                     format="HLS",
-                    size="Live",
+                    size=None,
                     stream_type="full",
                     has_audio=True,
                     has_video=True,
@@ -306,20 +307,17 @@ class YtDlpExtractor(BaseExtractor):
                         label = "Tiết kiệm (360p)"
 
                     muxed_spec = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
-                    bitrate_k = 12000 if h >= 2160 else 6000 if h >= 1440 else 3000 if h >= 1080 else 1500 if h >= 720 else 800
-                    approx_size = self.format_bytes(int(duration_sec * bitrate_k * 1000 / 8)) if duration_sec else "Tự động"
 
                     streams.append(
                         StreamFormat(
                             format_id=muxed_spec,
                             quality=f"{label} — Có âm thanh đầy đủ",
                             format="MP4",
-                            size=approx_size,
+                            size=None,
+                            raw_size=None,
                             stream_type="full",
                             has_audio=True,
                             has_video=True,
-                            fps="60fps" if h >= 1080 else "30fps",
-                            bitrate=f"{bitrate_k}kbps",
                         )
                     )
 
@@ -334,8 +332,8 @@ class YtDlpExtractor(BaseExtractor):
                             format_id="hd",
                             quality="HD (Độ phân giải cao) — Có âm thanh đầy đủ",
                             format=(hd.get("ext") or "mp4").upper(),
-                            size=self.format_bytes(sz) if sz else "Tự động",
-                            raw_size=sz,
+                            size=self.format_bytes(sz) if sz else None,
+                            raw_size=sz or None,
                             stream_type="full",
                             has_audio=True,
                             has_video=True,
@@ -349,8 +347,8 @@ class YtDlpExtractor(BaseExtractor):
                             format_id="sd",
                             quality="SD (Tiêu chuẩn) — Có âm thanh đầy đủ",
                             format=(sd.get("ext") or "mp4").upper(),
-                            size=self.format_bytes(sz) if sz else "Tự động",
-                            raw_size=sz,
+                            size=self.format_bytes(sz) if sz else None,
+                            raw_size=sz or None,
                             stream_type="full",
                             has_audio=True,
                             has_video=True,
@@ -371,8 +369,8 @@ class YtDlpExtractor(BaseExtractor):
                             format_id=str(f.get("format_id")),
                             quality=f"{h}p (Chỉ video / Không tiếng)",
                             format=(f.get("ext") or "mp4").upper(),
-                            size=self.format_bytes(sz) if sz else "Tự động",
-                            raw_size=sz,
+                            size=self.format_bytes(sz) if sz else None,
+                            raw_size=sz or None,
                             stream_type="mute",
                             has_audio=False,
                             has_video=True,
@@ -385,27 +383,26 @@ class YtDlpExtractor(BaseExtractor):
 
             # Audio formats chuẩn
             audio_presets = [
-                ("opus_best", "OPUS Chuẩn gốc (160 kbps, không suy hao)", "OPUS", 160),
-                ("mp3_320k", "MP3 Chất lượng cao (320 kbps)", "MP3", 320),
-                ("mp3_192k", "MP3 Chuẩn phổ biến (192 kbps)", "MP3", 192),
-                ("m4a_aac", "M4A / AAC Gốc (256 kbps)", "M4A", 256),
-                ("ogg_vorbis", "OGG Vorbis (192 kbps)", "OGG", 192),
-                ("flac_lossless", "FLAC Âm thanh lossless (phòng thu)", "FLAC", 900),
-                ("wav_lossless", "WAV Bản ghi không nén (Uncompressed)", "WAV", 1411),
-                ("alac_lossless", "ALAC Chuẩn Apple Lossless", "ALAC", 900),
+                ("opus_best", "OPUS Chuẩn gốc (160 kbps, không suy hao)", "OPUS"),
+                ("mp3_320k", "MP3 Chất lượng cao (320 kbps)", "MP3"),
+                ("mp3_192k", "MP3 Chuẩn phổ biến (192 kbps)", "MP3"),
+                ("m4a_aac", "M4A / AAC Gốc (256 kbps)", "M4A"),
+                ("ogg_vorbis", "OGG Vorbis (192 kbps)", "OGG"),
+                ("flac_lossless", "FLAC Âm thanh lossless (phòng thu)", "FLAC"),
+                ("wav_lossless", "WAV Bản ghi không nén (Uncompressed)", "WAV"),
+                ("alac_lossless", "ALAC Chuẩn Apple Lossless", "ALAC"),
             ]
-            for fid, q_label, ext_label, br in audio_presets:
-                sz = self.format_bytes(int(duration_sec * br * 1000 / 8)) if duration_sec else "Tự động"
+            for fid, q_label, ext_label in audio_presets:
                 streams.append(
                     StreamFormat(
                         format_id=fid,
                         quality=q_label,
                         format=ext_label,
-                        size=sz,
+                        size=None,
+                        raw_size=None,
                         stream_type="audio",
                         has_audio=True,
                         has_video=False,
-                        bitrate=f"{br}kbps" if br < 900 else "Lossless",
                     )
                 )
 
@@ -414,7 +411,7 @@ class YtDlpExtractor(BaseExtractor):
         is_short = (
             "/shorts/" in url_lower
             or "/shorts/" in str(raw.get("webpage_url", "")).lower()
-            or (platform == "youtube" and 0 < duration_sec <= 65 and (raw.get("height") or 0) > (raw.get("width") or 0))
+            or (platform == "youtube" and duration_sec is not None and 0 < duration_sec <= 65 and (raw.get("height") or 0) > (raw.get("width") or 0))
         )
         is_reel = (
             "/reel/" in url_lower
@@ -452,32 +449,51 @@ class YtDlpExtractor(BaseExtractor):
     def _parse_playlist_data(self, stdout_data: str, url: str) -> ProfileCrawlResult:
         lines = [l.strip() for l in stdout_data.strip().split("\n") if l.strip().startswith("{")]
         media: List[CrawlMediaItem] = []
-        channel_name = "Playlist / Channel"
-        channel_handle = "@channel"
+        channel_name = None
+        channel_handle = None
         avatar = ""
+        platform = self._detect_platform_string("", url)
 
         for idx, line in enumerate(lines, 1):
             try:
                 item = json.loads(line)
                 if item.get("channel") or item.get("uploader"):
                     channel_name = item.get("channel") or item.get("uploader")
-                    handle_id = item.get("channel_id") or item.get("uploader_id") or channel_name.lower().replace(" ", "")
-                    channel_handle = f"@{handle_id}"
+                    handle_id = item.get("channel_id") or item.get("uploader_id") or (channel_name.lower().replace(" ", "") if channel_name else None)
+                    channel_handle = f"@{handle_id}" if handle_id else None
 
                 thumbs = item.get("thumbnails")
                 best_thumb = thumbs[-1].get("url") if isinstance(thumbs, list) and thumbs else (item.get("thumbnail") or "")
 
-                video_url = item.get("url") or ""
-                if not video_url.startswith("http"):
-                    item_id = item.get("id") or str(idx)
-                    video_url = f"https://www.youtube.com/watch?v={item_id}"
+                # Trích xuất URL thực từ source
+                raw_url = item.get("url") or item.get("webpage_url") or item.get("original_url")
+                if isinstance(raw_url, str) and (raw_url.startswith("http://") or raw_url.startswith("https://")):
+                    video_url = raw_url
+                else:
+                    # Nếu source không có URL thật:
+                    # Chỉ construct YouTube URL nếu:
+                    # 1. Platform chắc chắn là YouTube
+                    # 2. ID chắc chắn hợp lệ (11 ký tự chuẩn base64url của YouTube)
+                    # 3. URL format được xác định chính xác
+                    item_ie = str(item.get("ie_key") or item.get("extractor_key") or item.get("extractor") or "").strip().lower()
+                    is_definitely_youtube = (platform == "youtube") or (item_ie in ("youtube", "youtubetab", "youtubeplaylist", "youtubechannel"))
 
-                v_lower = video_url.lower()
+                    candidate_id = str(item.get("id") or "").strip()
+                    if not YOUTUBE_VIDEO_ID_REGEX.match(candidate_id):
+                        alt_id = str(item.get("url") or "").strip()
+                        candidate_id = alt_id if YOUTUBE_VIDEO_ID_REGEX.match(alt_id) else ""
+
+                    if is_definitely_youtube and candidate_id:
+                        video_url = f"https://www.youtube.com/watch?v={candidate_id}"
+                    else:
+                        video_url = None
+
+                v_lower = (video_url or "").lower()
                 is_short = "/shorts/" in v_lower
                 is_reel = "/reel/" in v_lower or "/reels/" in v_lower
 
                 dur = item.get("duration")
-                duration_str = self.format_duration(dur) if dur else "Video"
+                duration_str = self.format_duration(dur) if dur else None
 
                 vc = item.get("view_count")
                 views_str = f"{self.format_number(vc)} lượt xem" if vc is not None else None
@@ -486,13 +502,13 @@ class YtDlpExtractor(BaseExtractor):
                     CrawlMediaItem(
                         id=idx,
                         type="video",
-                        title=item.get("title") or f"Video {idx}",
+                        title=item.get("title") or None,
                         thumb=best_thumb,
                         url=video_url,
                         duration=duration_str,
-                        quality="HD",
-                        size="Tự động",
-                        author=item.get("uploader") or item.get("channel") or channel_name,
+                        quality=None,
+                        size=None,
+                        author=item.get("uploader") or item.get("channel") or channel_name or None,
                         views=views_str,
                         is_reel=is_reel or None,
                         is_short=is_short or None,
@@ -500,8 +516,6 @@ class YtDlpExtractor(BaseExtractor):
                 )
             except Exception:
                 continue
-
-        platform = self._detect_platform_string("", url)
 
         return ProfileCrawlResult(
             platform=platform,
@@ -545,9 +559,9 @@ class YtDlpExtractor(BaseExtractor):
         return "generic"
 
     @staticmethod
-    def format_duration(seconds: Optional[float]) -> str:
-        if not seconds or math.isnan(seconds):
-            return "00:00"
+    def format_duration(seconds: Optional[float]) -> Optional[str]:
+        if not seconds or math.isnan(seconds) or seconds <= 0:
+            return None
         s = int(seconds)
         secs = s % 60
         mins = (s // 60) % 60

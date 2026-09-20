@@ -4,7 +4,7 @@ from .gallery import GalleryDlExtractor
 from .tiktok import TikTokExtractor
 from .movie import MovieExtractor
 from .direct import DirectImageExtractor
-from .web_scraper import WebScraperExtractor
+from .web_scraper import WebScraperExtractor, OversizedResponseError
 
 __all__ = [
     "BaseExtractor",
@@ -14,5 +14,6 @@ __all__ = [
     "MovieExtractor",
     "DirectImageExtractor",
     "WebScraperExtractor",
+    "OversizedResponseError",
 ]
 

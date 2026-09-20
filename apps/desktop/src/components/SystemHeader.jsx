@@ -40,6 +40,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
       if (cs) setCookieCount(cs.platforms?.filter((p) => p.has_cookies).length || 0)
     } catch (err) {
       console.warn('Lỗi khi làm mới trình duyệt:', err)
+      showToast(typeof err === 'string' ? err : err?.message || 'Lỗi khi làm mới trình duyệt')
     }
   }
 
@@ -63,6 +64,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
       })
       .catch((err) => {
         console.warn('Lỗi khi tải thông tin hệ thống:', err)
+        if (active) showToast(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải thông tin hệ thống')
       })
     return () => {
       active = false

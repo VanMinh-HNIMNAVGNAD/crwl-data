@@ -31,6 +31,80 @@ import {
 } from '../services/api'
 import DownloadProgressCard from './DownloadProgressCard'
 
+/**
+ * Loại bỏ ký tự không hợp lệ và nguy hiểm trên Linux, ngăn chặn path traversal.
+ */
+function sanitizeFilenamePart(str, fallback = 'image') {
+  if (!str || typeof str !== 'string') return fallback
+  const cleaned = str
+    .replace(/[/\0\\:*?"<>|;&$!`\n\r\t]/g, '_')
+    .replace(/\.{2,}/g, '_')
+    .trim()
+    .replace(/^\.+|\.+$/g, '')
+    .slice(0, 100)
+    .trim()
+  return cleaned || fallback
+}
+
+/**
+ * Sinh danh sách item tải batch với filename unique cho mỗi media:
+ * - Ưu tiên: title + media ID (ví dụ: image_12345.jpg)
+ * - Nếu media ID không tồn tại: dùng cơ chế collision-safe (ví dụ: image_001.jpg)
+ * - Đảm bảo mỗi selected media trong một batch phải có filename unique (không trùng lặp)
+ * - Filename hợp lệ trên Linux, loại bỏ ký tự nguy hiểm, chống path traversal, extension đúng
+ */
+function generateBatchMediaFilenames(items, defaultReferer = null) {
+  const usedNames = new Set()
+  return items.map((img, idx) => {
+    // 1. Xác định extension chuẩn
+    let ext = (img.ext || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+    if (!ext && img.url) {
+      const match = img.url.split('?')[0].match(/\.([a-zA-Z0-9]{3,4})$/)
+      if (match) ext = match[1].toLowerCase()
+    }
+    if (!ext) ext = 'jpg'
+
+    // 2. Làm sạch title và tách extension nếu title đã chứa
+    let rawTitle = (img.title || 'image').trim()
+    if (ext && rawTitle.toLowerCase().endsWith(`.${ext}`)) {
+      rawTitle = rawTitle.slice(0, -(ext.length + 1))
+    }
+    const cleanTitle = sanitizeFilenamePart(rawTitle, 'image')
+
+    // 3. Ưu tiên: title + media ID
+    const rawId = img.id != null ? String(img.id).trim() : ''
+    const cleanId = rawId ? sanitizeFilenamePart(rawId, '') : ''
+
+    let baseName
+    if (cleanId) {
+      if (cleanTitle.endsWith(`_${cleanId}`) || cleanTitle === cleanId) {
+        baseName = cleanTitle
+      } else {
+        baseName = `${cleanTitle}_${cleanId}`
+      }
+    } else {
+      // Cơ chế collision-safe khi không có media ID
+      const indexStr = String(idx + 1).padStart(3, '0')
+      baseName = `${cleanTitle}_${indexStr}`
+    }
+
+    // 4. Đảm bảo 100% unique trong batch
+    let candidate = `${baseName}.${ext}`
+    let counter = 1
+    while (usedNames.has(candidate)) {
+      candidate = `${baseName}_${counter}.${ext}`
+      counter++
+    }
+    usedNames.add(candidate)
+
+    return {
+      url: img.url,
+      filename: candidate,
+      referer: img.referer || defaultReferer || null,
+    }
+  })
+}
+
 export default function LinkDownloader({ onShowToast }) {
   const [mode, setMode] = useState('single') // 'single' | 'batch'
   const [url, setUrl] = useState('')
@@ -332,6 +406,7 @@ export default function LinkDownloader({ onShowToast }) {
         concurrentFragments: accelerate ? 8 : 1,
         videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
         taskId,
+        platform: media.platform,
       })
 
       if (res?.success) {
@@ -406,12 +481,15 @@ export default function LinkDownloader({ onShowToast }) {
   // Tải ảnh album đơn lẻ
   const handleDownloadImage = async (img) => {
     try {
+      const generated = generateBatchMediaFilenames([img], singleMedia?.originalUrl)
+      const filename = generated[0]?.filename || `${sanitizeFilenamePart(img.title || 'photo')}.${img.ext || 'jpg'}`
       if (isTauri()) {
-        onShowToast?.(`Đang tải ảnh: ${img.title || 'photo'}...`)
+        onShowToast?.(`Đang tải ảnh: ${filename}...`)
         const res = await downloadDirectFile({
           url: img.url,
-          filename: `${img.title || 'photo'}.${img.ext || 'jpg'}`,
+          filename,
           referer: singleMedia?.originalUrl,
+          platform: singleMedia?.platform,
         })
         if (res?.file_name) {
           onShowToast?.(`Đã lưu: ${res.file_name}`)
@@ -421,7 +499,7 @@ export default function LinkDownloader({ onShowToast }) {
       const directUrl = buildProxyMediaUrl(img.url)
       const a = document.createElement('a')
       a.href = directUrl
-      a.download = `${img.title || 'photo'}.${img.ext || 'jpg'}`
+      a.download = filename
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
@@ -489,18 +567,20 @@ export default function LinkDownloader({ onShowToast }) {
         console.warn('Cannot attach progress listener:', e)
       }
 
-      const itemsPayload = itemsToDownload.map((img) => ({
-        url: img.url,
-        // Rust tự bổ sung đúng đuôi tệp theo URL thật, không ép cứng .jpg nữa
-        filename: img.title || 'image',
-        referer: singleMedia?.originalUrl,
-      }))
+      const itemsPayload = generateBatchMediaFilenames(
+        itemsToDownload.map((img) => ({
+          ...img,
+          referer: singleMedia?.originalUrl,
+        })),
+        singleMedia?.originalUrl
+      )
       const res = await downloadAlbumBatch({
         items: itemsPayload,
         albumName: `${singleMedia?.title || 'Album'}_Media`,
         destDir: targetDir,
         asZip: asZip,
         taskId,
+        platform: singleMedia?.platform,
       })
       setNativeProgress({
         id: taskId,

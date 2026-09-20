@@ -33,9 +33,9 @@ class DirectImageExtractor(BaseExtractor):
 
     def extract(self, url: str) -> MediaMetadata:
         target_url = url.strip()
-        filename = "image.jpg"
-        size_str = "Tự động"
-        ext = "jpg"
+        filename = None
+        size_str = None
+        ext = None
 
         try:
             clean_path = target_url.split("?")[0]
@@ -62,7 +62,7 @@ class DirectImageExtractor(BaseExtractor):
             id=1,
             url=target_url,
             title=filename,
-            resolution="Ảnh gốc HD",
+            resolution=None,
             size=size_str,
             type="gif" if ext == "gif" else "image",
             ext=ext,
@@ -72,11 +72,11 @@ class DirectImageExtractor(BaseExtractor):
         return MediaMetadata(
             id=str(int(time.time() * 1000)),
             platform="direct",
-            title=f"{filename} (Hình ảnh trực tiếp)",
-            author="Hình ảnh Web",
-            author_url=target_url,
-            duration="1 hình ảnh",
-            views="Chất lượng gốc",
+            title=filename,
+            author=None,
+            author_url=None,
+            duration=None,
+            views=None,
             thumbnail=target_url,
             high_res_thumbnail=target_url,
             type="album",

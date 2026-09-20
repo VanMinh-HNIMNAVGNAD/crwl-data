@@ -297,7 +297,7 @@ class MediaDispatcher(BaseExtractor):
         target_url = self._normalize_x_url(target_url)
         target_url = self._normalize_instagram_url(target_url, media_type)
 
-        is_youtube = clean_hint == "youtube" or any(d in target_url for d in ("youtube.com", "youtu.be", "/playlist"))
+        is_youtube = clean_hint == "youtube" or any(d in target_url for d in ("youtube.com", "youtu.be"))
         is_tiktok = clean_hint == "tiktok" or "tiktok.com" in target_url
         is_soundcloud = clean_hint == "soundcloud" or "soundcloud.com" in target_url
         is_twitch = clean_hint == "twitch" or "twitch.tv" in target_url
@@ -406,7 +406,7 @@ class MediaDispatcher(BaseExtractor):
         import urllib.parse
         parsed = urllib.parse.urlparse(target_url)
         domain = parsed.netloc or target_url
-        title = f"Media từ {domain}"
+        title = None
 
         if not self.sniffer.is_available():
             raise RuntimeError(
@@ -433,12 +433,12 @@ class MediaDispatcher(BaseExtractor):
             return MediaMetadata(
                 id=str(abs(hash(target_url))),
                 platform="facebook" if is_fb else "generic",
-                title=title or "Bộ sưu tập ảnh",
-                author=domain,
-                author_url=target_url,
-                duration="Không xác định",
-                views="Không xác định",
-                thumbnail=images[0].thumb or images[0].url if images else "",
+                title=None,
+                author=None,
+                author_url=None,
+                duration=None,
+                views=None,
+                thumbnail=images[0].thumb or images[0].url if images else None,
                 type="album",
                 original_url=target_url,
                 description=f"🔍 Tìm thấy {len(images)} ảnh chất lượng cao.",
@@ -451,12 +451,12 @@ class MediaDispatcher(BaseExtractor):
             return MediaMetadata(
                 id=str(abs(hash(target_url))),
                 platform="generic",
-                title=title,
-                author=domain,
-                author_url=target_url,
-                duration="Không xác định",
-                views="Không xác định",
-                thumbnail="",
+                title=None,
+                author=None,
+                author_url=None,
+                duration=None,
+                views=None,
+                thumbnail=None,
                 type="video",
                 original_url=target_url,
                 description=(
@@ -470,12 +470,12 @@ class MediaDispatcher(BaseExtractor):
         return MediaMetadata(
             id=str(abs(hash(target_url))),
             platform="generic",
-            title=title,
-            author=domain,
-            author_url=target_url,
-            duration="Không xác định",
-            views="Không xác định",
-            thumbnail="",
+            title=None,
+            author=None,
+            author_url=None,
+            duration=None,
+            views=None,
+            thumbnail=None,
             type="video",
             original_url=target_url,
             description=f"🔍 Phát hiện {len(streams)} nguồn stream qua network interceptor.",

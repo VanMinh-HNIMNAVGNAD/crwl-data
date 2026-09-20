@@ -181,6 +181,7 @@ export default function AccountDownloader({ onShowToast }) {
           filename: item.title || 'image',
           referer: profileResult?.url,
           destDir: targetDir,
+          platform: profileResult?.platform || item.platform,
         })
       } else {
         try {
@@ -193,6 +194,7 @@ export default function AccountDownloader({ onShowToast }) {
           title: item.title,
           destDir: targetDir,
           taskId,
+          platform: profileResult?.platform || item.platform,
         })
       }
 
@@ -261,9 +263,10 @@ export default function AccountDownloader({ onShowToast }) {
       }
     }
 
-    const imageItems = itemsToDownload.filter((it) => it.type === 'image')
     const videoItems = itemsToDownload.filter((it) => it.type === 'video')
+    const imageItems = itemsToDownload.filter((it) => it.type !== 'video')
 
+    const albumName = `Profile_${profileResult?.name || 'Media'}`
     const taskId = createTaskId()
     setIsZipDownloading(true)
     setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} tệp`)
@@ -279,7 +282,10 @@ export default function AccountDownloader({ onShowToast }) {
     let unlisten = null
     try {
       let albumRes = null
-      if (imageItems.length > 0) {
+      let albumFolder = null
+
+      // CASE A: Chỉ có ảnh và người dùng chọn ZIP -> Tải ảnh và nén ZIP trực tiếp trong 1 lượt
+      if (asZip && videoItems.length === 0) {
         try {
           unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
         } catch (e) {
@@ -291,12 +297,14 @@ export default function AccountDownloader({ onShowToast }) {
           filename: `${it.title || 'media'}_${it.id}`,
           referer: profileResult?.url,
         }))
+
         albumRes = await downloadAlbumBatch({
           items: zipPayload,
-          albumName: `Profile_${profileResult?.name || 'Media'}`,
+          albumName,
           destDir: targetDir,
-          asZip: asZip,
+          asZip: true,
           taskId,
+          platform: profileResult?.platform || itemsToDownload[0]?.platform,
         })
 
         if (typeof unlisten === 'function') {
@@ -304,28 +312,76 @@ export default function AccountDownloader({ onShowToast }) {
           unlisten = null
         }
 
-        if (videoItems.length === 0) {
-          setNativeProgress({
-            id: taskId,
-            percent: 100,
-            speed: '',
-            eta: '',
-            status: 'completed',
-            phase: 'Hoàn tất',
-            filePath: albumRes?.file_path,
-            fileName: albumRes?.file_name,
-          })
-          onShowToast?.(
-            albumRes?.message ||
-              (albumRes?.file_path
-                ? `Đã lưu tại: ${albumRes.file_path}`
-                : `Đã tải thành công (${itemsToDownload.length} tệp)!`)
-          )
+        setNativeProgress({
+          id: taskId,
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'completed',
+          phase: 'Hoàn tất',
+          filePath: albumRes?.file_path,
+          fileName: albumRes?.file_name,
+        })
+        onShowToast?.(
+          albumRes?.message ||
+            (albumRes?.file_path
+              ? `Đã lưu ZIP tại: ${albumRes.file_path}`
+              : `Đã tải thành công (${itemsToDownload.length} tệp)!`)
+        )
+        return
+      }
+
+      // CASE B: Có video (chỉ video, hoặc cả ảnh + video) hoặc không chọn ZIP
+      // Bước 1: Tải toàn bộ ảnh vào thư mục album (chưa nén ZIP)
+      if (imageItems.length > 0) {
+        try {
+          unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+        } catch (e) {
+          console.warn('Cannot attach progress listener:', e)
+        }
+
+        const imgPayload = imageItems.map((it) => ({
+          url: it.url,
+          filename: `${it.title || 'media'}_${it.id}`,
+          referer: profileResult?.url,
+        }))
+
+        albumRes = await downloadAlbumBatch({
+          items: imgPayload,
+          albumName,
+          destDir: targetDir,
+          asZip: false,
+          taskId,
+          platform: profileResult?.platform || imageItems[0]?.platform,
+        })
+
+        if (typeof unlisten === 'function') {
+          unlisten()
+          unlisten = null
+        }
+
+        if (albumRes?.file_path) {
+          albumFolder = albumRes.file_path
+        }
+      } else if (asZip) {
+        // Nếu không có ảnh nhưng cần nén ZIP: khởi tạo thư mục album để tải video vào đó
+        const prepRes = await downloadAlbumBatch({
+          items: [],
+          albumName,
+          destDir: targetDir,
+          asZip: false,
+          taskId,
+          platform: profileResult?.platform,
+        })
+        if (prepRes?.file_path) {
+          albumFolder = prepRes.file_path
         }
       }
 
+      // Bước 2: Tải các video (lưu thẳng vào albumFolder nếu có, để gom chung với ảnh)
+      let lastVideoRes = null
       if (videoItems.length > 0) {
-        let lastVideoRes = null
+        const videoDestDir = albumFolder || targetDir
         for (let i = 0; i < videoItems.length; i++) {
           const item = videoItems[i]
           const vidTaskId = `${taskId}_vid_${i}`
@@ -355,8 +411,9 @@ export default function AccountDownloader({ onShowToast }) {
             lastVideoRes = await startNativeDownload({
               url: item.url,
               title: item.title,
-              destDir: targetDir,
+              destDir: videoDestDir,
               taskId: vidTaskId,
+              platform: profileResult?.platform || item.platform,
             })
           } finally {
             if (typeof unlisten === 'function') {
@@ -365,6 +422,27 @@ export default function AccountDownloader({ onShowToast }) {
             }
           }
         }
+      }
+
+      // Bước 3: Nếu là chế độ ZIP -> nén toàn bộ thư mục (đã chứa cả ảnh và video) thành file ZIP
+      if (asZip) {
+        setNativeProgress({
+          id: taskId,
+          percent: 92,
+          speed: '',
+          eta: '',
+          status: 'processing',
+          phase: 'Đang nén toàn bộ tệp vào file ZIP...',
+        })
+
+        const zipRes = await downloadAlbumBatch({
+          items: [],
+          albumName,
+          destDir: targetDir,
+          asZip: true,
+          taskId,
+          platform: profileResult?.platform,
+        })
 
         setNativeProgress({
           id: taskId,
@@ -373,8 +451,26 @@ export default function AccountDownloader({ onShowToast }) {
           eta: '',
           status: 'completed',
           phase: 'Hoàn tất',
-          filePath: lastVideoRes?.file_path || targetDir,
-          fileName: lastVideoRes?.file_name,
+          filePath: zipRes?.file_path,
+          fileName: zipRes?.file_name,
+        })
+        onShowToast?.(
+          zipRes?.message ||
+            (zipRes?.file_path
+              ? `Đã lưu ZIP tại: ${zipRes.file_path}`
+              : `Đã nén thành công (${itemsToDownload.length} tệp)!`)
+        )
+      } else {
+        // Chế độ download bình thường không ZIP
+        setNativeProgress({
+          id: taskId,
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'completed',
+          phase: 'Hoàn tất',
+          filePath: albumFolder || lastVideoRes?.file_path || targetDir,
+          fileName: albumRes?.file_name || lastVideoRes?.file_name,
         })
         onShowToast?.(`Đã tải thành công (${itemsToDownload.length} tệp)!`)
       }

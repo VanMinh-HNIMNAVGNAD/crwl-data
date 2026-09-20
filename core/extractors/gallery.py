@@ -168,10 +168,10 @@ class GalleryDlExtractor(BaseExtractor):
                 raise RuntimeError(f"gallery-dl crawl thất bại: {stderr.strip() or f'Exit code {code}'}")
             return ProfileCrawlResult(
                 platform="social",
-                name="Tài khoản",
-                handle="@profile",
+                name=None,
+                handle=None,
                 url=profile_url,
-                avatar="",
+                avatar=None,
                 stats="Đã quét 0 tệp",
                 media=[],
                 total_count=0,
@@ -187,10 +187,10 @@ class GalleryDlExtractor(BaseExtractor):
     def _normalize_gallery(self, raw_entries: List[Any], original_url: str) -> MediaMetadata:
         images: List[MediaImage] = []
         category = "social"
-        author = "Người dùng"
-        author_url = original_url
-        title = "Bộ sưu tập đa phương tiện"
-        description = ""
+        author = None
+        author_url = None
+        title = None
+        description = None
 
         index = 1
         for item in raw_entries:
@@ -228,9 +228,9 @@ class GalleryDlExtractor(BaseExtractor):
                 is_gif = ext == "gif"
                 item_type = "video" if is_video else ("gif" if is_gif else "image")
 
-                media_title = meta.get("filename") or meta.get("title") or (f"Video {index}" if is_video else f"Ảnh {index}")
-                res = f"{meta['width']}x{meta['height']}" if meta.get("width") and meta.get("height") else ("Video HD" if is_video else "Ảnh HD")
-                size_str = self.format_bytes(meta["filesize"]) if meta.get("filesize") else "Tự động"
+                media_title = meta.get("filename") or meta.get("title") or None
+                res = f"{meta['width']}x{meta['height']}" if meta.get("width") and meta.get("height") else None
+                size_str = self.format_bytes(meta["filesize"]) if meta.get("filesize") else None
                 thumb = meta.get("display_url") or meta.get("thumbnail") or (None if is_video else media_url)
 
                 if meta.get("category"):
@@ -256,12 +256,14 @@ class GalleryDlExtractor(BaseExtractor):
         is_single_video = len(images) == 1 and images[0].type == "video"
         streams = []
         if is_single_video:
+            quality_str = f"{images[0].resolution} — Video gốc chất lượng cao" if images[0].resolution else "Video gốc chất lượng cao"
             streams.append(
                 StreamFormat(
                     format_id="original_video",
-                    quality=f"{images[0].resolution or 'HD 1080p'} — Video gốc chất lượng cao",
+                    quality=quality_str,
                     format=(images[0].ext or "mp4").upper(),
-                    size=images[0].size or "Tự động",
+                    size=images[0].size,
+                    raw_size=None,
                     stream_type="full",
                     has_audio=True,
                     has_video=True,
@@ -274,14 +276,16 @@ class GalleryDlExtractor(BaseExtractor):
         if "twitter" in platform or "x.com" in platform:
             platform = "x"
 
+        final_title = images[0].title if is_single_video else (f"{title} ({len(images)} tệp)" if title else None)
+
         return MediaMetadata(
             id=str(abs(hash(original_url))) if original_url else str(int(time.time() * 1000)),
             platform=platform,
-            title=images[0].title if is_single_video else f"{title} ({len(images)} tệp)",
+            title=final_title,
             author=author,
             author_url=author_url,
-            duration="1 video" if is_single_video else f"{len(images)} hình ảnh",
-            views="Chất lượng gốc",
+            duration=None,
+            views=None,
             thumbnail=first_thumb,
             high_res_thumbnail=first_thumb,
             type="video" if is_single_video else "album",
@@ -294,8 +298,8 @@ class GalleryDlExtractor(BaseExtractor):
     def _parse_crawl_result(self, raw_entries: List[Any], profile_url: str, media_type: str) -> ProfileCrawlResult:
         media: List[CrawlMediaItem] = []
         platform = "social"
-        author = "Người dùng"
-        avatar = ""
+        author = None
+        avatar = None
 
         idx = 1
         for item in raw_entries:
@@ -334,25 +338,28 @@ class GalleryDlExtractor(BaseExtractor):
                 if item_avatar:
                     avatar = item_avatar
 
-                item_title = meta.get("title") or meta.get("filename") or (f"Video {idx}" if is_video else f"Hình ảnh {idx}")
+                item_title = meta.get("title") or meta.get("filename") or None
                 thumb_url = meta.get("display_url") or (meta.get("thumbnail") if is_video else media_url) or media_url
+
+                quality_str = f"{meta['width']}x{meta['height']}" if meta.get("width") and meta.get("height") else None
+                size_str = self.format_bytes(meta["filesize"]) if meta.get("filesize") else None
 
                 media.append(
                     CrawlMediaItem(
                         id=idx,
                         type="video" if is_video else "image",
-                        title=str(item_title),
+                        title=item_title,
                         thumb=thumb_url,
                         url=media_url,
-                        duration="Video" if is_video else "Ảnh HD",
-                        quality=f"{meta['width']}x{meta['height']}" if meta.get("width") and meta.get("height") else "HD",
-                        size=self.format_bytes(meta["filesize"]) if meta.get("filesize") else "Tự động",
+                        duration=None,
+                        quality=quality_str,
+                        size=size_str,
                         author=author,
                     )
                 )
                 idx += 1
 
-        clean_handle = f"@{author.lower().replace(' ', '')}" if author else "@profile"
+        clean_handle = f"@{author.lower().replace(' ', '')}" if author else None
 
         return ProfileCrawlResult(
             platform=platform,
