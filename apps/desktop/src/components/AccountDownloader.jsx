@@ -23,8 +23,21 @@ import {
 import DownloadProgressCard from './DownloadProgressCard'
 
 function safeMediaTitle(item, fallback = 'media') {
-  const raw = `${item?.title || fallback}_${item?.id || ''}`
-  const cleaned = raw
+  // Một bài đăng có thể chứa nhiều ảnh. Ghép mã bài đăng + số thứ tự trong bài
+  // để các ảnh cùng một bài không đè lên nhau và vẫn nhìn ra được chúng đi cùng
+  // nhau khi mở thư mục tải về.
+  const parts = [item?.title || fallback]
+  if (item?.postId) {
+    parts.push(item.postId)
+  }
+  if (item?.totalInPost > 1 && item?.indexInPost) {
+    parts.push(`${String(item.indexInPost).padStart(2, '0')}of${item.totalInPost}`)
+  }
+  parts.push(item?.id ?? '')
+
+  const cleaned = parts
+    .filter((part) => part !== '' && part != null)
+    .join('_')
     .replace(/[/\0\\:*?"<>|;&$!`\n\r\t]/g, '_')
     .replace(/\.{2,}/g, '_')
     .trim()
@@ -778,7 +791,7 @@ export default function AccountDownloader({ onShowToast }) {
 
           <div className="pane-control-row">
             <div className="pills-group">
-              <span className="control-label-text">Số lượng:</span>
+              <span className="control-label-text" title="Số BÀI ĐĂNG cần quét — mọi ảnh/video bên trong mỗi bài đều được lấy đủ">Số bài đăng:</span>
               {[
                 { id: '20', label: '20' },
                 { id: '50', label: '50' },
@@ -1025,7 +1038,11 @@ export default function AccountDownloader({ onShowToast }) {
                         {item.title || 'Phương tiện'}
                       </span>
                       <div className="profile-item-footer">
-                        <span className="item-quality-pill">{item.quality || 'HD'}</span>
+                        <span className="item-quality-pill">
+                          {item.totalInPost > 1
+                            ? `Ảnh ${item.indexInPost}/${item.totalInPost}${item.quality ? ` • ${item.quality}` : ''}`
+                            : item.quality || 'HD'}
+                        </span>
                         <button
                           type="button"
                           className="profile-download-btn"

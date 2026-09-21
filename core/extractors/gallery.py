@@ -10,8 +10,11 @@ import math
 import os
 import re
 import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Dict, Any, Tuple
 from .base import BaseExtractor
+from ..cancellation import attach_request, current_request_id, detach_request, raise_if_cancelled
 from ..models import (
     MediaMetadata,
     MediaImage,
@@ -24,6 +27,40 @@ from ..cookies.browser_cookies import get_browser_cookies_txt
 
 class GalleryDlExtractor(BaseExtractor):
     """Wrapper cho gallery-dl binary"""
+
+    # ── Quét theo BÀI ĐĂNG thay vì theo TỆP ──────────────────────────────
+    # gallery-dl `--range` đếm theo TỆP. Với tài khoản nhiều ảnh mỗi bài
+    # (carousel Instagram, album Facebook, post nhiều ảnh trên X/Bluesky),
+    # "--range 1-20" có thể chỉ phủ hết 4 bài rồi CẮT NGANG bài thứ 5 — người
+    # dùng thấy bài đăng bị thiếu ảnh. Nay số lượng người dùng nhập được hiểu là
+    # SỐ BÀI ĐĂNG, còn mọi tệp bên trong mỗi bài đều được giữ đủ.
+
+    # Những extractor đọc được `max-posts` (giới hạn chính xác theo bài đăng).
+    _MAX_POSTS_CATEGORIES = frozenset({
+        "instagram", "pixiv", "kemono", "artstation", "pawchive",
+    })
+
+    # Với extractor không hỗ trợ `max-posts`, nới rộng --range theo số tệp ước
+    # lượng mỗi bài rồi cắt lại đúng số bài ở phía chúng ta.
+    _FILES_PER_POST_HEADROOM = int(os.environ.get("CRWL_FILES_PER_POST", "5"))
+    _MAX_RANGE_FILES = int(os.environ.get("CRWL_MAX_RANGE_FILES", "800"))
+
+    # Bung bài đăng bị thiếu tệp bằng cách bóc tách riêng từng bài. Mỗi lần bung
+    # là một tiến trình gallery-dl nên phải chặn trên cả số lượng lẫn song song.
+    _MAX_EXPAND_POSTS = int(os.environ.get("CRWL_MAX_EXPAND_POSTS", "40"))
+    _EXPAND_WORKERS = max(1, int(os.environ.get("CRWL_EXPAND_WORKERS", "3")))
+    # Ngân sách thời gian cho toàn bộ việc bung bài đăng. Hết ngân sách thì dừng
+    # và trả về những gì đã có — thà thiếu vài bài còn hơn để Rust sidecar timeout
+    # rồi mất trắng cả lượt quét.
+    _EXPAND_BUDGET_SEC = float(os.environ.get("CRWL_EXPAND_BUDGET_SEC", "120"))
+    _EXPAND_POST_TIMEOUT = int(os.environ.get("CRWL_EXPAND_POST_TIMEOUT", "30"))
+
+    # Khoá nhận diện bài đăng, theo thứ tự ưu tiên (đủ dùng cho instagram,
+    # twitter/X, bluesky, facebook, reddit, pinterest, threads, tumblr...).
+    _POST_KEY_FIELDS = (
+        "post_url", "post_shortcode", "post_id", "sidecar_media_id",
+        "tweet_id", "uri", "shortcode", "gallery_id", "album_id",
+    )
 
     def __init__(self):
         super().__init__()
@@ -103,19 +140,36 @@ class GalleryDlExtractor(BaseExtractor):
             timeout = self._timeout_for(limit, range_start, range_end)
 
         args, tmp_cookie = self.get_base_args(target_url=profile_url, browser=browser)
+
+        # `range_start`/`range_end` và `limit` nay tính theo BÀI ĐĂNG.
         if range_start and range_end and range_end >= range_start:
-            range_spec = f"{range_start}-{range_end}"
+            first_post, last_post = range_start, range_end
         elif limit and limit > 0:
-            range_spec = f"1-{limit}"
+            first_post, last_post = 1, limit
         else:
-            range_spec = ""
+            first_post, last_post = 1, 0  # 0 = quét toàn bộ
 
         cmd = [self.binary_path, *args, "-j"]
-        if range_spec:
-            cmd.extend(["--range", range_spec])
+        category = self._category_of(profile_url)
+        limit_desc = "all"
+
+        if last_post > 0:
+            if category in self._MAX_POSTS_CATEGORIES:
+                # Giới hạn chính xác theo bài đăng; KHÔNG dùng --range để không
+                # cắt ngang carousel.
+                cmd.extend(["-o", f"max-posts={last_post}"])
+                limit_desc = f"max-posts={last_post}"
+            else:
+                budget = min(
+                    self._MAX_RANGE_FILES,
+                    max(last_post, last_post * self._FILES_PER_POST_HEADROOM),
+                )
+                cmd.extend(["--range", f"1-{budget}"])
+                limit_desc = f"posts 1-{last_post} (<= {budget} tệp)"
+
         cmd.append(profile_url)
 
-        self.log(f"gallery-dl crawl ({range_spec or 'all'}): {profile_url}")
+        self.log(f"gallery-dl crawl ({limit_desc}): {profile_url}")
         try:
             code, stdout, stderr = self.run_process(cmd, timeout=timeout)
         finally:
@@ -171,8 +225,231 @@ class GalleryDlExtractor(BaseExtractor):
                 total_count=0,
             )
 
-        return self._parse_crawl_result(raw_entries, profile_url, media_type)
+        # Gom tệp theo bài đăng → cắt đúng số bài người dùng yêu cầu → bung
+        # những bài còn thiếu tệp. Nhờ vậy mỗi bài đăng giữ được ĐỦ ảnh/video
+        # thay vì chỉ một ảnh đại diện.
+        groups = self._group_by_post(raw_entries)
+        if last_post > 0:
+            groups = groups[first_post - 1:last_post]
+        groups = self._expand_incomplete_posts(groups, browser)
 
+        return self._parse_crawl_result(groups, raw_entries, profile_url, media_type)
+
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Gom nhóm theo bài đăng & bung bài đăng bị thiếu tệp
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _category_of(url: str) -> str:
+        """Đoán category gallery-dl từ hostname (instagram, twitter, ...)."""
+        host = ""
+        try:
+            raw = (url or "").strip()
+            if not raw.lower().startswith(("http://", "https://")):
+                raw = "https://" + raw
+            host = (urllib.parse.urlparse(raw).hostname or "").lower()
+        except Exception:
+            return ""
+        table = {
+            "instagram.com": "instagram", "instagr.am": "instagram",
+            "x.com": "twitter", "twitter.com": "twitter",
+            "facebook.com": "facebook", "fb.com": "facebook",
+            "pinterest.com": "pinterest", "pin.it": "pinterest",
+            "reddit.com": "reddit", "redd.it": "reddit",
+            "threads.net": "threads", "threads.com": "threads",
+            "bsky.app": "bluesky", "tumblr.com": "tumblr",
+            "pixiv.net": "pixiv", "artstation.com": "artstation",
+            "kemono.su": "kemono", "kemono.party": "kemono",
+            "weibo.com": "weibo", "deviantart.com": "deviantart",
+        }
+        for domain, category in table.items():
+            if host == domain or host.endswith("." + domain):
+                return category
+        return ""
+
+    @classmethod
+    def _post_key(cls, meta: Dict[str, Any], fallback: str) -> str:
+        """Khoá nhận diện bài đăng chứa tệp này."""
+        if isinstance(meta, dict):
+            for field in cls._POST_KEY_FIELDS:
+                value = meta.get(field)
+                if isinstance(value, (str, int)) and str(value).strip():
+                    return f"{field}:{value}"
+        return fallback
+
+    @classmethod
+    def _post_url_of(cls, meta: Dict[str, Any]) -> Optional[str]:
+        """URL của bài đăng, dùng để bóc tách lại toàn bộ tệp bên trong."""
+        if not isinstance(meta, dict):
+            return None
+        for field in ("post_url", "webpage_url", "page_url", "permalink"):
+            value = meta.get(field)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                return value
+        shortcode = meta.get("post_shortcode") or meta.get("shortcode")
+        category = str(meta.get("category") or "").lower()
+        if shortcode and category == "instagram":
+            return f"https://www.instagram.com/p/{shortcode}/"
+
+        # Bluesky chỉ đưa ra `uri` dạng at:// — dựng lại URL web từ handle tác giả.
+        if category == "bluesky":
+            uri = str(meta.get("uri") or "")
+            author = meta.get("author") if isinstance(meta.get("author"), dict) else {}
+            handle = author.get("handle") or meta.get("username")
+            rkey = uri.rsplit("/", 1)[-1] if uri else ""
+            if handle and rkey:
+                return f"https://bsky.app/profile/{handle}/post/{rkey}"
+
+        # X/Twitter: gallery-dl đặt tweet_id + author.name
+        if category == "twitter":
+            tweet_id = meta.get("tweet_id") or meta.get("post_id")
+            author = meta.get("author") if isinstance(meta.get("author"), dict) else {}
+            handle = author.get("name") or meta.get("username")
+            if tweet_id and handle:
+                return f"https://x.com/{handle}/status/{tweet_id}"
+
+        return None
+
+    def _group_by_post(self, raw_entries: Optional[List[Any]]) -> List[Dict[str, Any]]:
+        """Gom các entry code-3 thành từng bài đăng, giữ nguyên thứ tự xuất hiện."""
+        order: List[str] = []
+        buckets: Dict[str, Dict[str, Any]] = {}
+
+        for position, item in enumerate(raw_entries or []):
+            if not (isinstance(item, list) and len(item) >= 2 and item[0] == 3):
+                continue
+            meta = item[2] if len(item) > 2 and isinstance(item[2], dict) else {}
+            key = self._post_key(meta, f"_entry_{position}")
+            if key not in buckets:
+                order.append(key)
+                buckets[key] = {"key": key, "entries": [], "url": self._post_url_of(meta)}
+            bucket = buckets[key]
+            bucket["entries"].append(item)
+            if not bucket["url"]:
+                bucket["url"] = self._post_url_of(meta)
+
+        return [buckets[k] for k in order]
+
+    @staticmethod
+    def _declared_file_count(entries: List[Any]) -> int:
+        """Số tệp mà gallery-dl KHAI BÁO bài đăng này có (`count` / `num`)."""
+        declared = 0
+        for entry in entries:
+            meta = entry[2] if len(entry) > 2 and isinstance(entry[2], dict) else {}
+            for field in ("count", "num"):
+                try:
+                    declared = max(declared, int(meta.get(field) or 0))
+                except (TypeError, ValueError):
+                    continue
+        return declared
+
+    @classmethod
+    def _is_incomplete_post(cls, entries: List[Any]) -> bool:
+        """Bài đăng này có bị trả thiếu tệp không?
+
+        Hai nguồn thiếu tệp đã gặp thực tế:
+          1. `count`/`num` khai báo nhiều hơn số tệp nhận được — xảy ra khi
+             `--range` cắt ngang bài đăng.
+          2. Instagram qua GraphQL khi phiên đăng nhập không đầy đủ: bài carousel
+             (`typename == "GraphSidecar"`) không kèm `edge_sidecar_to_children`
+             nên gallery-dl chỉ phát ra ĐÚNG MỘT tệp — chính là ảnh bìa.
+        """
+        seen = len(entries)
+        if seen == 0:
+            return False
+        if cls._declared_file_count(entries) > seen:
+            return True
+        if seen > 1:
+            return False
+        meta = entries[0][2] if len(entries[0]) > 2 and isinstance(entries[0][2], dict) else {}
+        # `typename` chỉ do nhánh GraphQL của Instagram đặt. Một bài GraphSidecar
+        # thật luôn có từ 2 ảnh trở lên, nên thấy đúng 1 tệp nghĩa là children đã
+        # bị lược bỏ và ta đang cầm ảnh bìa.
+        #
+        # KHÔNG dùng `sidecar_media_id` làm dấu hiệu: nhánh REST chỉ đặt nó khi
+        # `carousel_media` CÓ MẶT — mà lúc đó mọi ảnh đã được bung sẵn. Bài
+        # carousel đúng 1 ảnh sẽ bị bung lại vô ích, tốn thêm một tiến trình
+        # gallery-dl cho mỗi bài.
+        return str(meta.get("typename") or "") == "GraphSidecar"
+
+    def _fetch_post_entries(self, post_url: str, browser: Optional[str]) -> List[Any]:
+        """Bóc tách riêng một bài đăng để lấy ĐẦY ĐỦ tệp bên trong."""
+        args, tmp_cookie = self.get_base_args(target_url=post_url, browser=browser)
+        cmd = [self.binary_path, *args, "-j", post_url]
+        try:
+            code, stdout, stderr = self.run_process(cmd, timeout=self._EXPAND_POST_TIMEOUT)
+        finally:
+            self._cleanup_cookie(tmp_cookie)
+
+        if code != 0 and not (stdout or "").strip():
+            self.warn(f"Không bung được bài đăng {post_url}: {(stderr or '').strip()[:120]}")
+            return []
+        parsed = self._parse_json(stdout)
+        if self._detect_auth_error(parsed, stderr):
+            return []
+        return [
+            x for x in (parsed or [])
+            if isinstance(x, list) and len(x) >= 2 and x[0] == 3
+        ]
+
+    def _expand_incomplete_posts(
+        self,
+        groups: List[Dict[str, Any]],
+        browser: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Bóc tách lại những bài đăng bị trả thiếu tệp, thay tại chỗ."""
+        targets = [
+            g for g in groups
+            if g.get("url") and self._is_incomplete_post(g["entries"])
+        ]
+        if not targets:
+            return groups
+
+        capped = targets[: self._MAX_EXPAND_POSTS]
+        if len(targets) > len(capped):
+            self.warn(
+                f"Có {len(targets)} bài đăng thiếu tệp, chỉ bung {len(capped)} bài đầu "
+                f"(đặt CRWL_MAX_EXPAND_POSTS để nới giới hạn)."
+            )
+        self.log(f"Đang bung {len(capped)} bài đăng để lấy đủ ảnh bên trong...")
+
+        raise_if_cancelled()
+        parent_req = current_request_id()
+        deadline = time.monotonic() + self._EXPAND_BUDGET_SEC
+        skipped = 0
+
+        def worker(group: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Any]]:
+            # Luồng con sinh ra với req_id rỗng; không gắn lại thì tiến trình
+            # gallery-dl nó tạo sẽ không nằm trong sổ huỷ và nút "Hủy" vô tác dụng.
+            previous = attach_request(parent_req)
+            try:
+                if time.monotonic() >= deadline:
+                    return group, []
+                raise_if_cancelled()
+                return group, self._fetch_post_entries(group["url"], browser)
+            except Exception as err:  # một bài lỗi không được làm hỏng cả lượt quét
+                self.warn(f"Bung bài đăng thất bại ({group.get('url')}): {err}")
+                return group, []
+            finally:
+                detach_request(previous)
+
+        workers = min(self._EXPAND_WORKERS, len(capped))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="crwl-post") as pool:
+            for group, entries in pool.map(worker, capped):
+                if len(entries) > len(group["entries"]):
+                    self.log(
+                        f"Bài đăng {group.get('url')}: {len(group['entries'])} → {len(entries)} tệp"
+                    )
+                    group["entries"] = entries
+                elif not entries:
+                    skipped += 1
+
+        if skipped:
+            self.warn(f"{skipped} bài đăng chưa bung được (hết thời gian hoặc lỗi mạng).")
+
+        raise_if_cancelled()
+        return groups
 
     # ─────────────────────────────────────────────────────────────────────────
     # Normalizers
@@ -289,18 +566,21 @@ class GalleryDlExtractor(BaseExtractor):
             images=images,
         )
 
-    def _parse_crawl_result(self, raw_entries: List[Any], profile_url: str, media_type: str) -> ProfileCrawlResult:
+    def _parse_crawl_result(
+        self,
+        groups: List[Dict[str, Any]],
+        raw_entries: Optional[List[Any]],
+        profile_url: str,
+        media_type: str,
+    ) -> ProfileCrawlResult:
         media: List[CrawlMediaItem] = []
         platform = "social"
         author = None
         avatar = None
 
-        idx = 1
-        for item in raw_entries:
-            if not isinstance(item, list) or len(item) < 2:
-                continue
-
-            if item[0] == 2 and isinstance(item[1], dict):
+        # Thông tin tài khoản nằm ở entry code-2 (Message.Directory).
+        for item in (raw_entries or []):
+            if isinstance(item, list) and len(item) >= 2 and item[0] == 2 and isinstance(item[1], dict):
                 meta = item[1]
                 if meta.get("category"):
                     platform = meta["category"]
@@ -311,7 +591,15 @@ class GalleryDlExtractor(BaseExtractor):
                 if found_avatar:
                     avatar = found_avatar
 
-            elif item[0] == 3 and len(item) >= 2:
+        idx = 1
+        post_count = 0
+        for group in groups:
+            entries = group.get("entries") or []
+            post_url = group.get("url")
+            total_in_post = len(entries)
+            kept_in_post = 0
+
+            for position, item in enumerate(entries, 1):
                 raw_url = item[1]
                 meta = item[2] if len(item) > 2 and isinstance(item[2], dict) else {}
                 media_url = meta.get("video_url") or raw_url
@@ -338,6 +626,11 @@ class GalleryDlExtractor(BaseExtractor):
                 quality_str = f"{meta['width']}x{meta['height']}" if meta.get("width") and meta.get("height") else None
                 size_str = self.format_bytes(meta["filesize"]) if meta.get("filesize") else None
 
+                try:
+                    num_in_post = int(meta.get("num") or position)
+                except (TypeError, ValueError):
+                    num_in_post = position
+
                 media.append(
                     CrawlMediaItem(
                         id=idx,
@@ -349,11 +642,22 @@ class GalleryDlExtractor(BaseExtractor):
                         quality=quality_str,
                         size=size_str,
                         author=author,
+                        post_id=str(meta.get("post_shortcode") or meta.get("post_id") or "") or None,
+                        post_url=post_url,
+                        index_in_post=num_in_post if total_in_post > 1 else None,
+                        total_in_post=total_in_post if total_in_post > 1 else None,
                     )
                 )
                 idx += 1
+                kept_in_post += 1
+
+            if kept_in_post:
+                post_count += 1
 
         clean_handle = f"@{author.lower().replace(' ', '')}" if author else None
+        stats = f"Đã quét {len(media)} tệp phương tiện"
+        if post_count:
+            stats += f" từ {post_count} bài đăng"
 
         return ProfileCrawlResult(
             platform=platform,
@@ -361,7 +665,7 @@ class GalleryDlExtractor(BaseExtractor):
             handle=clean_handle,
             url=profile_url,
             avatar=avatar,
-            stats=f"Đã quét {len(media)} tệp phương tiện",
+            stats=stats,
             media=media,
             total_count=len(media),
         )
@@ -390,8 +694,9 @@ class GalleryDlExtractor(BaseExtractor):
             count = 0  # 0 = quét toàn bộ
         if count <= 0:
             return 540
-        # ~1.5s cho mỗi mục, kẹp trong khoảng 90s..540s
-        return max(90, min(540, 60 + int(count * 1.5)))
+        # `count` nay là SỐ BÀI ĐĂNG, mỗi bài có thể chứa nhiều tệp nên tốn thời
+        # gian hơn trước. ~3s mỗi bài, kẹp trong khoảng 90s..540s.
+        return max(90, min(540, 60 + int(count * 3)))
 
     # Dấu hiệu gallery-dl gặp lỗi do thiếu cookie đăng nhập.
     # 'username' KeyError là cách Instagram báo "chưa đăng nhập" khi bóc tách profile.

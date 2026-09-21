@@ -129,6 +129,14 @@ class CrawlMediaItem:
     is_live: Optional[bool] = None
     is_reel: Optional[bool] = None
     is_short: Optional[bool] = None
+    # Một bài đăng có thể chứa nhiều tệp (carousel Instagram, album Facebook,
+    # post nhiều ảnh trên X/Bluesky). Bốn trường dưới đây giữ lại quan hệ
+    # "tệp này thuộc bài đăng nào, là tệp thứ mấy / trên tổng bao nhiêu" để giao
+    # diện gom nhóm được và tên tệp tải về không đụng nhau.
+    post_id: Optional[str] = None
+    post_url: Optional[str] = None
+    index_in_post: Optional[int] = None
+    total_in_post: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = {
@@ -138,6 +146,14 @@ class CrawlMediaItem:
             "thumb": self.thumb,
             "url": self.url,
         }
+        if self.post_id:
+            res["postId"] = self.post_id
+        if self.post_url:
+            res["postUrl"] = self.post_url
+        if self.index_in_post is not None:
+            res["indexInPost"] = self.index_in_post
+        if self.total_in_post is not None:
+            res["totalInPost"] = self.total_in_post
         if self.duration:
             res["duration"] = self.duration
         if self.quality:

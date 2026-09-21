@@ -69,6 +69,25 @@ def current_request_id() -> Optional[str]:
     return getattr(_local, "req_id", None)
 
 
+def attach_request(req_id: Optional[str]) -> Optional[str]:
+    """Gắn luồng phụ vào request của luồng cha, trả về giá trị cũ để khôi phục.
+
+    Cờ huỷ và sổ tiến trình con được tra theo thread-local ``req_id``. Luồng
+    worker (ví dụ khi bung ảnh của nhiều bài đăng song song) sinh ra với
+    ``req_id = None``, nên tiến trình gallery-dl chúng tạo sẽ KHÔNG được ghi vào
+    sổ và lệnh "Hủy" không thể kill được. Hàm này chỉ gán thread-local, tuyệt đối
+    không đụng tới ``_registry`` — vòng đời request vẫn do luồng cha quản lý.
+    """
+    previous = getattr(_local, "req_id", None)
+    _local.req_id = req_id
+    return previous
+
+
+def detach_request(previous: Optional[str] = None) -> None:
+    """Khôi phục req_id của luồng sau khi ``attach_request``."""
+    _local.req_id = previous
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Theo dõi tiến trình con
 # ─────────────────────────────────────────────────────────────────────────────

@@ -242,7 +242,7 @@ def run_test_1():
     assert_no_disallowed_strings(gal_dict, "gallery_empty")
 
     # B4. GalleryExtractor crawl rỗng
-    empty_crawl = gallery._parse_crawl_result([], "https://instagram.com/unknown", "all")
+    empty_crawl = gallery._parse_crawl_result([], [], "https://instagram.com/unknown", "all")
     assert empty_crawl.name is None
     assert empty_crawl.handle is None
     assert_no_disallowed_strings(empty_crawl.to_dict(), "gallery_crawl_empty")

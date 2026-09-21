@@ -687,11 +687,15 @@ class MediaDispatcher(BaseExtractor):
                 return url
 
             # Nếu đã có subpath cụ thể
-            if subpath in ("posts", "reels", "tagged", "channel"):
+            if subpath in ("posts", "photos", "reels", "tagged", "channel"):
                 return f"{clean}/"
 
             if media_type == "video":
                 return f"{base}{username}/reels/"
+            if media_type == "image":
+                # `/photos/` là extractor riêng của gallery-dl, đã loại sẵn reel
+                # nên không phải tải về rồi lọc bỏ. Carousel vẫn được bung đủ ảnh.
+                return f"{base}{username}/photos/"
             return f"{base}{username}/posts/"
 
         return url
