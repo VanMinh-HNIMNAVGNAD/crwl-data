@@ -17,7 +17,7 @@ import {
   downloadDirectFile,
   downloadAlbumBatch,
   onDownloadProgress,
-  selectDownloadDirectory,
+  askForDownloadDirectory,
   getAlwaysAskDownloadDir,
 } from '../services/api'
 import DownloadProgressCard from './DownloadProgressCard'
@@ -215,7 +215,7 @@ export default function AccountDownloader({ onShowToast }) {
     let targetDir = undefined
     if (getAlwaysAskDownloadDir()) {
       try {
-        targetDir = await selectDownloadDirectory()
+        targetDir = await askForDownloadDirectory()
         if (!targetDir) {
           onShowToast?.('Đã hủy tải do chưa chọn thư mục lưu')
           setDownloadingId(null)
@@ -359,7 +359,7 @@ export default function AccountDownloader({ onShowToast }) {
     let targetDir = undefined
     if (getAlwaysAskDownloadDir()) {
       try {
-        targetDir = await selectDownloadDirectory()
+        targetDir = await askForDownloadDirectory()
         if (!targetDir) {
           onShowToast?.('Đã hủy do chưa chọn thư mục lưu')
           return

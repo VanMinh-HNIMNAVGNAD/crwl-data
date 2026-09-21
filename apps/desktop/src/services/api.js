@@ -329,6 +329,18 @@ export async function selectDownloadDirectory() {
   }
 }
 
+/**
+ * Hộp thoại chọn thư mục lưu tệp tải về nhưng KHÔNG lưu thành mặc định toàn cục
+ */
+export async function askForDownloadDirectory() {
+  try {
+    const dir = await invoke('select_download_directory')
+    return dir
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi chọn thư mục lưu tệp', { cause: err })
+  }
+}
+
 export async function getDefaultDownloadDirectory() {
   const custom = getCustomDownloadDir()
   if (custom) return custom

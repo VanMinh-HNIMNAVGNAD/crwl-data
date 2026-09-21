@@ -24,9 +24,8 @@ import {
   downloadAlbumBatch,
   downloadDirectFile,
   onDownloadProgress,
-  selectDownloadDirectory,
+  askForDownloadDirectory,
   getAlwaysAskDownloadDir,
-  setAlwaysAskDownloadDir,
 } from '../services/api'
 import DownloadProgressCard from './DownloadProgressCard'
 
@@ -122,7 +121,6 @@ export default function LinkDownloader({ onShowToast }) {
   const [downloadTaskTitle, setDownloadTaskTitle] = useState('')
   const [userSelectedSubLang, setUserSelectedSubLang] = useState('')
   const selectedSubLang = userSelectedSubLang || singleMedia?.subtitles?.[0]?.lang || ''
-  const [alwaysAskDir, setAlwaysAskDir] = useState(getAlwaysAskDownloadDir())
   const [isZipDownloading, setIsZipDownloading] = useState(false)
   const cancelRef = useRef(false)         // chặn xử lý kết quả sau khi đã hủy
   const activeExtractTaskRef = useRef(null) // task đang chạy, để huỷ thật ở backend
@@ -388,9 +386,9 @@ export default function LinkDownloader({ onShowToast }) {
     setDownloadingId(streamId)
 
     let targetDir = undefined
-    if (alwaysAskDir) {
+    if (getAlwaysAskDownloadDir()) {
       try {
-        targetDir = await selectDownloadDirectory()
+        targetDir = await askForDownloadDirectory()
         if (!targetDir) {
           onShowToast?.('Đã hủy tải do chưa chọn thư mục lưu')
           setDownloadingId(null)
@@ -513,8 +511,8 @@ export default function LinkDownloader({ onShowToast }) {
   const handleDownloadThumbnail = async () => {
     if (!singleMedia) return
     let targetDir
-    if (alwaysAskDir) {
-      targetDir = await selectDownloadDirectory()
+    if (getAlwaysAskDownloadDir()) {
+      targetDir = await askForDownloadDirectory()
       if (!targetDir) {
         onShowToast?.('Đã hủy lưu thumbnail do chưa chọn thư mục')
         return
@@ -539,8 +537,8 @@ export default function LinkDownloader({ onShowToast }) {
   const handleDownloadSubtitle = async (sub) => {
     if (!singleMedia) return
     let targetDir
-    if (alwaysAskDir) {
-      targetDir = await selectDownloadDirectory()
+    if (getAlwaysAskDownloadDir()) {
+      targetDir = await askForDownloadDirectory()
       if (!targetDir) {
         onShowToast?.('Đã hủy lưu phụ đề do chưa chọn thư mục')
         return
@@ -566,9 +564,9 @@ export default function LinkDownloader({ onShowToast }) {
   // Tải ảnh album đơn lẻ
   const handleDownloadImage = async (img) => {
     let targetDir = undefined
-    if (alwaysAskDir) {
+    if (getAlwaysAskDownloadDir()) {
       try {
-        targetDir = await selectDownloadDirectory()
+        targetDir = await askForDownloadDirectory()
         if (!targetDir) {
           onShowToast?.('Đã hủy tải do chưa chọn thư mục lưu')
           return
@@ -701,9 +699,9 @@ export default function LinkDownloader({ onShowToast }) {
     }
 
     let targetDir = undefined
-    if (alwaysAskDir) {
+    if (getAlwaysAskDownloadDir()) {
       try {
-        targetDir = await selectDownloadDirectory()
+        targetDir = await askForDownloadDirectory()
         if (!targetDir) {
           onShowToast?.('Đã hủy do chưa chọn thư mục lưu')
           return
@@ -1422,18 +1420,6 @@ export default function LinkDownloader({ onShowToast }) {
                     onChange={(e) => setEmbedSubs(e.target.checked)}
                   />
                   <span>Nhúng Phụ đề</span>
-                </label>
-
-                <label className="checkbox-opt-label">
-                  <input
-                    type="checkbox"
-                    checked={alwaysAskDir}
-                    onChange={(e) => {
-                      setAlwaysAskDir(e.target.checked)
-                      setAlwaysAskDownloadDir(e.target.checked)
-                    }}
-                  />
-                  <span>Hỏi nơi lưu trữ trước khi tải</span>
                 </label>
 
                 <div className="format-container-picker">

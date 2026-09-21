@@ -6,6 +6,8 @@ import {
   getCookieStatus,
   getDefaultDownloadDirectory,
   selectDownloadDirectory,
+  getAlwaysAskDownloadDir,
+  setAlwaysAskDownloadDir,
 } from '../services/api'
 import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings } from './Icons'
 import mediaLogo from '../assets/media-record-svgrepo-com.svg'
@@ -14,6 +16,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
   const [browsersData, setBrowsersData] = useState(null)
   const [selectedBrowser, setSelectedBrowser] = useState(getActiveBrowser() || '')
   const [downloadDir, setDownloadDir] = useState('')
+  const [alwaysAsk, setAlwaysAsk] = useState(getAlwaysAskDownloadDir())
   const [isDropdownOpen, setIsDropdownOpen] = useState(false)
   const [toastMsg, setToastMsg] = useState('')
   const [cookieCount, setCookieCount] = useState(0)
@@ -237,14 +240,28 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
           </button>
 
           {/* Chọn nơi lưu trữ tệp */}
-          <button
-            type="button"
-            className="btn-folder-trigger"
-            onClick={handleSelectFolder}
-            title={`Thư mục lưu hiện tại:\n${downloadDir || 'Mặc định (~/Downloads)'}\n\nNhấp để chọn thư mục lưu khác...`}
-          >
-            <span className="folder-name-text">{formatDirDisplay(downloadDir)}</span>
-          </button>
+          <div className="folder-selector-wrapper" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <button
+              type="button"
+              className="btn-folder-trigger"
+              onClick={handleSelectFolder}
+              title={`Thư mục lưu hiện tại:\n${downloadDir || 'Mặc định (~/Downloads)'}\n\nNhấp để chọn thư mục lưu khác...`}
+            >
+              <span className="folder-name-text">{formatDirDisplay(downloadDir)}</span>
+            </button>
+            <label className="checkbox-opt-label" style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', color: '#cbd5e1', fontSize: '12px' }} title="Bật để luôn hỏi nơi lưu tệp trước khi tải">
+              <input
+                type="checkbox"
+                checked={alwaysAsk}
+                onChange={(e) => {
+                  setAlwaysAsk(e.target.checked)
+                  setAlwaysAskDownloadDir(e.target.checked)
+                }}
+                style={{ cursor: 'pointer', accentColor: '#38bdf8' }}
+              />
+              <span style={{ userSelect: 'none' }}>Hỏi trước khi tải</span>
+            </label>
+          </div>
 
           {/* History Button Trigger */}
           <button
