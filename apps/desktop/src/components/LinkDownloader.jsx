@@ -138,6 +138,7 @@ export default function LinkDownloader({ onShowToast }) {
   const [isOptionsOpen, setIsOptionsOpen] = useState(false)
   const [embedSubs, setEmbedSubs] = useState(false)
   const [embedMetadata, setEmbedMetadata] = useState(true)
+  const [embedThumbnail, setEmbedThumbnail] = useState(false)
   const [accelerate, setAccelerate] = useState(true)
   const [videoContainer, setVideoContainer] = useState('auto')
 
@@ -448,7 +449,7 @@ export default function LinkDownloader({ onShowToast }) {
         destDir: targetDir,
         embedSubs: embedSubs,
         embedMetadata: embedMetadata,
-        embedThumbnail: embedMetadata,
+        embedThumbnail: embedThumbnail,
         concurrentFragments: accelerate ? 8 : 1,
         videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
         taskId,
@@ -636,7 +637,10 @@ export default function LinkDownloader({ onShowToast }) {
     }
   }
 
-  const albumImages = useMemo(() => singleMedia?.images || [], [singleMedia])
+  const albumImages = useMemo(
+    () => (singleMedia?.images || []).filter((img) => img.type === 'image' || img.type === 'gif'),
+    [singleMedia]
+  )
   const selectedImageCount = useMemo(
     () => Object.values(selectedImages).filter(Boolean).length,
     [selectedImages]
@@ -848,48 +852,114 @@ export default function LinkDownloader({ onShowToast }) {
 
     let unlisten = null
     try {
-      unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
-      const itemsPayload = generateBatchMediaFilenames(
-        itemsToDownload.map((media) => {
-          const stream = media.streams?.find((item) => item.url) || media.streams?.[0]
-          return {
-            url: stream?.url || media.originalUrl,
-            title: media.title || 'media',
-            ext: stream?.ext,
-            id: media.id,
-            referer: media.originalUrl,
-          }
-        }),
-        null
-      )
-
-      if (itemsPayload.some((item) => !item.url)) {
-        throw new Error('Một mục đã chọn không có nguồn tải hợp lệ')
-      }
-
-      const res = await downloadAlbumBatch({
-        items: itemsPayload,
+      // Tạo thư mục trước. Video phải đi qua yt-dlp với URL gốc vì stream URL
+      // của YouTube là URL ký tạm thời và thường là HLS playlist.
+      const prepRes = await downloadAlbumBatch({
+        items: [],
         albumName,
         destDir: targetDir,
+        asZip: false,
+        taskId,
+        platform: itemsToDownload[0]?.platform,
+      })
+      const albumFolder = prepRes?.file_path
+      if (!albumFolder) {
+        throw new Error('Không tạo được thư mục tạm để tải ZIP')
+      }
+
+      const imageItems = itemsToDownload.flatMap((media) =>
+        (media.images || [])
+          .filter((image) => image.type === 'image' || image.type === 'gif')
+          .map((image) => ({
+            ...image,
+            referer: media.originalUrl,
+            title: image.title || media.title || 'image',
+          }))
+      )
+      const videoItems = itemsToDownload.filter(
+        (media) =>
+          media.images?.some((image) => image.type === 'video') ||
+          !(media.images?.length > 0)
+      )
+      let completed = 0
+
+      if (imageItems.length > 0) {
+        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+        const imageRes = await downloadAlbumBatch({
+          items: generateBatchMediaFilenames(imageItems, null),
+          albumName,
+          destDir: targetDir,
+          albumDir: albumFolder,
+          asZip: false,
+          taskId,
+          platform: itemsToDownload[0]?.platform,
+        })
+        if (imageRes?.success === false) throw new Error(imageRes.message || 'Không tải được ảnh')
+        unlisten()
+        unlisten = null
+        completed = imageItems.length
+      }
+
+      for (let index = 0; index < videoItems.length; index++) {
+        const media = videoItems[index]
+        const videoTaskId = `${taskId}_video_${index}`
+        let videoUnlisten = null
+        try {
+          videoUnlisten = await onDownloadProgress((payload) => {
+            setNativeProgress({
+              ...payload,
+              id: videoTaskId,
+              phase: `Đang tải video [${index + 1}/${videoItems.length}]...`,
+            })
+          }, videoTaskId)
+          const videoImage = media.images?.find((image) => image.type === 'video')
+          const videoUrl = videoImage?.url || media.originalUrl || media.url
+          if (!videoUrl) throw new Error(`Mục ${index + 1} không có URL gốc để tải`)
+          const videoRes = await startNativeDownload({
+            url: videoUrl,
+            title: media.title || `media_${index + 1}`,
+            destDir: albumFolder,
+            taskId: videoTaskId,
+            platform: media.platform,
+          })
+          if (!videoRes?.success) {
+            throw new Error(videoRes?.message || `Không tải được video thứ ${index + 1}`)
+          }
+        } finally {
+          if (typeof videoUnlisten === 'function') videoUnlisten()
+          completed++
+          setNativeProgress((prev) => ({
+            ...(prev || {}),
+            id: taskId,
+            percent: Math.round((completed / itemsToDownload.length) * 90),
+            status: 'downloading',
+            phase: `Đã tải ${completed}/${itemsToDownload.length} mục`,
+          }))
+        }
+      }
+
+      if (typeof unlisten === 'function') {
+        unlisten()
+        unlisten = null
+      }
+      setNativeProgress({
+        id: taskId,
+        percent: 92,
+        speed: '',
+        eta: '',
+        status: 'processing',
+        phase: 'Đang nén các tệp đã tải...',
+      })
+      const res = await downloadAlbumBatch({
+        items: [],
+        albumName,
+        destDir: targetDir,
+        albumDir: albumFolder,
         asZip: true,
         taskId,
         platform: itemsToDownload[0]?.platform,
       })
-      if (res?.success === false) {
-        setNativeProgress({
-          id: taskId,
-          percent: 100,
-          speed: '',
-          eta: '',
-          status: 'error',
-          phase: 'Nén ZIP thất bại',
-          filePath: res.file_path,
-          message: res.message,
-        })
-        onShowToast?.(res.message || 'Nén ZIP thất bại')
-        return
-      }
-
+      if (res?.success === false) throw new Error(res.message || 'Nén ZIP thất bại')
       setNativeProgress({
         id: taskId,
         percent: 100,
@@ -903,14 +973,26 @@ export default function LinkDownloader({ onShowToast }) {
       onShowToast?.(res?.message || `Đã lưu ZIP: ${res?.file_path || res?.file_name || 'Batch_Media.zip'}`)
     } catch (err) {
       const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải ZIP'
-      setNativeProgress((prev) => ({
-        ...prev,
-        id: taskId,
-        status: 'error',
-        phase: 'Tải ZIP thất bại',
-        message: errMsg,
-      }))
-      onShowToast?.(errMsg)
+      if (errMsg.includes('cancelled') || errMsg.includes('hủy') || errMsg.includes('abort')) {
+        setNativeProgress({
+          id: taskId,
+          percent: 0,
+          speed: '',
+          eta: '',
+          status: 'cancelled',
+          phase: 'Đã hủy tải ZIP',
+          message: 'Đã hủy tải xuống và dọn dẹp tệp tạm',
+        })
+      } else {
+        setNativeProgress((prev) => ({
+          ...(prev || {}),
+          id: taskId,
+          status: 'error',
+          phase: 'Tải ZIP thất bại',
+          message: errMsg,
+        }))
+        onShowToast?.(errMsg)
+      }
     } finally {
       if (typeof unlisten === 'function') unlisten()
       if (currentDownloadTaskIdRef.current === taskId) currentDownloadTaskIdRef.current = null
@@ -1302,6 +1384,15 @@ export default function LinkDownloader({ onShowToast }) {
                     onChange={(e) => setEmbedMetadata(e.target.checked)}
                   />
                   <span>Nhúng Metadata</span>
+                </label>
+
+                <label className="checkbox-opt-label">
+                  <input
+                    type="checkbox"
+                    checked={embedThumbnail}
+                    onChange={(e) => setEmbedThumbnail(e.target.checked)}
+                  />
+                  <span>Nhúng Thumbnail</span>
                 </label>
 
                 <label className="checkbox-opt-label">

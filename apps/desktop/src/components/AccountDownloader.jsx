@@ -358,7 +358,7 @@ export default function AccountDownloader({ onShowToast }) {
 
     isCancelledRef.current = false
     const videoItems = itemsToDownload.filter((it) => it.type === 'video')
-    const imageItems = itemsToDownload.filter((it) => it.type !== 'video')
+    const imageItems = itemsToDownload.filter((it) => it.type === 'image' || it.type === 'gif')
 
     const albumName = customAlbumName
     const taskId = createTaskId()
