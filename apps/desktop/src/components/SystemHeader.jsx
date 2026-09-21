@@ -10,7 +10,7 @@ import {
   setAlwaysAskDownloadDir,
 } from '../services/api'
 import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings } from './Icons'
-import mediaLogo from '../assets/media-record-svgrepo-com.svg'
+const mediaLogo = '/favicon.svg'
 
 export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools, cookieRefreshKey }) {
   const [browsersData, setBrowsersData] = useState(null)
