@@ -994,6 +994,8 @@ export default function AccountDownloader({ onShowToast }) {
                         src={item.thumb || item.url}
                         alt=""
                         className="profile-item-thumb"
+                        loading="lazy"
+                        decoding="async"
                         onError={(e) => {
                           e.target.style.display = 'none'
                         }}

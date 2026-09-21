@@ -275,12 +275,14 @@ export async function startNativeDownload({
 /**
  * Tải ảnh bìa (thumbnail) — thay thế /api/media/download/thumbnail
  */
-export async function downloadThumbnail({ url, title, browser = null, taskId = null }) {
+export async function downloadThumbnail({ url, title, destDir = null, browser = null, taskId = null }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
+  const customDir = destDir || getCustomDownloadDir() || null
   try {
     return await invoke('download_thumbnail', {
       url: url.trim(),
       title: title || null,
+      destDir: customDir,
       browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
       deviceId: getDeviceId(),
       taskId: taskId || null,
@@ -293,14 +295,16 @@ export async function downloadThumbnail({ url, title, browser = null, taskId = n
 /**
  * Tải phụ đề (subtitle) — thay thế /api/media/download/subtitle
  */
-export async function downloadSubtitle({ url, lang, format = 'vtt', title, browser = null, taskId = null }) {
+export async function downloadSubtitle({ url, lang, format = 'vtt', title, destDir = null, browser = null, taskId = null }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
+  const customDir = destDir || getCustomDownloadDir() || null
   try {
     return await invoke('download_subtitle', {
       url: url.trim(),
       lang,
       format,
       title: title || null,
+      destDir: customDir,
       browser: targetBrowser && targetBrowser !== 'none' ? targetBrowser : null,
       deviceId: getDeviceId(),
       taskId: taskId || null,

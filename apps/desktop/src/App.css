@@ -1746,6 +1746,8 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   overflow: hidden;
   cursor: pointer;
   transition: border-color 0.15s ease;
+  content-visibility: auto;
+  contain-intrinsic-size: 180px;
 }
 
 .profile-grid-item:hover {

@@ -176,6 +176,7 @@ pub async fn download_thumbnail(
     url: String,
     title: Option<String>,
     browser: Option<String>,
+    dest_dir: Option<String>,
     device_id: Option<String>,
     task_id: Option<String>,
 ) -> Result<DownloadResult, String> {
@@ -184,6 +185,7 @@ pub async fn download_thumbnail(
         format_id: Some("thumbnail".to_string()),
         title,
         browser,
+        dest_dir,
         device_id: device_id.unwrap_or_default(),
         task_id,
         ..Default::default()
@@ -204,6 +206,7 @@ pub async fn download_subtitle(
     format: Option<String>,
     title: Option<String>,
     browser: Option<String>,
+    dest_dir: Option<String>,
     device_id: Option<String>,
     task_id: Option<String>,
 ) -> Result<DownloadResult, String> {
@@ -212,6 +215,7 @@ pub async fn download_subtitle(
         format_id: Some(format!("subtitle:{}:{}", lang, format.as_deref().unwrap_or("vtt"))),
         title,
         browser,
+        dest_dir,
         device_id: device_id.unwrap_or_default(),
         task_id,
         ..Default::default()

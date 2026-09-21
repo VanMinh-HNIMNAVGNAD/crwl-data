@@ -451,7 +451,8 @@ export default function LinkDownloader({ onShowToast }) {
         embedMetadata: embedMetadata,
         embedThumbnail: embedThumbnail,
         concurrentFragments: accelerate ? 8 : 1,
-        videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
+        // Container video không thể áp dụng cho stream audio/MP3.
+        videoFormat: !isAudioOnly && videoContainer !== 'auto' ? videoContainer : undefined,
         taskId,
         platform: media.platform,
       })
@@ -510,11 +511,20 @@ export default function LinkDownloader({ onShowToast }) {
   // Tải thumbnail
   const handleDownloadThumbnail = async () => {
     if (!singleMedia) return
+    let targetDir
+    if (alwaysAskDir) {
+      targetDir = await selectDownloadDirectory()
+      if (!targetDir) {
+        onShowToast?.('Đã hủy lưu thumbnail do chưa chọn thư mục')
+        return
+      }
+    }
     try {
       onShowToast?.('Đang tải ảnh thumbnail...')
       const res = await downloadThumbnail({
         url: singleMedia.originalUrl,
         title: singleMedia.title,
+        destDir: targetDir,
       })
       if (res?.file_name) {
         onShowToast?.(`Đã lưu thumbnail: ${res.file_name}`)
@@ -527,6 +537,14 @@ export default function LinkDownloader({ onShowToast }) {
   // Tải phụ đề
   const handleDownloadSubtitle = async (sub) => {
     if (!singleMedia) return
+    let targetDir
+    if (alwaysAskDir) {
+      targetDir = await selectDownloadDirectory()
+      if (!targetDir) {
+        onShowToast?.('Đã hủy lưu phụ đề do chưa chọn thư mục')
+        return
+      }
+    }
     try {
       onShowToast?.(`Đang tải phụ đề: ${sub.name || sub.lang}...`)
       const res = await downloadSubtitle({
@@ -534,6 +552,7 @@ export default function LinkDownloader({ onShowToast }) {
         lang: sub.lang,
         format: sub.ext,
         title: singleMedia.title,
+        destDir: targetDir,
       })
       if (res?.file_name) {
         onShowToast?.(`Đã lưu phụ đề: ${res.file_name}`)
@@ -1422,6 +1441,7 @@ export default function LinkDownloader({ onShowToast }) {
                     className="minimal-select"
                     value={videoContainer}
                     onChange={(e) => setVideoContainer(e.target.value)}
+                    aria-label="Định dạng container video đầu ra"
                   >
                     {VIDEO_CONTAINER_OPTIONS.map((f) => (
                       <option key={f.id} value={f.id}>
@@ -1429,6 +1449,7 @@ export default function LinkDownloader({ onShowToast }) {
                       </option>
                     ))}
                   </select>
+                  <span className="tools-setting-hint">Chỉ áp dụng khi tải video; stream âm thanh vẫn là audio.</span>
                 </div>
               </div>
             )}
@@ -1550,6 +1571,8 @@ export default function LinkDownloader({ onShowToast }) {
                         src={img.thumb || img.url}
                         alt=""
                         className="album-img"
+                        loading="lazy"
+                        decoding="async"
                         onError={(e) => {
                           e.target.style.display = 'none'
                         }}
@@ -1757,6 +1780,8 @@ export default function LinkDownloader({ onShowToast }) {
                     src={m.thumbnail || m.highResThumbnail}
                     alt=""
                     className="batch-item-thumb"
+                    loading="lazy"
+                    decoding="async"
                     onError={(e) => {
                       e.target.style.display = 'none'
                     }}

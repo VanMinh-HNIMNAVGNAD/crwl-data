@@ -2355,9 +2355,6 @@ impl DownloaderService {
         let file = std::fs::File::create(zip_path)
             .map_err(|e| format!("Không thể tạo tệp zip: {e}"))?;
         let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-
         let walker = walkdir::WalkDir::new(src_dir);
         for entry in walker.into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -2371,9 +2368,25 @@ impl DownloaderService {
 
             let path_str = relative_path.to_string_lossy().replace('\\', "/");
             if path.is_dir() {
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
                 zip.add_directory(&path_str, options)
                     .map_err(|e| format!("Lỗi thêm thư mục vào zip: {e}"))?;
             } else if path.is_file() {
+                // Media phổ biến đã được nén sẵn; Deflate lại video/ảnh chỉ làm
+                // tăng CPU và thời gian đóng gói mà hầu như không giảm kích thước.
+                let extension = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.to_ascii_lowercase());
+                let method = match extension.as_deref() {
+                    Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "avif" | "mp4" | "mkv" | "mov" | "webm" | "m4v" | "mp3" | "m4a" | "flac" | "wav" | "aac" | "ogg" | "opus" | "zip" | "7z" | "rar") => {
+                        zip::CompressionMethod::Stored
+                    }
+                    _ => zip::CompressionMethod::Deflated,
+                };
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(method);
                 zip.start_file(&path_str, options)
                     .map_err(|e| format!("Lỗi tạo mục tệp trong zip: {e}"))?;
                 let mut f = std::fs::File::open(path)
