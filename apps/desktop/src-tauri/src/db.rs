@@ -88,7 +88,16 @@ impl Database {
             }
         }
 
-        // 3. Tìm theo thứ tự ưu tiên các file .env
+        // 3. Kiểm tra biến môi trường nhúng lúc biên dịch (GitHub Actions build secrets)
+        if let Some(url) = option_env!("DATABASE_URL") {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() && !Self::is_placeholder_url(trimmed) {
+                info!("Đã nạp DATABASE_URL từ cấu hình đóng gói (compile-time env)");
+                return Some(trimmed.to_string());
+            }
+        }
+
+        // 4. Tìm theo thứ tự ưu tiên các file .env
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let config_dir = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
 
@@ -247,9 +256,22 @@ impl Database {
         let pool = self.get_pool().await?;
         let username = format!("desktop_{}", &device_id.chars().take(10).collect::<String>());
 
+        let browser_name = if cfg!(windows) {
+            "Windows Desktop (Tauri)"
+        } else if cfg!(target_os = "macos") {
+            "macOS Desktop (Tauri)"
+        } else {
+            "Linux Desktop (Tauri)"
+        };
+        let user_agent = if cfg!(windows) {
+            "Tauri 2 / WebView2"
+        } else {
+            "Tauri 2 / WebKitGTK"
+        };
+
         let query = r#"
             INSERT INTO users (username, role, is_active, device_id, browser_name, user_agent, last_active_at)
-            VALUES ($1, 'user', true, $2, 'Linux Desktop (Tauri)', 'Tauri 2 / WebKitGTK', NOW())
+            VALUES ($1, 'user', true, $2, $3, $4, NOW())
             ON CONFLICT (device_id) DO UPDATE SET last_active_at = NOW()
             RETURNING id;
         "#;
@@ -257,6 +279,8 @@ impl Database {
         match sqlx::query(query)
             .bind(&username)
             .bind(device_id)
+            .bind(browser_name)
+            .bind(user_agent)
             .fetch_one(&pool)
             .await
         {
@@ -284,13 +308,21 @@ impl Database {
         let pool = self.get_pool().await?;
         let user_id = self.get_or_create_user(device_id).await;
 
+        let browser_name = if cfg!(windows) {
+            "Tauri 2 / Windows Desktop"
+        } else if cfg!(target_os = "macos") {
+            "Tauri 2 / macOS Desktop"
+        } else {
+            "Tauri 2 / Linux Desktop"
+        };
+
         let query = r#"
             INSERT INTO download_history (
                 user_id, platform, media_title, file_name, file_size_bytes,
                 client_type, duration_ms, status, error_reason,
                 client_ip, device_id, browser_name, downloaded_at
             ) VALUES (
-                $1, $2, $3, $4, $5, 'desktop', $6, $7, $8, $9, $10, 'Tauri 2 / Linux Desktop', NOW()
+                $1, $2, $3, $4, $5, 'desktop', $6, $7, $8, $9, $10, $11, NOW()
             ) RETURNING id;
         "#;
 
@@ -305,6 +337,7 @@ impl Database {
             .bind(error_reason)
             .bind(client_ip)
             .bind(device_id)
+            .bind(browser_name)
             .fetch_one(&pool)
             .await
         {

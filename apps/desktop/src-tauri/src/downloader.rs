@@ -503,6 +503,12 @@ impl DownloaderService {
             .to_string();
 
         let mut cmd = Command::new(&ytdlp_path);
+        #[cfg(windows)]
+        {
+            #[allow(unused_imports)]
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
         cmd.arg(&opts.url);
         cmd.arg("-o").arg(&output_template);
         cmd.arg("--no-playlist");
@@ -2298,7 +2304,14 @@ impl DownloaderService {
         dest: &Path,
     ) -> (bool, Option<String>) {
         const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-        let output = match Command::new("curl")
+        let mut cmd = Command::new("curl");
+        #[cfg(windows)]
+        {
+            #[allow(unused_imports)]
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let output = match cmd
             .arg("-sSL")
             .arg("-f")
             .arg("--retry").arg("2")

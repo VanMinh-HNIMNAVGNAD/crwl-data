@@ -305,3 +305,39 @@ Sau khi build thành công, các file cài đặt sẽ nằm tại:
 | **Build Web Assets (dist)** | `pnpm build` |
 | **Đóng gói Linux App (.deb / .AppImage)** | `pnpm build:tauri` |
 | **Dọn dẹp thư mục build** | `cargo clean` (trong `src-tauri`) & `rm -rf apps/desktop/dist` |
+
+---
+
+## 9. Phát Hành Tự Động Qua GitHub Actions (Windows & Linux Release)
+
+Dự án đã tích hợp sẵn GitHub Actions workflow tại `.github/workflows/release.yml` để tự động biên dịch và tạo bản phát hành kèm file cài đặt.
+
+### 9.1. Cấu hình quyền và Secret trên GitHub
+1. **Cấp quyền tạo Release**:
+   - Vào repository trên GitHub: **Settings** → **Actions** → **General** → **Workflow permissions**.
+   - Chọn **"Read and write permissions"** và bấm **Save**.
+2. **Cấu hình Supabase `DATABASE_URL` (Tùy chọn)**:
+   - Vào **Settings** → **Secrets and variables** → **Actions** → **New repository secret**.
+   - Tên secret: `DATABASE_URL`
+   - Giá trị: Chuỗi kết nối Supabase IPv4 Pooler (`postgresql://postgres.[REF]:[PASS]@aws-0-[REGION].pooler.supabase.com:5432/postgres`).
+   - *Khi đặt secret này, file `.exe` và `.deb` được build sẽ tự động nhận diện và kết nối database ngay mà người dùng không cần tạo file .env.*
+
+### 9.2. Cách tạo bản phát hành (Release)
+**Cách 1: Đẩy Git Tag (Khuyên dùng)**
+```bash
+git add .
+git commit -m "chore: release v0.1.1"
+git push origin main
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+**Cách 2: Chạy thủ công trên GitHub UI (Workflow Dispatch)**
+- Vào tab **Actions** trên GitHub.
+- Chọn workflow **Release App**.
+- Bấm nút **Run workflow**, điền tag phiên bản (ví dụ `v0.1.1`) và xác nhận.
+
+Sau khi quy trình hoàn tất (khoảng 5-10 phút):
+- GitHub Actions sẽ tự động tạo một bản phát hành mới trong mục **Releases**.
+- Đính kèm đầy đủ file `.exe` (NSIS Installer cho Windows), `.msi`, `.AppImage` và `.deb` (cho Linux).
+

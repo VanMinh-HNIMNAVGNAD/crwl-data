@@ -15,6 +15,15 @@ pub struct SystemService;
 impl SystemService {
     /// Kiểm tra xem binary có tồn tại trong PATH hệ thống không
     fn is_binary_in_path(name: &str) -> bool {
+        if which::which(name).is_ok() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            if which::which(format!("{name}.exe")).is_ok() {
+                return true;
+            }
+        }
         let paths = [
             format!("/usr/bin/{name}"),
             format!("/usr/local/bin/{name}"),
@@ -24,79 +33,85 @@ impl SystemService {
         paths.iter().any(|p| std::path::Path::new(p).exists())
     }
 
-    /// Lấy danh sách trình duyệt khả dụng trên Linux (hỗ trợ .config, Snap, Flatpak & Binary PATH)
+    /// Lấy danh sách trình duyệt khả dụng trên Linux & Windows (hỗ trợ .config, LocalAppData, Snap, Flatpak & PATH)
     pub fn get_browsers_list() -> Vec<BrowserInfo> {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let local_app_data = dirs::data_local_dir();
+        let app_data = dirs::config_dir();
+
+        // 1. Edge
+        let mut edge_paths = vec![
+            home.join(".config/microsoft-edge"),
+            home.join(".config/microsoft-edge-dev"),
+            home.join(".config/microsoft-edge-beta"),
+            home.join(".var/app/com.microsoft.Edge/config/microsoft-edge"),
+        ];
+        if let Some(ref l) = local_app_data {
+            edge_paths.push(l.join("Microsoft").join("Edge").join("User Data"));
+        }
+
+        // 2. Firefox
+        let mut firefox_paths = vec![
+            home.join(".mozilla/firefox"),
+            home.join("snap/firefox/common/.mozilla/firefox"),
+            home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
+        ];
+        if let Some(ref a) = app_data {
+            firefox_paths.push(a.join("Mozilla").join("Firefox").join("Profiles"));
+        }
+
+        // 3. Chrome
+        let mut chrome_paths = vec![
+            home.join(".config/google-chrome"),
+            home.join(".config/google-chrome-beta"),
+            home.join(".var/app/com.google.Chrome/config/google-chrome"),
+        ];
+        if let Some(ref l) = local_app_data {
+            chrome_paths.push(l.join("Google").join("Chrome").join("User Data"));
+        }
+
+        // 4. Chromium
+        let chromium_paths = vec![
+            home.join(".config/chromium"),
+            home.join("snap/chromium/common/chromium"),
+            home.join(".var/app/org.chromium.Chromium/config/chromium"),
+        ];
+
+        // 5. Brave
+        let mut brave_paths = vec![
+            home.join(".config/BraveSoftware/Brave-Browser"),
+            home.join(".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"),
+        ];
+        if let Some(ref l) = local_app_data {
+            brave_paths.push(l.join("BraveSoftware").join("Brave-Browser").join("User Data"));
+        }
+
+        // 6. Opera
+        let mut opera_paths = vec![
+            home.join(".config/opera"),
+            home.join("snap/opera/current/.config/opera"),
+        ];
+        if let Some(ref a) = app_data {
+            opera_paths.push(a.join("Opera Software").join("Opera Stable"));
+        }
+
+        // 7. Vivaldi
+        let mut vivaldi_paths = vec![
+            home.join(".config/vivaldi"),
+            home.join(".var/app/com.vivaldi.Vivaldi/config/vivaldi"),
+        ];
+        if let Some(ref l) = local_app_data {
+            vivaldi_paths.push(l.join("Vivaldi").join("User Data"));
+        }
 
         let browser_defs = vec![
-            (
-                "edge",
-                "Microsoft Edge",
-                vec![
-                    home.join(".config/microsoft-edge"),
-                    home.join(".config/microsoft-edge-dev"),
-                    home.join(".config/microsoft-edge-beta"),
-                    home.join(".var/app/com.microsoft.Edge/config/microsoft-edge"),
-                ],
-                vec!["microsoft-edge", "microsoft-edge-stable", "microsoft-edge-dev"],
-            ),
-            (
-                "firefox",
-                "Mozilla Firefox",
-                vec![
-                    home.join(".mozilla/firefox"),
-                    home.join("snap/firefox/common/.mozilla/firefox"),
-                    home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
-                ],
-                vec!["firefox", "firefox-esr"],
-            ),
-            (
-                "chrome",
-                "Google Chrome",
-                vec![
-                    home.join(".config/google-chrome"),
-                    home.join(".config/google-chrome-beta"),
-                    home.join(".var/app/com.google.Chrome/config/google-chrome"),
-                ],
-                vec!["google-chrome", "google-chrome-stable"],
-            ),
-            (
-                "chromium",
-                "Chromium",
-                vec![
-                    home.join(".config/chromium"),
-                    home.join("snap/chromium/common/chromium"),
-                    home.join(".var/app/org.chromium.Chromium/config/chromium"),
-                ],
-                vec!["chromium", "chromium-browser"],
-            ),
-            (
-                "brave",
-                "Brave Browser",
-                vec![
-                    home.join(".config/BraveSoftware/Brave-Browser"),
-                    home.join(".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"),
-                ],
-                vec!["brave-browser", "brave"],
-            ),
-            (
-                "opera",
-                "Opera",
-                vec![
-                    home.join(".config/opera"),
-                    home.join("snap/opera/current/.config/opera"),
-                ],
-                vec!["opera"],
-            ),
-            (
-                "vivaldi",
-                "Vivaldi",
-                vec![
-                    home.join(".config/vivaldi"),
-                    home.join(".var/app/com.vivaldi.Vivaldi/config/vivaldi"),
-                ],
-                vec!["vivaldi", "vivaldi-stable"],
-            ),
+            ("edge", "Microsoft Edge", edge_paths, vec!["microsoft-edge", "microsoft-edge-stable", "microsoft-edge-dev", "msedge"]),
+            ("firefox", "Mozilla Firefox", firefox_paths, vec!["firefox", "firefox-esr"]),
+            ("chrome", "Google Chrome", chrome_paths, vec!["google-chrome", "google-chrome-stable", "chrome"]),
+            ("chromium", "Chromium", chromium_paths, vec!["chromium", "chromium-browser"]),
+            ("brave", "Brave Browser", brave_paths, vec!["brave-browser", "brave"]),
+            ("opera", "Opera", opera_paths, vec!["opera"]),
+            ("vivaldi", "Vivaldi", vivaldi_paths, vec!["vivaldi", "vivaldi-stable"]),
         ];
 
         browser_defs

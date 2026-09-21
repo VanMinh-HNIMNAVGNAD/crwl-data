@@ -35,23 +35,77 @@ pub struct AllBinaryStatus {
 pub struct BinaryManager;
 
 impl BinaryManager {
-    /// Tìm binary trong PATH và các vị trí phổ biến trên Linux
+    /// Tìm binary trong PATH và các vị trí phổ biến trên hệ thống (Linux & Windows)
     pub fn find_binary(name: &str) -> Option<PathBuf> {
         // Đường dẫn do người dùng cấu hình được ưu tiên trước PATH
         if let Some(custom) = SettingsManager::custom_binary_path(name) {
             return Some(custom);
         }
-        // Tìm trong PATH
+
+        // 1. Tìm trực tiếp trong PATH
         if let Ok(p) = which::which(name) {
             return Some(p);
         }
 
+        // 2. Xử lý đặc thù trên Windows
+        #[cfg(windows)]
+        {
+            // Kiểm tra tên có đuôi .exe
+            if !name.ends_with(".exe") {
+                if let Ok(p) = which::which(format!("{}.exe", name)) {
+                    return Some(p);
+                }
+            }
+
+            // Với Python trên Windows: python3 thường không có, chỉ có python.exe hoặc py.exe
+            if name == "python3" {
+                if let Ok(p) = which::which("python") {
+                    return Some(p);
+                }
+                if let Ok(p) = which::which("py") {
+                    return Some(p);
+                }
+
+                // Dò tìm trong %LOCALAPPDATA%\Programs\Python\Python3*
+                if let Some(local_app_data) = dirs::data_local_dir() {
+                    let py_dir = local_app_data.join("Programs").join("Python");
+                    if py_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&py_dir) {
+                            for entry in entries.flatten() {
+                                let exe = entry.path().join("python.exe");
+                                if exe.is_file() {
+                                    return Some(exe);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Thư mục crwl/bin trong config của ứng dụng
+        if let Some(config_dir) = dirs::config_dir() {
+            let app_bin = config_dir.join("crwl").join("bin").join(name);
+            if app_bin.exists() {
+                return Some(app_bin);
+            }
+            #[cfg(windows)]
+            {
+                let app_bin_exe = config_dir.join("crwl").join("bin").join(format!("{}.exe", name));
+                if app_bin_exe.exists() {
+                    return Some(app_bin_exe);
+                }
+            }
+        }
+
+        // 4. Thư mục ~/.local/bin trên Linux/Unix
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let local_bin = home.join(".local/bin").join(name);
         if local_bin.exists() {
             return Some(local_bin);
         }
 
+        // 5. Các vị trí tiêu chuẩn trên Linux
         let candidates = vec![
             PathBuf::from(format!("/usr/local/bin/{}", name)),
             PathBuf::from(format!("/usr/bin/{}", name)),
@@ -64,6 +118,11 @@ impl BinaryManager {
             }
         }
         None
+    }
+
+    /// Tiện ích tìm Python executable đa nền tảng
+    pub fn find_python() -> Option<PathBuf> {
+        Self::find_binary("python3")
     }
 
     /// Kiểm tra xem binary có sẵn trên máy không

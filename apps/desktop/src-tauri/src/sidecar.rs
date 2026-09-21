@@ -269,10 +269,21 @@ impl SidecarManager {
             let cli = this.cli_path.clone();
             let inner_arc = this.inner.clone();
             let spawn_time = std::time::Instant::now();
+            let python_bin = crate::binary_manager::BinaryManager::find_python()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| {
+                    if cfg!(windows) { "python".to_string() } else { "python3".to_string() }
+                });
 
-            let mut cmd = Command::new("python3");
+            let mut cmd = Command::new(&python_bin);
             cmd.arg(&cli).arg("--stdin");
             cmd.env("PYTHONUNBUFFERED", "1");
+            #[cfg(windows)]
+            {
+                #[allow(unused_imports)]
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
             if let Some(proj_root) = cli.parent().and_then(|p| p.parent()) {
                 cmd.current_dir(proj_root);
                 cmd.env("PYTHONPATH", proj_root);
