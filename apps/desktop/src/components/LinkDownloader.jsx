@@ -114,6 +114,7 @@ export default function LinkDownloader({ onShowToast }) {
   // Kết quả sau khi phân tích
   const [singleMedia, setSingleMedia] = useState(null)
   const [batchMedias, setBatchMedias] = useState([])
+  const [selectedBatchIds, setSelectedBatchIds] = useState({})
   const [streamFilter, setStreamFilter] = useState('all') // 'all' | 'full' | 'mute' | 'audio'
   const [selectedImages, setSelectedImages] = useState({})
   const [downloadingId, setDownloadingId] = useState(null)
@@ -327,6 +328,7 @@ export default function LinkDownloader({ onShowToast }) {
 
     if (results.length > 0) {
       setBatchMedias(results)
+      setSelectedBatchIds({})
       setSingleMedia(null)
       const failMsg = failedLinks.length > 0 ? ` (${failedLinks.length} lỗi/timeout)` : ''
       onShowToast?.(`Giải mã thành công ${results.length}/${parsedBatchLinks.length} liên kết!${failMsg}`)
@@ -786,6 +788,136 @@ export default function LinkDownloader({ onShowToast }) {
     }
   }
 
+  const selectedBatchCount = useMemo(
+    () => Object.values(selectedBatchIds).filter(Boolean).length,
+    [selectedBatchIds]
+  )
+
+  const handleToggleSelectAllBatch = () => {
+    if (selectedBatchCount === batchMedias.length) {
+      setSelectedBatchIds({})
+      return
+    }
+
+    const all = {}
+    batchMedias.forEach((media, index) => {
+      all[media.id || index] = true
+    })
+    setSelectedBatchIds(all)
+  }
+
+  const handleDownloadBatchZip = async () => {
+    const itemsToDownload = batchMedias.filter((media, index) => selectedBatchIds[media.id || index])
+    if (itemsToDownload.length === 0) {
+      onShowToast?.('Vui lòng chọn ít nhất 1 mục để tải ZIP')
+      return
+    }
+
+    const promptResult = window.prompt(
+      'Nhập tên file ZIP (để trống sẽ dùng tên mặc định):',
+      'Batch_Media'
+    )
+    if (promptResult === null) return
+    const albumName = promptResult.trim() || 'Batch_Media'
+
+    let targetDir = undefined
+    if (alwaysAskDir) {
+      try {
+        targetDir = await selectDownloadDirectory()
+        if (!targetDir) {
+          onShowToast?.('Đã hủy do chưa chọn thư mục lưu')
+          return
+        }
+      } catch (err) {
+        console.warn('Lỗi chọn thư mục:', err)
+      }
+    }
+
+    const taskId = createTaskId()
+    currentDownloadTaskIdRef.current = taskId
+    setIsZipDownloading(true)
+    setDownloadTaskTitle(`Nén ZIP: ${itemsToDownload.length} mục`)
+    setNativeProgress({
+      id: taskId,
+      percent: 0,
+      speed: '',
+      eta: '',
+      status: 'preparing',
+      phase: `Chuẩn bị nén ${itemsToDownload.length} mục...`,
+    })
+
+    let unlisten = null
+    try {
+      unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+      const itemsPayload = generateBatchMediaFilenames(
+        itemsToDownload.map((media) => {
+          const stream = media.streams?.find((item) => item.url) || media.streams?.[0]
+          return {
+            url: stream?.url || media.originalUrl,
+            title: media.title || 'media',
+            ext: stream?.ext,
+            id: media.id,
+            referer: media.originalUrl,
+          }
+        }),
+        null
+      )
+
+      if (itemsPayload.some((item) => !item.url)) {
+        throw new Error('Một mục đã chọn không có nguồn tải hợp lệ')
+      }
+
+      const res = await downloadAlbumBatch({
+        items: itemsPayload,
+        albumName,
+        destDir: targetDir,
+        asZip: true,
+        taskId,
+        platform: itemsToDownload[0]?.platform,
+      })
+      if (res?.success === false) {
+        setNativeProgress({
+          id: taskId,
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'error',
+          phase: 'Nén ZIP thất bại',
+          filePath: res.file_path,
+          message: res.message,
+        })
+        onShowToast?.(res.message || 'Nén ZIP thất bại')
+        return
+      }
+
+      setNativeProgress({
+        id: taskId,
+        percent: 100,
+        speed: '',
+        eta: '',
+        status: 'completed',
+        phase: 'Hoàn tất',
+        filePath: res?.file_path,
+        fileName: res?.file_name,
+      })
+      onShowToast?.(res?.message || `Đã lưu ZIP: ${res?.file_path || res?.file_name || 'Batch_Media.zip'}`)
+    } catch (err) {
+      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải ZIP'
+      setNativeProgress((prev) => ({
+        ...prev,
+        id: taskId,
+        status: 'error',
+        phase: 'Tải ZIP thất bại',
+        message: errMsg,
+      }))
+      onShowToast?.(errMsg)
+    } finally {
+      if (typeof unlisten === 'function') unlisten()
+      if (currentDownloadTaskIdRef.current === taskId) currentDownloadTaskIdRef.current = null
+      setIsZipDownloading(false)
+    }
+  }
+
   const filteredStreams = useMemo(() => {
     if (!singleMedia?.streams) return []
     if (streamFilter === 'all') return singleMedia.streams
@@ -799,6 +931,7 @@ export default function LinkDownloader({ onShowToast }) {
     setUrl('')
     setSingleMedia(null)
     setBatchMedias([])
+    setSelectedBatchIds({})
     setAsyncResolved(null)
     setSelectedImages({})
     setNativeProgress(null)
@@ -811,6 +944,7 @@ export default function LinkDownloader({ onShowToast }) {
   const handleClearBatch = () => {
     setBatchText('')
     setBatchMedias([])
+    setSelectedBatchIds({})
     setSelectedImages({})
     setNativeProgress(null)
     setDownloadingId(null)
@@ -1466,13 +1600,37 @@ export default function LinkDownloader({ onShowToast }) {
           <div className="batch-results-list">
             <div className="batch-results-header">
               <span>Đã bóc tách {batchMedias.length} liên kết</span>
-              <button
-                type="button"
-                className="minimal-small-btn"
-                onClick={() => setBatchMedias([])}
-              >
-                Xóa kết quả
-              </button>
+              <div className="profile-top-actions">
+                <button
+                  type="button"
+                  className="minimal-small-btn"
+                  onClick={handleToggleSelectAllBatch}
+                >
+                  {selectedBatchCount === batchMedias.length ? 'Bỏ chọn' : 'Chọn tất cả'}
+                </button>
+                {selectedBatchCount > 0 && (
+                  <button
+                    type="button"
+                    className="minimal-small-btn btn-success"
+                    onClick={handleDownloadBatchZip}
+                    disabled={isZipDownloading}
+                    title="Đóng gói các mục đã chọn thành file ZIP"
+                  >
+                    <IconZip className="w-3 h-3" />
+                    <span>Tải ZIP ({selectedBatchCount})</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="minimal-small-btn"
+                  onClick={() => {
+                    setBatchMedias([])
+                    setSelectedBatchIds({})
+                  }}
+                >
+                  Xóa kết quả
+                </button>
+              </div>
             </div>
 
             {/* Tiến trình tải của chế độ nhiều link */}
@@ -1486,7 +1644,24 @@ export default function LinkDownloader({ onShowToast }) {
             )}
             <div className="batch-items-stack">
               {batchMedias.map((m, idx) => (
-                <div key={m.id || idx} className="batch-row-item">
+                <div
+                  key={m.id || idx}
+                  className={`batch-row-item ${selectedBatchIds[m.id || idx] ? 'is-selected' : ''}`}
+                  onClick={() => {
+                    const itemId = m.id || idx
+                    setSelectedBatchIds((prev) => ({ ...prev, [itemId]: !prev[itemId] }))
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={Boolean(selectedBatchIds[m.id || idx])}
+                    onChange={() => {
+                      const itemId = m.id || idx
+                      setSelectedBatchIds((prev) => ({ ...prev, [itemId]: !prev[itemId] }))
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                    aria-label={`Chọn ${m.title || 'liên kết'}`}
+                  />
                   <img
                     src={m.thumbnail || m.highResThumbnail}
                     alt=""
@@ -1507,7 +1682,8 @@ export default function LinkDownloader({ onShowToast }) {
                   <button
                     type="button"
                     className="minimal-small-btn btn-success"
-                    onClick={() => {
+                    onClick={(e) => {
+                      e.stopPropagation()
                       const topStream = m.streams?.[0] || { quality: 'Tự động' }
                       handleDownloadStream(topStream, m)
                     }}

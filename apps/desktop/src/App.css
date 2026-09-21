@@ -1656,6 +1656,11 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   border-radius: 4px;
 }
 
+.batch-row-item.is-selected {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 1px var(--accent-blue), 0 2px 8px rgba(59, 130, 246, 0.16);
+}
+
 .batch-item-thumb {
   width: 44px;
   height: 28px;
