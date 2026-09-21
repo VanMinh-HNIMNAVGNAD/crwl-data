@@ -524,8 +524,9 @@ impl DownloaderService {
             cmd.arg("--js-runtimes").arg(format!("node:{}", node_path.to_string_lossy()));
         }
 
-        // Tải song song nhiều mảnh (HLS/DASH) — giữ trong khoảng an toàn
-        let frags = opts.concurrent_fragments.unwrap_or(8).clamp(1, 16);
+        // Giữ số kết nối thấp để tránh làm nghẽn CPU, RAM và băng thông trên máy yếu.
+        // Người dùng vẫn có thể tăng explicit qua DownloadOptions khi cần.
+        let frags = opts.concurrent_fragments.unwrap_or(2).clamp(1, 8);
         cmd.arg("-N").arg(frags.to_string());
 
         // aria2c chỉ bật khi người dùng yêu cầu: nó không xuất tiến trình theo
@@ -1462,7 +1463,9 @@ impl DownloaderService {
 
             // Tải song song có giới hạn. Cấp phát trước đường dẫn độc nhất cho từng tệp
             // để tránh race condition và ghi đè khi nhiều tệp có cùng tên hoặc chạy concurrent.
-            const MAX_PARALLEL: usize = 5;
+            // Mỗi tác vụ là một process curl riêng; 5 process đồng thời gây giật
+            // mạnh trên các máy 2 nhân khi tải album lớn.
+            const MAX_PARALLEL: usize = 2;
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
             let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut handles = Vec::with_capacity(total);

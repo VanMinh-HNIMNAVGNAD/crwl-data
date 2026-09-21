@@ -139,7 +139,8 @@ export default function LinkDownloader({ onShowToast }) {
   const [embedSubs, setEmbedSubs] = useState(false)
   const [embedMetadata, setEmbedMetadata] = useState(true)
   const [embedThumbnail, setEmbedThumbnail] = useState(false)
-  const [accelerate, setAccelerate] = useState(true)
+  // Mặc định ưu tiên độ phản hồi trên máy yếu; người dùng vẫn có thể bật tăng tốc.
+  const [accelerate, setAccelerate] = useState(false)
   const [videoContainer, setVideoContainer] = useState('auto')
 
   // Synchronous validation state computed from URL
@@ -450,7 +451,7 @@ export default function LinkDownloader({ onShowToast }) {
         embedSubs: embedSubs,
         embedMetadata: embedMetadata,
         embedThumbnail: embedThumbnail,
-        concurrentFragments: accelerate ? 8 : 1,
+        concurrentFragments: accelerate ? 2 : 1,
         // Container video không thể áp dụng cho stream audio/MP3.
         videoFormat: !isAudioOnly && videoContainer !== 'auto' ? videoContainer : undefined,
         taskId,

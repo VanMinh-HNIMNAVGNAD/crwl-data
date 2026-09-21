@@ -502,7 +502,9 @@ export default function AccountDownloader({ onShowToast }) {
       let lastVideoRes = null
       if (videoItems.length > 0) {
         const videoDestDir = albumFolder || targetDir
-        const maxParallelVideos = 3
+        // Mỗi video thường khởi chạy một process yt-dlp + ffmpeg. Chạy tuần tự
+        // giữ máy yếu phản hồi được khi người dùng tải hàng loạt.
+        const maxParallelVideos = 1
         let nextVideoIndex = 0
         let completedVideos = 0
         const videoResults = new Array(videoItems.length)
