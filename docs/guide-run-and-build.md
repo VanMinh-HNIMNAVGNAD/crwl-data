@@ -20,6 +20,7 @@
 6. [Quản Lý Công Cụ Đi Kèm (yt-dlp, ffmpeg, gallery-dl)](#6-quản-lý-công-cụ-đi-kèm-yt-dlp-ffmpeg-gallery-dl)
 7. [Xử Lý Sự Cố Thường Gặp (Troubleshooting FAQ)](#7-xử-lý-sự-cố-thường-gặp-troubleshooting-faq)
 8. [Bảng Tra Cứu Lệnh Nhanh (Cheatsheet)](#8-bảng-tra-cứu-lệnh-nhanh-cheatsheet)
+9. [Phát Hành Tự Động Qua GitHub Actions (Windows & Linux)](#9-phát-hành-tự-động-qua-github-actions-windows--linux-release) *(Chi tiết xem tại [guide-cicd-and-release.md](guide-cicd-and-release.md))*
 
 ---
 
