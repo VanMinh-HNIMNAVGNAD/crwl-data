@@ -6,8 +6,9 @@ import {
   IconImage,
   IconDownload,
   IconZip,
+  IconSettings,
 } from './Icons'
-import { detectPlatform } from '../constants'
+import { detectPlatform, VIDEO_CONTAINER_OPTIONS } from '../constants'
 import {
   crawlProfile,
   cancelExtraction,
@@ -45,7 +46,24 @@ function safeMediaTitle(item, fallback = 'media') {
   return Array.from(cleaned || fallback).slice(0, 80).join('') || fallback
 }
 
-export default function AccountDownloader({ onShowToast }) {
+export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
+  // Shared download options từ App level
+  const {
+    videoContainer = 'auto',
+    accelerate = false,
+    embedMetadata = true,
+    embedThumbnail = false,
+    onVideoContainerChange,
+    onAccelerateChange,
+    onEmbedMetadataChange,
+    onEmbedThumbnailChange,
+  } = dlOptions
+
+  // concurrentFragments: accelerate=false→1 (tiết kiệm CPU), true→4 (đa luồng)
+  const concurrentFragments = accelerate ? 4 : 1
+  // maxParallelVideos: số video tải song song trong batch
+  const maxParallelVideos = accelerate ? 2 : 1
+
   const [accountInput, setAccountInput] = useState('')
   const [selectedPlatform, setSelectedPlatform] = useState('auto')
   const [mediaTypeFilter, setMediaTypeFilter] = useState('all') // 'all' | 'video' | 'image'
@@ -55,6 +73,7 @@ export default function AccountDownloader({ onShowToast }) {
   const [isCrawling, setIsCrawling] = useState(false)
   const [statusText, setStatusText] = useState('')
   const [elapsedCrawl, setElapsedCrawl] = useState(0)
+  const [isOptionsOpen, setIsOptionsOpen] = useState(false)
 
   // Kết quả quét tài khoản
   const [profileResult, setProfileResult] = useState(null)
@@ -266,6 +285,10 @@ export default function AccountDownloader({ onShowToast }) {
           url: item.url,
           title: safeMediaTitle(item),
           destDir: targetDir,
+          embedMetadata,
+          embedThumbnail,
+          concurrentFragments,
+          videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
           taskId,
           platform: profileResult?.platform || item.platform,
         })
@@ -515,9 +538,9 @@ export default function AccountDownloader({ onShowToast }) {
       let lastVideoRes = null
       if (videoItems.length > 0) {
         const videoDestDir = albumFolder || targetDir
-        // Mỗi video thường khởi chạy một process yt-dlp + ffmpeg. Chạy tuần tự
-        // giữ máy yếu phản hồi được khi người dùng tải hàng loạt.
-        const maxParallelVideos = 1
+        // Mỗi video thường khởi chạy một process yt-dlp + ffmpeg.
+        // maxParallelVideos điều chỉnh theo accelerate để tối ưu CPU.
+        const maxParallelVideosLocal = maxParallelVideos
         let nextVideoIndex = 0
         let completedVideos = 0
         const videoResults = new Array(videoItems.length)
@@ -545,6 +568,10 @@ export default function AccountDownloader({ onShowToast }) {
                 url: item.url,
                 title: safeMediaTitle(item),
                 destDir: videoDestDir,
+                embedMetadata,
+                embedThumbnail,
+                concurrentFragments,
+                videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
                 taskId: vidTaskId,
                 platform: profileResult?.platform || item.platform,
               })
@@ -566,7 +593,7 @@ export default function AccountDownloader({ onShowToast }) {
 
         await Promise.all(
           Array.from(
-            { length: Math.min(maxParallelVideos, videoItems.length) },
+            { length: Math.min(maxParallelVideosLocal, videoItems.length) },
             () => downloadNextVideo()
           )
         )
@@ -718,8 +745,69 @@ export default function AccountDownloader({ onShowToast }) {
             <IconImage className="w-3.5 h-3.5" />
             <span>Ảnh</span>
           </button>
+          {/* Nút tùy chọn tải */}
+          <button
+            type="button"
+            className={`pane-toggle-btn ${isOptionsOpen ? 'active' : ''}`}
+            onClick={() => setIsOptionsOpen(!isOptionsOpen)}
+            title="Tùy chọn tải: container, tăng tốc, metadata..."
+          >
+            <IconSettings className="w-3.5 h-3.5" />
+            <span>Tùy chọn</span>
+          </button>
         </div>
       </div>
+
+      {/* Options bar (nếu mở) */}
+      {isOptionsOpen && (
+        <div className="download-options-inline-box" style={{ margin: '0 0 8px 0' }}>
+          {/* Container pills — chỉ hiện với video */}
+          {mediaTypeFilter !== 'image' && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '11px', color: '#94a3b8', minWidth: 'max-content' }}>Định dạng video:</span>
+              {VIDEO_CONTAINER_OPTIONS.map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  className={`minimal-pill ${videoContainer === f.id ? 'active' : ''}`}
+                  title={f.desc}
+                  onClick={() => onVideoContainerChange?.(f.id)}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+          )}
+          <label className="checkbox-opt-label" title="Tăng tốc tải bằng đa luồng — tiêu thụ nhiều CPU/RAM hơn">
+            <input
+              type="checkbox"
+              checked={accelerate}
+              onChange={(e) => onAccelerateChange?.(e.target.checked)}
+            />
+            <span>Tăng tốc đa luồng {accelerate ? `(2 video song song, ${concurrentFragments} luồng/video)` : '(1 video, 1 luồng)'}</span>
+          </label>
+          {mediaTypeFilter !== 'image' && (
+            <>
+              <label className="checkbox-opt-label">
+                <input
+                  type="checkbox"
+                  checked={embedMetadata}
+                  onChange={(e) => onEmbedMetadataChange?.(e.target.checked)}
+                />
+                <span>Nhúng Metadata</span>
+              </label>
+              <label className="checkbox-opt-label">
+                <input
+                  type="checkbox"
+                  checked={embedThumbnail}
+                  onChange={(e) => onEmbedThumbnailChange?.(e.target.checked)}
+                />
+                <span>Nhúng Thumbnail</span>
+              </label>
+            </>
+          )}
+        </div>
+      )}
 
       {/* Form nhập liệu */}
       <div className="pane-input-section">

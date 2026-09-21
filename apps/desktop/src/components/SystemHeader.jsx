@@ -249,13 +249,25 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
             >
               <span className="folder-name-text">{formatDirDisplay(downloadDir)}</span>
             </button>
-            <label className="checkbox-opt-label" style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', color: '#cbd5e1', fontSize: '12px' }} title="Bật để luôn hỏi nơi lưu tệp trước khi tải">
+            <label
+              className="checkbox-opt-label"
+              style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', color: '#cbd5e1', fontSize: '12px' }}
+              title={alwaysAsk
+                ? `Chế độ: Hỏi thư mục mỗi lần tải\nTắt để tự động lưu vào: ${downloadDir || '~/Downloads'}` 
+                : `Chế độ: Tự động lưu vào ${downloadDir || '~/Downloads'}\nBật nếu muốn chọn thư mục trước mỗi lần tải`
+              }
+            >
               <input
                 type="checkbox"
                 checked={alwaysAsk}
                 onChange={(e) => {
                   setAlwaysAsk(e.target.checked)
                   setAlwaysAskDownloadDir(e.target.checked)
+                  showToast(
+                    e.target.checked
+                      ? 'Bật: Sẽ hỏi nơi lưu trước mỗi lần tải'
+                      : `Tắt: Tự động lưu vào "${downloadDir || 'Downloads mặc định'}"`
+                  )
                 }}
                 style={{ cursor: 'pointer', accentColor: '#38bdf8' }}
               />

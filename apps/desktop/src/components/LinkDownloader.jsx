@@ -103,7 +103,19 @@ function generateBatchMediaFilenames(items, defaultReferer = null) {
   })
 }
 
-export default function LinkDownloader({ onShowToast }) {
+export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
+  // Shared download options từ App level (persist qua localStorage)
+  const {
+    videoContainer = 'auto',
+    accelerate = false,
+    embedMetadata = true,
+    embedThumbnail = false,
+    onVideoContainerChange,
+    onAccelerateChange,
+    onEmbedMetadataChange,
+    onEmbedThumbnailChange,
+  } = dlOptions
+
   const [mode, setMode] = useState('single') // 'single' | 'batch'
   const [url, setUrl] = useState('')
   const [batchText, setBatchText] = useState('')
@@ -127,19 +139,18 @@ export default function LinkDownloader({ onShowToast }) {
   const currentDownloadTaskIdRef = useRef(null) // task download đang chạy, để huỷ và dọn dẹp tệp
   const [isCancelling, setIsCancelling] = useState(false)
 
-  // Trimmer tool state
+  // Trimmer tool state — chỉ có nghĩa với tải đơn link
   const [isTrimmerOpen, setIsTrimmerOpen] = useState(false)
   const [trimStart, setTrimStart] = useState('')
   const [trimEnd, setTrimEnd] = useState('')
 
-  // Advanced download options state
+  // Advanced options UI state
   const [isOptionsOpen, setIsOptionsOpen] = useState(false)
+  // embedSubs chỉ dùng cho tải đơn (phụ đề gắn kèm với 1 video cụ thể)
   const [embedSubs, setEmbedSubs] = useState(false)
-  const [embedMetadata, setEmbedMetadata] = useState(true)
-  const [embedThumbnail, setEmbedThumbnail] = useState(false)
-  // Mặc định ưu tiên độ phản hồi trên máy yếu; người dùng vẫn có thể bật tăng tốc.
-  const [accelerate, setAccelerate] = useState(false)
-  const [videoContainer, setVideoContainer] = useState('auto')
+
+  // concurrentFragments: tối ưu CPU — accelerate=false→1 (máy yếu), true→4 (mạng tốt)
+  const concurrentFragments = accelerate ? 4 : 1
 
   // Synchronous validation state computed from URL
   const trimmedUrl = url.trim()
@@ -449,7 +460,7 @@ export default function LinkDownloader({ onShowToast }) {
         embedSubs: embedSubs,
         embedMetadata: embedMetadata,
         embedThumbnail: embedThumbnail,
-        concurrentFragments: accelerate ? 2 : 1,
+        concurrentFragments,
         // Container video không thể áp dụng cho stream audio/MP3.
         videoFormat: !isAudioOnly && videoContainer !== 'auto' ? videoContainer : undefined,
         taskId,
@@ -843,9 +854,9 @@ export default function LinkDownloader({ onShowToast }) {
     const albumName = promptResult.trim() || 'Batch_Media'
 
     let targetDir = undefined
-    if (alwaysAskDir) {
+    if (getAlwaysAskDownloadDir()) {
       try {
-        targetDir = await selectDownloadDirectory()
+        targetDir = await askForDownloadDirectory()
         if (!targetDir) {
           onShowToast?.('Đã hủy do chưa chọn thư mục lưu')
           return
@@ -937,6 +948,10 @@ export default function LinkDownloader({ onShowToast }) {
             url: videoUrl,
             title: media.title || `media_${index + 1}`,
             destDir: albumFolder,
+            embedMetadata,
+            embedThumbnail,
+            concurrentFragments,
+            videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
             taskId: videoTaskId,
             platform: media.platform,
           })
@@ -1133,7 +1148,7 @@ export default function LinkDownloader({ onShowToast }) {
                     type="button"
                     className={`minimal-pill ${videoContainer === f.id ? 'active' : ''}`}
                     title={f.desc}
-                    onClick={() => setVideoContainer(f.id)}
+                    onClick={() => onVideoContainerChange?.(f.id)}
                   >
                     {f.label}
                   </button>
@@ -1215,6 +1230,62 @@ export default function LinkDownloader({ onShowToast }) {
                 </div>
               </div>
             </div>
+
+            {/* Container + options cho batch mode */}
+            <div className="pane-control-row">
+              <div className="pills-group">
+                {VIDEO_CONTAINER_OPTIONS.map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className={`minimal-pill ${videoContainer === f.id ? 'active' : ''}`}
+                    title={f.desc}
+                    onClick={() => onVideoContainerChange?.(f.id)}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                className={`minimal-small-btn ${isOptionsOpen ? 'active' : ''}`}
+                onClick={() => setIsOptionsOpen(!isOptionsOpen)}
+                title="Tùy chọn tải nâng cao"
+              >
+                <IconSettings className="w-3 h-3" />
+                <span>Tùy chọn</span>
+              </button>
+            </div>
+
+            {/* Options box cho batch mode */}
+            {isOptionsOpen && (
+              <div className="download-options-inline-box">
+                <label className="checkbox-opt-label" title="Tăng tốc tải bằng đa luồng — tiêu thụ nhiều CPU/RAM hơn">
+                  <input
+                    type="checkbox"
+                    checked={accelerate}
+                    onChange={(e) => onAccelerateChange?.(e.target.checked)}
+                  />
+                  <span>Tăng tốc đa luồng</span>
+                </label>
+                <label className="checkbox-opt-label">
+                  <input
+                    type="checkbox"
+                    checked={embedMetadata}
+                    onChange={(e) => onEmbedMetadataChange?.(e.target.checked)}
+                  />
+                  <span>Nhúng Metadata</span>
+                </label>
+                <label className="checkbox-opt-label">
+                  <input
+                    type="checkbox"
+                    checked={embedThumbnail}
+                    onChange={(e) => onEmbedThumbnailChange?.(e.target.checked)}
+                  />
+                  <span>Nhúng Thumbnail</span>
+                </label>
+              </div>
+            )}
 
             <div className="pane-control-row">
               {batchProgress.statusText && (
@@ -1383,23 +1454,23 @@ export default function LinkDownloader({ onShowToast }) {
               </div>
             )}
 
-            {/* Advanced download options box (nếu mở) */}
+            {/* Advanced download options box (nếu mở) — Tải đơn link */}
             {isOptionsOpen && (
               <div className="download-options-inline-box">
-                <label className="checkbox-opt-label">
+                <label className="checkbox-opt-label" title="Tăng tốc tải bằng đa luồng — tiêu thụ nhiều CPU/RAM hơn">
                   <input
                     type="checkbox"
                     checked={accelerate}
-                    onChange={(e) => setAccelerate(e.target.checked)}
+                    onChange={(e) => onAccelerateChange?.(e.target.checked)}
                   />
-                  <span>Tăng tốc 8x (Đa luồng)</span>
+                  <span>Tăng tốc đa luồng</span>
                 </label>
 
                 <label className="checkbox-opt-label">
                   <input
                     type="checkbox"
                     checked={embedMetadata}
-                    onChange={(e) => setEmbedMetadata(e.target.checked)}
+                    onChange={(e) => onEmbedMetadataChange?.(e.target.checked)}
                   />
                   <span>Nhúng Metadata</span>
                 </label>
@@ -1408,12 +1479,12 @@ export default function LinkDownloader({ onShowToast }) {
                   <input
                     type="checkbox"
                     checked={embedThumbnail}
-                    onChange={(e) => setEmbedThumbnail(e.target.checked)}
+                    onChange={(e) => onEmbedThumbnailChange?.(e.target.checked)}
                   />
                   <span>Nhúng Thumbnail</span>
                 </label>
 
-                <label className="checkbox-opt-label">
+                <label className="checkbox-opt-label" title="Nhúng phụ đề vào file video (chỉ có nghĩa với tải đơn link)">
                   <input
                     type="checkbox"
                     checked={embedSubs}
@@ -1427,7 +1498,7 @@ export default function LinkDownloader({ onShowToast }) {
                   <select
                     className="minimal-select"
                     value={videoContainer}
-                    onChange={(e) => setVideoContainer(e.target.value)}
+                    onChange={(e) => onVideoContainerChange?.(e.target.value)}
                     aria-label="Định dạng container video đầu ra"
                   >
                     {VIDEO_CONTAINER_OPTIONS.map((f) => (
