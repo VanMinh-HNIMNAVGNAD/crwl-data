@@ -234,7 +234,7 @@ pnpm --filter desktop tauri build
 ### 📍 Thư mục chứa kết quả build:
 Sau khi build thành công, các file cài đặt sẽ nằm tại:
 - **Gói Debian/Ubuntu (.deb)**:
-  `apps/desktop/src-tauri/target/release/bundle/deb/social-media-crawler_0.1.0_amd64.deb`
+  `apps/desktop/src-tauri/target/release/bundle/deb/social-media-crawler_0.1.1_amd64.deb`
 - **Gói Chạy Nhanh (.AppImage)**:
   `apps/desktop/src-tauri/target/release/bundle/appimage/social-media-crawler_0.1.0_amd64.AppImage`
 - **File nhị phân độc lập (Standalone Binary)**:
