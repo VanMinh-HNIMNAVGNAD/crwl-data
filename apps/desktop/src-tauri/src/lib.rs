@@ -70,7 +70,7 @@ pub fn run() {
             commands::select_download_directory,
             commands::get_default_download_directory,
             commands::open_download_folder,
-            // ── History (PostgreSQL) ──────────────────────────────────────
+            // ── History (SQLite) ──────────────────────────────────────────────
             commands::get_download_history,
             commands::clear_download_history,
             // ── System ────────────────────────────────────────────────────

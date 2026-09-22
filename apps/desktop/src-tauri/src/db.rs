@@ -1,13 +1,10 @@
-use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
-
-use crate::settings::SettingsManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadHistoryRecord {
@@ -26,7 +23,7 @@ pub struct DownloadHistoryRecord {
 
 #[derive(Debug, Clone)]
 pub struct Database {
-    pub pool: Arc<RwLock<Option<PgPool>>>,
+    pub pool: Arc<RwLock<Option<SqlitePool>>>,
 }
 
 impl Database {
@@ -37,13 +34,13 @@ impl Database {
     }
 
     #[allow(dead_code)]
-    pub fn from_pool(pool: Option<PgPool>) -> Self {
+    pub fn from_pool(pool: Option<SqlitePool>) -> Self {
         Self {
             pool: Arc::new(RwLock::new(pool)),
         }
     }
 
-    pub async fn get_pool(&self) -> Option<PgPool> {
+    pub async fn get_pool(&self) -> Option<SqlitePool> {
         self.pool.read().await.clone()
     }
 
@@ -52,193 +49,140 @@ impl Database {
         self.pool.read().await.is_some()
     }
 
-    /// Kiểm tra xem URL có phải là giá trị mẫu / giả lập hay không
-    pub fn is_placeholder_url(url: &str) -> bool {
-        let u = url.trim();
-        if u.is_empty() {
-            return true;
+    /// Xác định đường dẫn file SQLite cục bộ tại thư mục cấu hình của hệ điều hành:
+    /// - Linux: ~/.config/crwl/crwl.db
+    /// - Windows: %APPDATA%/crwl/crwl.db
+    pub fn resolve_db_path() -> PathBuf {
+        let dir = dirs::config_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+            .join("crwl");
+
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(&dir);
         }
-        let lower = u.to_lowercase();
-        lower.contains("postgres.xxxx")
-            || lower.contains("yourpassword")
-            || lower.contains("<password>")
-            || lower.contains("[password]")
-            || lower.contains("user:password")
-            || lower.contains("host:5432")
+
+        dir.join("crwl.db")
     }
 
-    /// Tự động tìm chuỗi DATABASE_URL từ settings.json, biến môi trường hệ thống hoặc file .env
-    pub fn resolve_database_url() -> Option<String> {
-        // 1. Kiểm tra settings.database_url (từ settings.json của ứng dụng)
-        let settings = SettingsManager::load();
-        if let Some(url) = settings.database_url {
-            let trimmed = url.trim();
-            if !trimmed.is_empty() && !Self::is_placeholder_url(trimmed) {
-                info!("Đã nạp DATABASE_URL từ settings.json");
-                return Some(trimmed.to_string());
-            }
-        }
-
-        // 2. Kiểm tra biến môi trường hệ thống trực tiếp
-        if let Ok(url) = env::var("DATABASE_URL") {
-            let trimmed = url.trim();
-            if !trimmed.is_empty() && !Self::is_placeholder_url(trimmed) {
-                info!("Đã nạp DATABASE_URL từ biến môi trường hệ thống");
-                return Some(trimmed.to_string());
-            }
-        }
-
-        // 3. Kiểm tra biến môi trường nhúng lúc biên dịch (GitHub Actions build secrets)
-        if let Some(url) = option_env!("DATABASE_URL") {
-            let trimmed = url.trim();
-            if !trimmed.is_empty() && !Self::is_placeholder_url(trimmed) {
-                info!("Đã nạp DATABASE_URL từ cấu hình đóng gói (compile-time env)");
-                return Some(trimmed.to_string());
-            }
-        }
-
-        // 4. Tìm theo thứ tự ưu tiên các file .env
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        let config_dir = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
-
-        let candidates = vec![
-            config_dir.join("crwl").join(".env"),   // ~/.config/crwl/.env (primary)
-            PathBuf::from(".env"),                   // cwd/.env
-            PathBuf::from("../.env"),                // parent dir
-            PathBuf::from("../../.env"),             // grandparent dir
-        ];
-
-        for candidate in candidates {
-            if candidate.exists() {
-                if let Ok(iter) = dotenvy::from_path_iter(&candidate) {
-                    for item in iter.flatten() {
-                        if item.0 == "DATABASE_URL" {
-                            let url = item.1.trim().to_string();
-                            if !url.is_empty() && !Self::is_placeholder_url(&url) {
-                                info!("Đã nạp DATABASE_URL từ file: {:?}", candidate);
-                                return Some(url);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Khởi tạo kết nối tới PostgreSQL trong nền
+    /// Khởi tạo kết nối tới SQLite Database cục bộ trong nền
     pub async fn init(&self) {
-        let database_url = Self::resolve_database_url();
+        let db_path = Self::resolve_db_path();
+        info!("Đang khởi tạo SQLite database cục bộ tại: {:?}", db_path);
 
-        if let Some(ref url) = database_url {
-            info!("Đang kết nối tới PostgreSQL database...");
-            match PgPoolOptions::new()
-                .max_connections(5)
-                .acquire_timeout(std::time::Duration::from_secs(8))
-                .connect(url)
-                .await
-            {
-                Ok(pool) => {
-                    info!("✅ Kết nối PostgreSQL thành công!");
-                    if let Err(e) = Self::init_schema(&pool).await {
-                        warn!("⚠️ Lỗi khi khởi tạo schema: {e}");
-                    }
-                    *self.pool.write().await = Some(pool);
-                }
-                Err(e) => {
-                    error!("❌ Không thể kết nối PostgreSQL: {e}. Ứng dụng sẽ hoạt động ở chế độ Offline (không lưu DB).");
-                    *self.pool.write().await = None;
-                }
+        if let Some(parent) = db_path.parent() {
+            if !parent.exists() {
+                let _ = std::fs::create_dir_all(parent);
             }
-        } else {
-            info!("ℹ️ Không tìm thấy DATABASE_URL hợp lệ. Ứng dụng sẽ hoạt động ở chế độ Offline.");
-            *self.pool.write().await = None;
+        }
+
+        let connect_opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+
+        match SqlitePoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_with(connect_opts)
+            .await
+        {
+            Ok(pool) => {
+                info!("✅ Kết nối SQLite database thành công!");
+                if let Err(e) = Self::init_schema(&pool).await {
+                    warn!("⚠️ Lỗi khi khởi tạo SQLite schema: {e}");
+                }
+                *self.pool.write().await = Some(pool);
+            }
+            Err(e) => {
+                error!("❌ Không thể kết nối SQLite database: {e}. Ứng dụng sẽ hoạt động ở chế độ Offline (không lưu DB).");
+                *self.pool.write().await = None;
+            }
         }
     }
 
-    /// Tự động đảm bảo 5 bảng của schema.sql tồn tại
-    async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
+    /// Tự động khởi tạo và xác thực các bảng trong SQLite
+    pub async fn init_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let ddl = r#"
-            CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+            PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS users (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                username VARCHAR(100) NOT NULL,
-                role VARCHAR(50) DEFAULT 'user',
-                is_active BOOLEAN DEFAULT TRUE,
-                device_id VARCHAR(255) UNIQUE NOT NULL,
-                ip_address VARCHAR(64),
-                browser_name VARCHAR(100),
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                role TEXT DEFAULT 'user',
+                is_active INTEGER DEFAULT 1,
+                device_id TEXT UNIQUE NOT NULL,
+                ip_address TEXT,
+                browser_name TEXT,
                 user_agent TEXT,
-                last_active_at TIMESTAMPTZ DEFAULT NOW(),
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                last_active_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS jobs (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                id TEXT PRIMARY KEY,
+                user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
                 title TEXT NOT NULL,
-                job_type VARCHAR(50) DEFAULT 'single',
-                engine VARCHAR(50) DEFAULT 'auto',
-                status VARCHAR(50) DEFAULT 'ready',
-                options JSONB DEFAULT '{}'::jsonb,
+                job_type TEXT DEFAULT 'single',
+                engine TEXT DEFAULT 'auto',
+                status TEXT DEFAULT 'ready',
+                options TEXT DEFAULT '{}',
                 total_items INTEGER DEFAULT 1,
                 extracted_items INTEGER DEFAULT 0,
-                client_ip VARCHAR(64),
-                device_id VARCHAR(255),
-                started_at TIMESTAMPTZ DEFAULT NOW(),
-                finished_at TIMESTAMPTZ
+                client_ip TEXT,
+                device_id TEXT,
+                started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                finished_at DATETIME
             );
 
             CREATE TABLE IF NOT EXISTS job_items (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
+                id TEXT PRIMARY KEY,
+                job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
                 source_url TEXT NOT NULL,
-                item_type VARCHAR(50) DEFAULT 'profile',
-                status VARCHAR(50) DEFAULT 'completed',
+                item_type TEXT DEFAULT 'profile',
+                status TEXT DEFAULT 'completed',
                 extracted_count INTEGER DEFAULT 0,
-                started_at TIMESTAMPTZ DEFAULT NOW(),
-                finished_at TIMESTAMPTZ
+                started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                finished_at DATETIME
             );
 
             CREATE TABLE IF NOT EXISTS extracted_medias (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
-                job_item_id UUID REFERENCES job_items(id) ON DELETE SET NULL,
-                user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-                platform VARCHAR(50),
-                media_type VARCHAR(50),
+                id TEXT PRIMARY KEY,
+                job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+                job_item_id TEXT REFERENCES job_items(id) ON DELETE SET NULL,
+                user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                platform TEXT,
+                media_type TEXT,
                 original_url TEXT NOT NULL,
                 title TEXT,
                 author TEXT,
                 author_url TEXT,
                 thumbnail_url TEXT,
                 duration_seconds INTEGER,
-                view_count BIGINT,
-                like_count BIGINT,
-                formats JSONB DEFAULT '[]'::jsonb,
-                download_status VARCHAR(50) DEFAULT 'pending',
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                view_count INTEGER,
+                like_count INTEGER,
+                formats TEXT DEFAULT '[]',
+                download_status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS download_history (
-                id BIGSERIAL PRIMARY KEY,
-                user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-                job_id UUID REFERENCES jobs(id) ON DELETE SET NULL,
-                extracted_media_id UUID REFERENCES extracted_medias(id) ON DELETE SET NULL,
-                platform VARCHAR(50),
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+                extracted_media_id TEXT REFERENCES extracted_medias(id) ON DELETE SET NULL,
+                platform TEXT,
                 media_title TEXT,
                 file_name TEXT,
-                file_size_bytes BIGINT,
-                client_type VARCHAR(50) DEFAULT 'desktop',
+                file_size_bytes INTEGER,
+                client_type TEXT DEFAULT 'desktop',
                 duration_ms INTEGER,
-                status VARCHAR(50) DEFAULT 'success',
+                status TEXT DEFAULT 'success',
                 error_reason TEXT,
-                client_ip VARCHAR(64),
-                device_id VARCHAR(255),
-                browser_name VARCHAR(100),
-                downloaded_at TIMESTAMPTZ DEFAULT NOW()
+                client_ip TEXT,
+                device_id TEXT,
+                browser_name TEXT,
+                downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE INDEX IF NOT EXISTS idx_users_device_id ON users(device_id);
@@ -247,13 +191,33 @@ impl Database {
         "#;
 
         sqlx::raw_sql(ddl).execute(pool).await?;
-        info!("✅ Schema PostgreSQL đã được xác thực/khởi tạo đồng bộ.");
+        info!("✅ Schema SQLite đã được xác thực/khởi tạo đồng bộ.");
         Ok(())
     }
 
     /// Lấy hoặc tạo user theo device_id
     pub async fn get_or_create_user(&self, device_id: &str) -> Option<uuid::Uuid> {
         let pool = self.get_pool().await?;
+
+        // 1. Kiểm tra nếu user đã tồn tại
+        let existing = sqlx::query("SELECT id FROM users WHERE device_id = ? LIMIT 1;")
+            .bind(device_id)
+            .fetch_optional(&pool)
+            .await;
+
+        if let Ok(Some(row)) = existing {
+            if let Ok(id_str) = row.try_get::<String, _>("id") {
+                let _ = sqlx::query("UPDATE users SET last_active_at = CURRENT_TIMESTAMP WHERE device_id = ?;")
+                    .bind(device_id)
+                    .execute(&pool)
+                    .await;
+                return uuid::Uuid::parse_str(&id_str).ok();
+            }
+        }
+
+        // 2. Tạo mới user
+        let user_uuid = uuid::Uuid::new_v4();
+        let user_id_str = user_uuid.to_string();
         let username = format!("desktop_{}", &device_id.chars().take(10).collect::<String>());
 
         let browser_name = if cfg!(windows) {
@@ -269,22 +233,21 @@ impl Database {
             "Tauri 2 / WebKitGTK"
         };
 
-        let query = r#"
-            INSERT INTO users (username, role, is_active, device_id, browser_name, user_agent, last_active_at)
-            VALUES ($1, 'user', true, $2, $3, $4, NOW())
-            ON CONFLICT (device_id) DO UPDATE SET last_active_at = NOW()
-            RETURNING id;
+        let insert_query = r#"
+            INSERT INTO users (id, username, role, is_active, device_id, browser_name, user_agent, last_active_at, created_at)
+            VALUES (?, ?, 'user', 1, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
         "#;
 
-        match sqlx::query(query)
+        match sqlx::query(insert_query)
+            .bind(&user_id_str)
             .bind(&username)
             .bind(device_id)
             .bind(browser_name)
             .bind(user_agent)
-            .fetch_one(&pool)
+            .execute(&pool)
             .await
         {
-            Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok(),
+            Ok(_) => Some(user_uuid),
             Err(e) => {
                 error!("Lỗi khi get_or_create_user: {e}");
                 None
@@ -316,18 +279,21 @@ impl Database {
             "Tauri 2 / Linux Desktop"
         };
 
+        let user_id_str = user_id.map(|u| u.to_string());
+        let now = chrono::Utc::now();
+
         let query = r#"
             INSERT INTO download_history (
                 user_id, platform, media_title, file_name, file_size_bytes,
                 client_type, duration_ms, status, error_reason,
                 client_ip, device_id, browser_name, downloaded_at
             ) VALUES (
-                $1, $2, $3, $4, $5, 'desktop', $6, $7, $8, $9, $10, $11, NOW()
-            ) RETURNING id;
+                ?, ?, ?, ?, ?, 'desktop', ?, ?, ?, ?, ?, ?, ?
+            );
         "#;
 
         match sqlx::query(query)
-            .bind(user_id)
+            .bind(user_id_str)
             .bind(platform)
             .bind(media_title)
             .bind(file_name)
@@ -338,10 +304,11 @@ impl Database {
             .bind(client_ip)
             .bind(device_id)
             .bind(browser_name)
-            .fetch_one(&pool)
+            .bind(now)
+            .execute(&pool)
             .await
         {
-            Ok(row) => row.try_get::<i64, _>("id").ok(),
+            Ok(res) => Some(res.last_insert_rowid()),
             Err(e) => {
                 error!("Lỗi khi record_download_history: {e}");
                 None
@@ -360,37 +327,56 @@ impl Database {
             None => return Vec::new(),
         };
 
-        let mut query = String::from(
-            r#"
-            SELECT
-                dh.id,
-                dh.media_title,
-                dh.file_name,
-                dh.file_size_bytes,
-                dh.platform,
-                dh.status,
-                dh.client_ip,
-                dh.device_id,
-                dh.browser_name,
-                dh.downloaded_at,
-                u.username
-            FROM download_history dh
-            LEFT JOIN users u ON dh.user_id = u.id
-            "#,
-        );
-
         let scoped_device = device_id.filter(|d| !d.trim().is_empty());
 
         let rows = if let Some(dev_id) = scoped_device {
-            query.push_str(" WHERE dh.device_id = $2 ORDER BY dh.downloaded_at DESC LIMIT $1;");
-            sqlx::query(&query)
-                .bind(limit)
+            let query = r#"
+                SELECT
+                    dh.id,
+                    dh.media_title,
+                    dh.file_name,
+                    dh.file_size_bytes,
+                    dh.platform,
+                    dh.status,
+                    dh.client_ip,
+                    dh.device_id,
+                    dh.browser_name,
+                    dh.downloaded_at,
+                    u.username
+                FROM download_history dh
+                LEFT JOIN users u ON dh.user_id = u.id
+                WHERE dh.device_id = ?
+                ORDER BY dh.downloaded_at DESC, dh.id DESC
+                LIMIT ?;
+            "#;
+            sqlx::query(query)
                 .bind(dev_id)
+                .bind(limit)
                 .fetch_all(&pool)
                 .await
         } else {
-            query.push_str(" ORDER BY dh.downloaded_at DESC LIMIT $1;");
-            sqlx::query(&query).bind(limit).fetch_all(&pool).await
+            let query = r#"
+                SELECT
+                    dh.id,
+                    dh.media_title,
+                    dh.file_name,
+                    dh.file_size_bytes,
+                    dh.platform,
+                    dh.status,
+                    dh.client_ip,
+                    dh.device_id,
+                    dh.browser_name,
+                    dh.downloaded_at,
+                    u.username
+                FROM download_history dh
+                LEFT JOIN users u ON dh.user_id = u.id
+                ORDER BY dh.downloaded_at DESC, dh.id DESC
+                LIMIT ?;
+            "#;
+            sqlx::query(query)
+                .bind(limit)
+                .fetch_all(&pool)
+                .await
         };
 
         let rows = match rows {
@@ -401,25 +387,40 @@ impl Database {
             }
         };
 
-        // `Row::get` panic khi cột NULL hoặc sai kiểu. Một panic trong Tauri command
-        // khiến promise phía UI không bao giờ resolve — modal Lịch sử quay vô tận.
-        // Dùng `try_get` để hàng dữ liệu lỗi chỉ bị bỏ qua thay vì treo cả tính năng.
         rows.into_iter()
-            .map(|r| DownloadHistoryRecord {
-                id: r.try_get("id").unwrap_or_default(),
-                media_title: r.try_get("media_title").unwrap_or_default(),
-                file_name: r.try_get("file_name").unwrap_or_default(),
-                file_size_bytes: r.try_get("file_size_bytes").unwrap_or_default(),
-                platform: r.try_get("platform").unwrap_or_default(),
-                status: r
-                    .try_get::<Option<String>, _>("status")
-                    .unwrap_or_default()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                client_ip: r.try_get("client_ip").unwrap_or_default(),
-                device_id: r.try_get("device_id").unwrap_or_default(),
-                browser_name: r.try_get("browser_name").unwrap_or_default(),
-                downloaded_at: r.try_get("downloaded_at").unwrap_or_default(),
-                username: r.try_get("username").unwrap_or_default(),
+            .map(|r| {
+                let downloaded_at: Option<chrono::DateTime<chrono::Utc>> = r
+                    .try_get::<chrono::DateTime<chrono::Utc>, _>("downloaded_at")
+                    .ok()
+                    .or_else(|| {
+                        r.try_get::<String, _>("downloaded_at").ok().and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(&s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&chrono::Utc))
+                                .or_else(|| {
+                                    chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                                        .ok()
+                                        .map(|ndt| ndt.and_utc())
+                                })
+                        })
+                    });
+
+                DownloadHistoryRecord {
+                    id: r.try_get("id").unwrap_or_default(),
+                    media_title: r.try_get("media_title").unwrap_or_default(),
+                    file_name: r.try_get("file_name").unwrap_or_default(),
+                    file_size_bytes: r.try_get("file_size_bytes").unwrap_or_default(),
+                    platform: r.try_get("platform").unwrap_or_default(),
+                    status: r
+                        .try_get::<Option<String>, _>("status")
+                        .unwrap_or_default()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    client_ip: r.try_get("client_ip").unwrap_or_default(),
+                    device_id: r.try_get("device_id").unwrap_or_default(),
+                    browser_name: r.try_get("browser_name").unwrap_or_default(),
+                    downloaded_at,
+                    username: r.try_get("username").unwrap_or_default(),
+                }
             })
             .collect()
     }
@@ -431,8 +432,8 @@ impl Database {
             None => return false,
         };
 
-        let result = if let Some(dev_id) = device_id {
-            sqlx::query("DELETE FROM download_history WHERE device_id = $1;")
+        let result = if let Some(dev_id) = device_id.filter(|d| !d.trim().is_empty()) {
+            sqlx::query("DELETE FROM download_history WHERE device_id = ?;")
                 .bind(dev_id)
                 .execute(&pool)
                 .await
@@ -459,6 +460,7 @@ impl Database {
     ) -> Option<(uuid::Uuid, uuid::Uuid)> {
         let pool = self.get_pool().await?;
         let user_id = self.get_or_create_user(device_id).await;
+        let user_id_str = user_id.map(|u| u.to_string());
 
         let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled Media");
         let platform = data.get("platform").and_then(|v| v.as_str()).unwrap_or("auto");
@@ -467,6 +469,7 @@ impl Database {
         let author_url = data.get("authorUrl").and_then(|v| v.as_str());
         let thumb = data.get("thumbnail").and_then(|v| v.as_str());
         let formats = data.get("streams").or_else(|| data.get("images")).cloned().unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        let formats_str = serde_json::to_string(&formats).unwrap_or_else(|_| "[]".to_string());
 
         // Parse duration seconds if number or string
         let duration_seconds = data.get("duration").and_then(|d| {
@@ -492,48 +495,53 @@ impl Database {
         });
 
         // 1. Tạo Job
+        let job_uuid = uuid::Uuid::new_v4();
+        let job_id_str = job_uuid.to_string();
+
         let job_query = r#"
             INSERT INTO jobs (
-                user_id, title, job_type, engine, status, options,
+                id, user_id, title, job_type, engine, status, options,
                 total_items, extracted_items, client_ip, device_id,
                 started_at, finished_at
             ) VALUES (
-                $1, $2, 'single', 'auto', 'ready', '{}'::jsonb,
-                1, 1, $3, $4, NOW(), NOW()
-            ) RETURNING id;
+                ?, ?, ?, 'single', 'auto', 'ready', '{}',
+                1, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            );
         "#;
 
-        let job_id = match sqlx::query(job_query)
-            .bind(user_id)
+        if let Err(e) = sqlx::query(job_query)
+            .bind(&job_id_str)
+            .bind(&user_id_str)
             .bind(title)
             .bind(client_ip)
             .bind(device_id)
-            .fetch_one(&pool)
+            .execute(&pool)
             .await
         {
-            Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok()?,
-            Err(e) => {
-                error!("Lỗi khi tạo job cho single extraction: {e}");
-                return None;
-            }
-        };
+            error!("Lỗi khi tạo job cho single extraction: {e}");
+            return None;
+        }
 
         // 2. Tạo Extracted Media
+        let media_uuid = uuid::Uuid::new_v4();
+        let media_id_str = media_uuid.to_string();
+
         let media_query = r#"
             INSERT INTO extracted_medias (
-                job_id, user_id, platform, media_type, original_url,
+                id, job_id, user_id, platform, media_type, original_url,
                 title, author, author_url, thumbnail_url, duration_seconds,
                 formats, download_status, created_at
             ) VALUES (
-                $1, $2, $3, $4, $5,
-                $6, $7, $8, $9, $10,
-                $11, 'pending', NOW()
-            ) RETURNING id;
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, 'pending', CURRENT_TIMESTAMP
+            );
         "#;
 
-        let media_id = match sqlx::query(media_query)
-            .bind(job_id)
-            .bind(user_id)
+        if let Err(e) = sqlx::query(media_query)
+            .bind(&media_id_str)
+            .bind(&job_id_str)
+            .bind(&user_id_str)
             .bind(platform)
             .bind(media_type)
             .bind(original_url)
@@ -542,19 +550,16 @@ impl Database {
             .bind(author_url)
             .bind(thumb)
             .bind(duration_seconds)
-            .bind(formats)
-            .fetch_one(&pool)
+            .bind(formats_str)
+            .execute(&pool)
             .await
         {
-            Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok()?,
-            Err(e) => {
-                error!("Lỗi khi tạo extracted_media: {e}");
-                return None;
-            }
-        };
+            error!("Lỗi khi tạo extracted_media: {e}");
+            return None;
+        }
 
-        info!("✅ Đã ghi nhận single extraction vào DB: Job {job_id}, Media {media_id}");
-        Some((job_id, media_id))
+        info!("✅ Đã ghi nhận single extraction vào SQLite: Job {job_uuid}, Media {media_uuid}");
+        Some((job_uuid, media_uuid))
     }
 
     /// Ghi nhận phiên quét profile vào jobs, job_items và extracted_medias
@@ -567,6 +572,7 @@ impl Database {
     ) -> Option<(uuid::Uuid, usize)> {
         let pool = self.get_pool().await?;
         let user_id = self.get_or_create_user(device_id).await;
+        let user_id_str = user_id.map(|u| u.to_string());
 
         let platform = data.get("platform").and_then(|v| v.as_str()).unwrap_or("auto");
         let empty_vec = vec![];
@@ -577,61 +583,65 @@ impl Database {
             "url": source_url,
             "total_items": total_items,
         });
+        let options_str = serde_json::to_string(&options).unwrap_or_else(|_| "{}".to_string());
 
         // 1. Tạo Job
+        let job_uuid = uuid::Uuid::new_v4();
+        let job_id_str = job_uuid.to_string();
+        let job_title = format!("Crawl: {source_url}");
+
         let job_query = r#"
             INSERT INTO jobs (
-                user_id, title, job_type, engine, status, options,
+                id, user_id, title, job_type, engine, status, options,
                 total_items, extracted_items, client_ip, device_id,
                 started_at, finished_at
             ) VALUES (
-                $1, $2, 'profile', 'auto', 'ready', $3,
-                $4, $4, $5, $6, NOW(), NOW()
-            ) RETURNING id;
+                ?, ?, ?, 'profile', 'auto', 'ready', ?,
+                ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            );
         "#;
 
-        let job_title = format!("Crawl: {source_url}");
-        let job_id = match sqlx::query(job_query)
-            .bind(user_id)
+        if let Err(e) = sqlx::query(job_query)
+            .bind(&job_id_str)
+            .bind(&user_id_str)
             .bind(&job_title)
-            .bind(options)
+            .bind(&options_str)
+            .bind(total_items)
             .bind(total_items)
             .bind(client_ip)
             .bind(device_id)
-            .fetch_one(&pool)
+            .execute(&pool)
             .await
         {
-            Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok()?,
-            Err(e) => {
-                error!("Lỗi khi tạo job cho profile crawl: {e}");
-                return None;
-            }
-        };
+            error!("Lỗi khi tạo job cho profile crawl: {e}");
+            return None;
+        }
 
         // 2. Tạo Job Item
+        let job_item_uuid = uuid::Uuid::new_v4();
+        let job_item_id_str = job_item_uuid.to_string();
+
         let item_query = r#"
             INSERT INTO job_items (
-                job_id, source_url, item_type, status, extracted_count,
+                id, job_id, source_url, item_type, status, extracted_count,
                 started_at, finished_at
             ) VALUES (
-                $1, $2, 'profile', 'completed', $3,
-                NOW(), NOW()
-            ) RETURNING id;
+                ?, ?, ?, 'profile', 'completed', ?,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            );
         "#;
 
-        let job_item_id = match sqlx::query(item_query)
-            .bind(job_id)
+        if let Err(e) = sqlx::query(item_query)
+            .bind(&job_item_id_str)
+            .bind(&job_id_str)
             .bind(source_url)
             .bind(total_items)
-            .fetch_one(&pool)
+            .execute(&pool)
             .await
         {
-            Ok(row) => row.try_get::<uuid::Uuid, _>("id").ok()?,
-            Err(e) => {
-                error!("Lỗi khi tạo job_item: {e}");
-                return None;
-            }
-        };
+            error!("Lỗi khi tạo job_item: {e}");
+            return None;
+        }
 
         // 3. Batch insert tối đa 50 item đầu tiên
         let top_items = media_list.iter().take(50);
@@ -644,22 +654,26 @@ impl Database {
             let item_thumb = item.get("thumb").or_else(|| item.get("thumbnail")).and_then(|th| th.as_str());
             let item_type = item.get("type").and_then(|ty| ty.as_str()).unwrap_or("video");
 
+            let media_uuid = uuid::Uuid::new_v4();
+            let media_id_str = media_uuid.to_string();
+
             let insert_sql = r#"
                 INSERT INTO extracted_medias (
-                    job_id, job_item_id, user_id, platform, media_type,
+                    id, job_id, job_item_id, user_id, platform, media_type,
                     original_url, title, author, thumbnail_url,
                     formats, download_status, created_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5,
-                    $6, $7, $8, $9,
-                    '[]'::jsonb, 'pending', NOW()
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    '[]', 'pending', CURRENT_TIMESTAMP
                 );
             "#;
 
             if let Ok(_) = sqlx::query(insert_sql)
-                .bind(job_id)
-                .bind(job_item_id)
-                .bind(user_id)
+                .bind(&media_id_str)
+                .bind(&job_id_str)
+                .bind(&job_item_id_str)
+                .bind(&user_id_str)
                 .bind(platform)
                 .bind(item_type)
                 .bind(item_url)
@@ -673,29 +687,14 @@ impl Database {
             }
         }
 
-        info!("✅ Đã ghi nhận profile crawl vào DB: Job {job_id}, {inserted_count} extracted_medias");
-        Some((job_id, media_list.len()))
+        info!("✅ Đã ghi nhận profile crawl vào SQLite: Job {job_uuid}, {inserted_count} extracted_medias");
+        Some((job_uuid, media_list.len()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_placeholder_url() {
-        assert!(Database::is_placeholder_url(""));
-        assert!(Database::is_placeholder_url("   "));
-        assert!(Database::is_placeholder_url(
-            "postgresql://postgres.xxxx:yourpassword@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres"
-        ));
-        assert!(Database::is_placeholder_url("postgresql://user:yourpassword@localhost:5432/db"));
-        assert!(Database::is_placeholder_url("postgresql://user:<password>@localhost:5432/db"));
-        assert!(Database::is_placeholder_url("postgresql://user:[PASSWORD]@localhost:5432/db"));
-        assert!(!Database::is_placeholder_url(
-            "postgresql://postgres.realref:MySecret123@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres"
-        ));
-    }
 
     #[tokio::test]
     async fn test_database_new_and_from_pool() {
@@ -706,5 +705,73 @@ mod tests {
         let db_from_none = Database::from_pool(None);
         assert!(!db_from_none.is_connected().await);
         assert!(db_from_none.get_pool().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_in_memory_flow() {
+        let connect_opts = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(connect_opts)
+            .await
+            .expect("Failed to connect to in-memory SQLite");
+
+        Database::init_schema(&pool)
+            .await
+            .expect("Failed to init SQLite schema");
+
+        let db = Database::from_pool(Some(pool));
+        assert!(db.is_connected().await);
+
+        // Test ghi nhận lịch sử tải
+        let dev_id = "test_device_123";
+        let record_id = db
+            .record_download_history(
+                dev_id,
+                "Test Video Title",
+                "test_video.mp4",
+                "youtube",
+                Some(1024 * 1024),
+                Some(1500),
+                "success",
+                None,
+                Some("127.0.0.1"),
+            )
+            .await;
+
+        assert!(record_id.is_some());
+        let id = record_id.unwrap();
+        assert!(id > 0);
+
+        // Test truy vấn lịch sử
+        let list = db.get_recent_downloads(10, Some(dev_id)).await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].media_title.as_deref(), Some("Test Video Title"));
+        assert_eq!(list[0].platform.as_deref(), Some("youtube"));
+        assert_eq!(list[0].status, "success");
+
+        // Test trích xuất media đơn
+        let single_data = serde_json::json!({
+            "title": "Single Extracted Video",
+            "platform": "tiktok",
+            "type": "video",
+            "author": "creator",
+            "thumbnail": "https://example.com/thumb.jpg",
+            "duration": 65
+        });
+        let extraction = db
+            .record_single_extraction(dev_id, "https://tiktok.com/@user/video/1", &single_data, None)
+            .await;
+        assert!(extraction.is_some());
+
+        // Test xóa lịch sử
+        let cleared = db.clear_download_history(Some(dev_id)).await;
+        assert!(cleared);
+
+        let empty_list = db.get_recent_downloads(10, Some(dev_id)).await;
+        assert_eq!(empty_list.len(), 0);
     }
 }

@@ -63,7 +63,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         with:
           projectPath: 'apps/desktop'
           tagName: ${{ github.event.inputs.tag || github.ref_name }}
@@ -71,7 +70,7 @@ jobs:
           releaseBody: |
             ## 🚀 Social Media Crawler ${{ github.event.inputs.tag || github.ref_name }}
             
-            Bản phát hành chính thức đồng thời cho cả **Linux** và **Windows** với kết nối Supabase Cloud Database.
+            Bản phát hành chính thức đồng thời cho cả **Linux** và **Windows** với cơ sở dữ liệu SQLite cục bộ (bảo mật & riêng tư 100%).
 
             ### 📦 Tệp cài đặt đính kèm cho cả 2 hệ điều hành:
 

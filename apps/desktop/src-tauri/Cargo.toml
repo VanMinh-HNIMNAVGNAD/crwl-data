@@ -31,7 +31,7 @@ rfd = "0.17.2"
 open = "5.4.4"
 dirs = "7.0.0"
 regex = "1.13.1"
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "chrono", "uuid", "json"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "chrono", "uuid", "json"] }
 which = "8.0.6"
 zip = { version = "4.2.0", default-features = false, features = ["deflate"] }
 walkdir = "2.5.0"

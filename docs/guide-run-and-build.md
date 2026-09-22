@@ -108,23 +108,16 @@ Tauri yêu cầu một số thư viện C/GTK để render giao diện và tươ
 
 ---
 
-## 3. Cấu Hình Môi Trường (.env & Database)
+## 3. Cơ Sở Dữ Liệu Cục Bộ (SQLite)
 
-Ứng dụng hỗ trợ kết nối PostgreSQL (Supabase Cloud hoặc PostgreSQL local).
+Ứng dụng sử dụng cơ sở dữ liệu SQLite cục bộ (Local Embedded Database) tự động khởi tạo tại máy người dùng:
+- **Linux**: `~/.config/crwl/crwl.db`
+- **Windows**: `%APPDATA%/crwl/crwl.db`
 
-### 3.1. Vị trí đọc file cấu hình:
-Hệ thống ưu tiên đọc file cấu hình theo thứ tự:
-1. `.env` ở thư mục gốc của project: `/home/minh/code/crwl-on-socialmedia/.env`
-2. `~/.config/crwl/.env` (Tự động khởi tạo trong thư mục cấu hình desktop của người dùng).
-
-### 3.2. Nội dung file `.env` mẫu:
-```ini
-# Kết nối Supabase PostgreSQL qua IPv4 Pooler (Khuyên dùng để tránh lỗi IPv6)
-DATABASE_URL=postgresql://postgres.[PROJECT_REF]:[PASSWORD]@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres
-
-# Hoặc nếu sử dụng PostgreSQL cục bộ (Localhost):
-# DATABASE_URL=postgresql://postgres:[PASSWORD]@localhost:5432/postgres
-```
+### 3.1. Ưu điểm bảo mật & vận hành:
+1. **Zero-Config**: Không cần cài đặt PostgreSQL, không cần tài khoản Supabase, app mở lên là tự động kết nối và tạo schema.
+2. **Bảo mật tuyệt đối**: Dữ liệu lịch sử tải và định danh máy lưu 100% cục bộ, không gửi ra ngoài internet.
+3. **Hoạt động Offline**: Không phụ thuộc vào đường truyền mạng hay trạng thái server remote.
 
 > [!CAUTION]
 > **Không bao giờ commit chuỗi kết nối thật vào repo.** File `.env` đã nằm trong
@@ -313,15 +306,12 @@ Sau khi build thành công, các file cài đặt sẽ nằm tại:
 
 Dự án đã tích hợp sẵn GitHub Actions workflow tại `.github/workflows/release.yml` để tự động biên dịch và tạo bản phát hành kèm file cài đặt.
 
-### 9.1. Cấu hình quyền và Secret trên GitHub
+### 9.1. Cấu hình quyền trên GitHub
 1. **Cấp quyền tạo Release**:
    - Vào repository trên GitHub: **Settings** → **Actions** → **General** → **Workflow permissions**.
    - Chọn **"Read and write permissions"** và bấm **Save**.
-2. **Cấu hình Supabase `DATABASE_URL` (Tùy chọn)**:
-   - Vào **Settings** → **Secrets and variables** → **Actions** → **New repository secret**.
-   - Tên secret: `DATABASE_URL`
-   - Giá trị: Chuỗi kết nối Supabase IPv4 Pooler (`postgresql://postgres.[REF]:[PASS]@aws-0-[REGION].pooler.supabase.com:5432/postgres`).
-   - *Khi đặt secret này, file `.exe` và `.deb` được build sẽ tự động nhận diện và kết nối database ngay mà người dùng không cần tạo file .env.*
+2. **Không cần cấu hình secret Database**:
+   - Do ứng dụng sử dụng SQLite cục bộ, không cần cấu hình bất kỳ secret database nào trên GitHub Actions.
 
 ### 9.2. Cách tạo bản phát hành (Release)
 **Cách 1: Đẩy Git Tag (Khuyên dùng)**

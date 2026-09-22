@@ -3,7 +3,7 @@
 > **Dự án**: Social Media Crawler (Desktop App)  
 > **Nền tảng hỗ trợ**: Windows (10/11) & Linux (Ubuntu, Debian, Fedora, Arch...)  
 > **Công cụ tự động hóa**: GitHub Actions + Tauri Action v0  
-> **Cơ sở dữ liệu**: Supabase PostgreSQL  
+> **Cơ sở dữ liệu**: SQLite Cục Bộ (Local Embedded Database, Bảo mật 100%)  
 
 ---
 
@@ -12,7 +12,7 @@
 2. [Quy Trình Phát Triển Hằng Ngày](#2-quy-trình-phát-triển-hằng-ngày)
 3. [Quy Trình Phát Hành Bản Mới (Tạo Release)](#3-quy-trình-phát-hành-bản-mới-tạo-release)
 4. [Cách Phát Hành Thủ Công Trên Giao Diện Web](#4-cách-phát-hành-thủ-công-trên-giao-diện-web)
-5. [Cấu Hình Kết Nối Supabase Database](#5-cấu-hình-kết-nối-supabase-database)
+5. [Cơ Sở Dữ Liệu SQLite Cục Bộ](#5-cơ-sở-dữ-liệu-sqlite-cục-bộ)
 6. [Danh Sách Tệp Đóng Gói & Tải Về](#6-danh-sách-tệp-đóng-gói--tải-về)
 7. [Bảng Tra Cứu Lệnh Nhanh (Cheatsheet)](#7-bảng-tra-cứu-lệnh-nhanh-cheatsheet)
 
@@ -98,23 +98,18 @@ Nếu bạn không muốn gõ lệnh tạo tag trên terminal:
 
 ---
 
-## 5. Cấu Hình Kết Nối Supabase Database
+## 5. Cơ Sở Dữ Liệu SQLite Cục Bộ
 
-Ứng dụng hỗ trợ kết nối trực tiếp đến PostgreSQL của Supabase để lưu lịch sử tải và đồng bộ dữ liệu:
+Ứng dụng sử dụng cơ sở dữ liệu **SQLite cục bộ** (Local Embedded Database), đảm bảo tính riêng tư và bảo mật dữ liệu tuyệt đối:
 
-### 1. Nhúng sẵn qua GitHub Actions (Khuyên dùng cho bản build phân phối)
-- Đã cấu hình tại: **Settings** → **Secrets and variables** → **Actions** → Secret **`DATABASE_URL`**.
-- Giá trị: Chuỗi kết nối IPv4 Session Pooler của Supabase:
-  ```text
-  postgresql://postgres.[PROJECT_REF]:[PASSWORD]@aws-0-[REGION].pooler.supabase.com:5432/postgres
-  ```
-- Khi GitHub Actions build, mã nguồn Rust ([`db.rs`](../apps/desktop/src-tauri/src/db.rs)) sẽ tự động nhúng chuỗi này vào file `.exe` / `.deb`. Người dùng tải app về mở lên là tự động kết nối Supabase luôn mà không cần tạo file cấu hình.
+### 1. Cơ Chế Hoạt Động & Bảo Mật
+- **Không gửi dữ liệu ra ngoài**: Lịch sử tải, thông tin media và thiết bị chỉ được lưu trực tiếp trên máy của người dùng.
+- **Không lưu/nhúng credential**: Không có bất kỳ chuỗi mật khẩu, access token hay connection string nào được nhúng vào file cài đặt, loại bỏ 100% rủi ro rò rỉ cơ sở dữ liệu.
+- **Hoạt động Offline hoàn toàn**: Ứng dụng tự tạo và quản lý tệp SQLite ngay khi khởi động mà không phụ thuộc vào kết nối mạng hay trạng thái server.
 
-### 2. Thay đổi chuỗi kết nối trong App (Dành cho người dùng cuối)
-- Bất kỳ lúc nào, người dùng có thể mở app:
-  1. Bấm vào biểu tượng **⚙️ (Quản lý công cụ)** ở góc trên.
-  2. Kéo xuống mục **Cấu hình ứng dụng** → ô **DATABASE_URL**.
-  3. Dán URL mới và bấm **Lưu cấu hình**. App sẽ lưu vào `settings.json` và kết nối lại ngay lập tức.
+### 2. Vị Trí Lưu Tệp Cơ Sở Dữ Liệu (`crwl.db`)
+- **Linux**: `~/.config/crwl/crwl.db`
+- **Windows**: `%APPDATA%\crwl\crwl.db` (ví dụ `C:\Users\<User>\AppData\Roaming\crwl\crwl.db`)
 
 ---
 

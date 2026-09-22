@@ -38,10 +38,6 @@ pub struct AppSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gallery_dl_path: Option<String>,
 
-    /// DATABASE_URL cho Supabase PostgreSQL
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub database_url: Option<String>,
-
     /// Phiên bản settings schema (để migrate sau này)
     #[serde(default = "default_version")]
     pub schema_version: u32,
@@ -57,7 +53,6 @@ impl Default for AppSettings {
             download_dir: None,
             ytdlp_path: None,
             gallery_dl_path: None,
-            database_url: None,
             schema_version: 1,
         }
     }
@@ -162,11 +157,10 @@ impl SettingsManager {
 
         let _ = ensure_config_dir();
         let template = r#"# Crwl Desktop App — Configuration
-# Điền thông tin Supabase của bạn nếu muốn đồng bộ lịch sử tải về vào database
-
-# Supabase PostgreSQL Connection URL
-# Lấy từ: https://supabase.com → Settings → Database → Connection string → URI
-# DATABASE_URL=postgresql://postgres.[PROJECT_REF]:[PASSWORD]@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres
+# Ứng dụng sử dụng cơ sở dữ liệu SQLite cục bộ lưu tại:
+# - Linux: ~/.config/crwl/crwl.db
+# - Windows: %APPDATA%/crwl/crwl.db
+# Không cần cấu hình thêm bất kỳ biến môi trường nào.
 "#;
 
         if let Err(e) = std::fs::write(&env_path, template) {
