@@ -1,6 +1,6 @@
 {
   "name": "crwl-on-socialmedia",
-  "version": "1.0.0",
+  "version": "0.1.2",
   "private": true,
   "packageManager": "pnpm@9.15.5",
   "engines": {
