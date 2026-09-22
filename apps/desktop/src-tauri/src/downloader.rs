@@ -1106,7 +1106,7 @@ impl DownloaderService {
             is_indeterminate: false,
         });
 
-        // Ghi nhận lịch sử tải thành công vào database PostgreSQL
+        // Ghi nhận lịch sử tải thành công vào SQLite cục bộ
         db.record_download_history(
             &opts.device_id,
             opts.title.as_deref().unwrap_or(&file_name),
