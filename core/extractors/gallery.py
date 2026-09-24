@@ -14,6 +14,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Dict, Any, Tuple
 from .base import BaseExtractor
+from .ytdlp import YtDlpExtractor
 from ..cancellation import attach_request, current_request_id, detach_request, raise_if_cancelled
 from ..models import (
     MediaMetadata,
@@ -195,7 +196,7 @@ class GalleryDlExtractor(BaseExtractor):
                     f"gallery-dl chuyển tiếp URL quá nhiều lần mà không ra media: {profile_url}"
                 )
             child_url = queued_urls[0]
-            self.log(f"gallery-dl chuyển tiếp URL con ({range_spec or 'all'}): {child_url}")
+            self.log(f"gallery-dl chuyển tiếp URL con ({limit_desc}): {child_url}")
             return self.crawl_profile(
                 child_url,
                 limit=limit,
@@ -517,6 +518,7 @@ class GalleryDlExtractor(BaseExtractor):
                         type=item_type,
                         ext=ext,
                         thumb=thumb,
+                        duration=self._duration_of(meta) if is_video else None,
                     )
                 )
                 index += 1
@@ -542,7 +544,13 @@ class GalleryDlExtractor(BaseExtractor):
                 )
             )
 
-        first_thumb = images[0].thumb or images[0].url
+        # Thumbnail phải là ẢNH. Không bao giờ fallback sang URL video: webview
+        # (WebKitGTK) giải mã file .mp4 đặt trong <img> thành toàn bộ khung hình
+        # thô trong RAM — một video 720p dài 1 phút đã tốn vài GB và treo cả máy.
+        first_thumb = next(
+            (img.thumb or img.url for img in images if img.type != "video"),
+            next((img.thumb for img in images if img.thumb), None),
+        )
         platform = category.lower()
         if "twitter" in platform or "x.com" in platform:
             platform = "x"
@@ -621,7 +629,9 @@ class GalleryDlExtractor(BaseExtractor):
                     avatar = item_avatar
 
                 item_title = meta.get("title") or meta.get("filename") or None
-                thumb_url = meta.get("display_url") or (meta.get("thumbnail") if is_video else media_url) or media_url
+                # Video không có ảnh poster thì để trống, KHÔNG dùng chính URL video
+                # (xem chú thích ở _normalize_gallery).
+                thumb_url = meta.get("display_url") or (meta.get("thumbnail") if is_video else media_url) or None
 
                 quality_str = f"{meta['width']}x{meta['height']}" if meta.get("width") and meta.get("height") else None
                 size_str = self.format_bytes(meta["filesize"]) if meta.get("filesize") else None
@@ -638,7 +648,7 @@ class GalleryDlExtractor(BaseExtractor):
                         title=item_title,
                         thumb=thumb_url,
                         url=media_url,
-                        duration=None,
+                        duration=self._duration_of(meta) if is_video else None,
                         quality=quality_str,
                         size=size_str,
                         author=author,
@@ -797,6 +807,13 @@ class GalleryDlExtractor(BaseExtractor):
             if isinstance(val, dict):
                 return val.get("avatar") or val.get("profile_image_url") or val.get("image_url")
         return meta.get("avatar_url") or meta.get("profile_pic_url")
+
+    @staticmethod
+    def _duration_of(meta: Dict[str, Any]) -> Optional[str]:
+        try:
+            return YtDlpExtractor.format_duration(float(meta.get("duration") or 0))
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _extract_ext(url: str) -> Optional[str]:

@@ -227,6 +227,7 @@ class MediaDispatcher(BaseExtractor):
                 self.warn(f"Video yt-dlp thất bại ({yt_err}), đang thử gallery-dl fallback...")
                 try:
                     res = self.gallery.extract_gallery(target_url, browser=browser)
+                    self._fill_video_posters(res, target_url, browser)
                     return self._enhance_metadata(res, target_url)
                 except Exception as gal_err:
                     # Nếu cả 2 đều lỗi auth -> trả thông báo đăng nhập rõ ràng
@@ -260,6 +261,7 @@ class MediaDispatcher(BaseExtractor):
                     except Exception:
                         pass
 
+                self._fill_video_posters(res, target_url, browser)
                 return self._enhance_metadata(res, target_url)
             except Exception as gal_err:
                 # Nếu lỗi auth đối với platform yêu cầu đăng nhập -> trả thông báo rõ ràng
@@ -293,6 +295,7 @@ class MediaDispatcher(BaseExtractor):
             self.warn(f"yt-dlp thất bại ({yt_err}), gallery-dl fallback...")
             try:
                 res = self.gallery.extract_gallery(target_url, browser=browser)
+                self._fill_video_posters(res, target_url, browser)
                 return self._enhance_metadata(res, target_url)
             except Exception as gal_err:
                 self.warn(f"gallery-dl thất bại ({gal_err}), web_scraper fallback...")
@@ -462,6 +465,40 @@ class MediaDispatcher(BaseExtractor):
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _fill_video_posters(self, res: MediaMetadata, target_url: str, browser: Optional[str]) -> None:
+        """Bổ sung ảnh poster cho các video gallery-dl trả về mà không có ảnh bìa.
+
+        Các video trong cùng một bài đăng dùng chung link bài viết, nhưng mỗi video
+        có media ID riêng nằm trong URL file (vd. video.twimg.com/amplify_video/<id>/...),
+        trùng với `id` yt-dlp trả về — nên ghép poster theo ID là chính xác.
+        """
+        videos = [img for img in (res.images or []) if img.type == "video" and not img.thumb]
+        if not videos:
+            return
+        try:
+            posters = self.ytdlp.extract_video_posters(target_url, browser=browser)
+        except Exception as e:  # thiếu poster thì UI hiện placeholder, không làm hỏng kết quả
+            self.warn(f"Không lấy được poster video qua yt-dlp: {e}")
+            return
+        if not posters:
+            return
+
+        unmatched = []
+        for img in videos:
+            match = next((thumb for mid, thumb in posters if len(mid) >= 6 and mid in (img.url or "")), None)
+            if match:
+                img.thumb = match
+            else:
+                unmatched.append(img)
+        # Không ghép được theo ID mà số lượng khớp nhau thì ghép theo thứ tự trong bài.
+        if unmatched and len(unmatched) == len(videos) == len(posters):
+            for img, (_, thumb) in zip(unmatched, posters):
+                img.thumb = thumb
+
+        if not res.thumbnail:
+            res.thumbnail = next((img.thumb for img in res.images if img.thumb), None)
+            res.high_res_thumbnail = res.high_res_thumbnail or res.thumbnail
 
     def _try_playwright_sniff(self, target_url: str, gal_err: Exception, yt_err: Exception) -> MediaMetadata:
         """Dùng Playwright headless để sniff stream URLs bị ẩn qua XHR/fetch"""

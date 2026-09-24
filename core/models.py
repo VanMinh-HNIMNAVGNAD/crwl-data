@@ -93,6 +93,7 @@ class MediaImage:
     type: Optional[str] = "image"  # 'image' | 'video' | 'gif'
     ext: Optional[str] = None
     thumb: Optional[str] = None
+    duration: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = {
@@ -109,6 +110,8 @@ class MediaImage:
             res["ext"] = self.ext
         if self.thumb:
             res["thumb"] = self.thumb
+        if self.duration:
+            res["duration"] = self.duration
         return res
 
 

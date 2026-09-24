@@ -120,6 +120,37 @@ class YtDlpExtractor(BaseExtractor):
 
         return self._normalize_metadata(raw_data, url)
 
+    def extract_video_posters(self, url: str, browser: Optional[str] = None, timeout: int = 25) -> List[Tuple[str, str]]:
+        """Danh sách (media_id, ảnh poster) của mọi video trong một bài đăng.
+
+        gallery-dl không trả ảnh bìa cho video (vd. X/Twitter) trong khi yt-dlp thì có,
+        nên dùng để bổ sung poster cho từng video của bài nhiều video.
+        """
+        if not self.is_available():
+            return []
+        args, tmp_cookie = self.get_base_args(allow_playlist=True, browser=browser, target_url=url)
+        cmd = [self.binary_path, *args, "--dump-json", url]
+        try:
+            code, stdout, _ = self.run_process(cmd, timeout=timeout)
+        finally:
+            if tmp_cookie and os.path.exists(tmp_cookie):
+                try:
+                    os.remove(tmp_cookie)
+                except Exception:
+                    pass
+        posters: List[Tuple[str, str]] = []
+        for line in stdout.splitlines():
+            if not line.startswith("{"):
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            thumb = raw.get("thumbnail")
+            if isinstance(thumb, str) and thumb.startswith("http"):
+                posters.append((str(raw.get("id") or ""), thumb))
+        return posters
+
     def extract_playlist(
         self,
         url: str,

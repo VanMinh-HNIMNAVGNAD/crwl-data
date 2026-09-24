@@ -172,6 +172,23 @@ export function isMatchingDomain(hostname, targetDomain) {
  * `?list=PLx.ts` cũng bị xếp nhầm vào nhóm phim.
  * Giữ đồng bộ với `is_direct_stream_url()` trong core/resolver/url_resolver.py.
  */
+/**
+ * URL trỏ tới file video/stream (không phải ảnh).
+ * Không bao giờ được đặt vào `<img src>`: WebKitGTK giải mã video trong <img>
+ * thành toàn bộ khung hình thô trong RAM → vài GB cho mỗi video và treo cả máy.
+ */
+export function isVideoFileUrl(url = '') {
+  if (!url || typeof url !== 'string') return false
+  if (isDirectStreamUrl(url)) return true
+  const path = parseUrlHostname(url)?.parsedUrl?.pathname || ''
+  return /\.(?:mp4|m4v|webm|mov|mkv|avi|flv|3gp|wmv|ogv)$/i.test(path)
+}
+
+/** Trả về URL ảnh đầu tiên an toàn để hiển thị trong <img>, bỏ qua URL video. */
+export function safeThumbSrc(...candidates) {
+  return candidates.find((u) => u && typeof u === 'string' && !isVideoFileUrl(u)) || undefined
+}
+
 export function isDirectStreamUrl(url = '') {
   if (!url || typeof url !== 'string') return false
   if (/\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url)) return true

@@ -8,7 +8,7 @@ import {
   IconZip,
   IconSettings,
 } from './Icons'
-import { detectPlatform, VIDEO_CONTAINER_OPTIONS } from '../constants'
+import { detectPlatform, VIDEO_CONTAINER_OPTIONS, safeThumbSrc } from '../constants'
 import {
   crawlProfile,
   cancelExtraction,
@@ -1093,16 +1093,22 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
                     }
                   >
                     <div className="profile-item-thumb-box">
-                      <img
-                        src={item.thumb || item.url}
-                        alt=""
-                        className="profile-item-thumb"
-                        loading="lazy"
-                        decoding="async"
-                        onError={(e) => {
-                          e.target.style.display = 'none'
-                        }}
-                      />
+                      {safeThumbSrc(item.thumb, item.url) ? (
+                        <img
+                          src={safeThumbSrc(item.thumb, item.url)}
+                          alt=""
+                          className="profile-item-thumb"
+                          loading="lazy"
+                          decoding="async"
+                          onError={(e) => {
+                            e.target.style.display = 'none'
+                          }}
+                        />
+                      ) : (
+                        <div className="profile-item-thumb thumb-placeholder">
+                          <IconVideo className="w-5 h-5" />
+                        </div>
+                      )}
                       {item.duration && (
                         <span className="duration-tag">{item.duration}</span>
                       )}

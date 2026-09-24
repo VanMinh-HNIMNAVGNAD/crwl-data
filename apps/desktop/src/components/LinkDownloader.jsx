@@ -11,7 +11,7 @@ import {
   IconCopy,
   IconSettings,
 } from './Icons'
-import { VIDEO_CONTAINER_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform, isGenericShortenerUrl } from '../constants'
+import { VIDEO_CONTAINER_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform, isGenericShortenerUrl, safeThumbSrc } from '../constants'
 import {
   extractMedia,
   cancelExtraction,
@@ -587,16 +587,17 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       }
     }
 
+    const kind = img.type === 'video' ? 'video' : 'ảnh'
     const taskId = createTaskId()
     currentDownloadTaskIdRef.current = taskId
-    setDownloadTaskTitle(img.title || 'Ảnh')
+    setDownloadTaskTitle(img.title || (img.type === 'video' ? 'Video' : 'Ảnh'))
     setNativeProgress({
       id: taskId,
       percent: 0,
       speed: '',
       eta: '',
       status: 'downloading',
-      phase: 'Đang tải ảnh...',
+      phase: `Đang tải ${kind}...`,
     })
 
     let unlisten = null
@@ -609,7 +610,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
       const generated = generateBatchMediaFilenames([img], singleMedia?.originalUrl)
       const filename = generated[0]?.filename || `${sanitizeFilenamePart(img.title || 'photo')}.${img.ext || 'jpg'}`
-      onShowToast?.(`Đang tải ảnh: ${filename}...`)
+      onShowToast?.(`Đang tải ${kind}: ${filename}...`)
       const res = await downloadDirectFile({
         url: img.url,
         filename,
@@ -666,10 +667,22 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     }
   }
 
+  // Bài đăng nhiều video (vd. 1 tweet 3 video) dùng chung link bài viết, nhưng mỗi
+  // video có URL file riêng → đưa vào lưới để tải được TỪNG video.
   const albumImages = useMemo(
-    () => (singleMedia?.images || []).filter((img) => img.type === 'image' || img.type === 'gif'),
+    () =>
+      (singleMedia?.images || []).filter(
+        (img) =>
+          img.type === 'image' ||
+          img.type === 'gif' ||
+          (img.type === 'video' && singleMedia?.type === 'album')
+      ),
     [singleMedia]
   )
+  const albumVideoOrder = useMemo(() => {
+    const videos = albumImages.filter((img) => img.type === 'video')
+    return { total: videos.length, indexOf: new Map(videos.map((img, i) => [img.id, i + 1])) }
+  }, [albumImages])
   const selectedImageCount = useMemo(
     () => Object.values(selectedImages).filter(Boolean).length,
     [selectedImages]
@@ -905,11 +918,21 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             title: image.title || media.title || 'image',
           }))
       )
-      const videoItems = itemsToDownload.filter(
-        (media) =>
-          media.images?.some((image) => image.type === 'video') ||
-          !(media.images?.length > 0)
-      )
+      // Mỗi video của bài đăng là một mục tải riêng. Trước đây chỉ lấy video ĐẦU
+      // TIÊN (find) nên bài có 3 video chỉ tải về 1.
+      const videoItems = itemsToDownload.flatMap((media) => {
+        const videos = (media.images || []).filter((image) => image.type === 'video')
+        if (videos.length > 0) {
+          return videos.map((image, i) => ({
+            media,
+            url: image.url,
+            title: videos.length > 1 ? `${media.title || 'media'} (video ${i + 1})` : media.title,
+          }))
+        }
+        if (media.images?.length > 0) return []
+        return [{ media, url: media.originalUrl || media.url, title: media.title }]
+      })
+      const totalUnits = imageItems.length + videoItems.length
       let completed = 0
 
       if (imageItems.length > 0) {
@@ -930,7 +953,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       }
 
       for (let index = 0; index < videoItems.length; index++) {
-        const media = videoItems[index]
+        const { media, url: videoUrl, title: videoTitle } = videoItems[index]
         const videoTaskId = `${taskId}_video_${index}`
         let videoUnlisten = null
         try {
@@ -941,12 +964,10 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
               phase: `Đang tải video [${index + 1}/${videoItems.length}]...`,
             })
           }, videoTaskId)
-          const videoImage = media.images?.find((image) => image.type === 'video')
-          const videoUrl = videoImage?.url || media.originalUrl || media.url
           if (!videoUrl) throw new Error(`Mục ${index + 1} không có URL gốc để tải`)
           const videoRes = await startNativeDownload({
             url: videoUrl,
-            title: media.title || `media_${index + 1}`,
+            title: videoTitle || `media_${index + 1}`,
             destDir: albumFolder,
             embedMetadata,
             embedThumbnail,
@@ -964,9 +985,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
           setNativeProgress((prev) => ({
             ...(prev || {}),
             id: taskId,
-            percent: Math.round((completed / itemsToDownload.length) * 90),
+            percent: Math.round((completed / totalUnits) * 90),
             status: 'downloading',
-            phase: `Đã tải ${completed}/${itemsToDownload.length} mục`,
+            phase: `Đã tải ${completed}/${totalUnits} tệp`,
           }))
         }
       }
@@ -1332,16 +1353,21 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             {/* Header thông tin media */}
             <div className="media-summary-row">
               <div className="media-thumb-box">
-                <img
-                  src={singleMedia.thumbnail || singleMedia.highResThumbnail}
-                  alt={singleMedia.title}
-                  className="preview-img"
-                  referrerPolicy="no-referrer"
-                  onError={(e) => {
-                    e.currentTarget.onerror = null
-                    e.currentTarget.src = singleMedia.thumbnail || singleMedia.highResThumbnail
-                  }}
-                />
+                {safeThumbSrc(singleMedia.thumbnail, singleMedia.highResThumbnail) ? (
+                  <img
+                    src={safeThumbSrc(singleMedia.thumbnail, singleMedia.highResThumbnail)}
+                    alt={singleMedia.title}
+                    className="preview-img"
+                    referrerPolicy="no-referrer"
+                    onError={(e) => {
+                      e.currentTarget.style.display = 'none'
+                    }}
+                  />
+                ) : (
+                  <div className="preview-img thumb-placeholder">
+                    <IconVideo className="w-5 h-5" />
+                  </div>
+                )}
                 {singleMedia.duration && (
                   <span className="duration-tag">{singleMedia.duration}</span>
                 )}
@@ -1578,7 +1604,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             {albumImages.length > 0 && (
               <div className="album-section">
                 <div className="album-header-bar">
-                  <span className="album-count-text">Album ảnh ({albumImages.length} tệp)</span>
+                  <span className="album-count-text">
+                    Album {albumVideoOrder.total > 0 ? 'media' : 'ảnh'} ({albumImages.length} tệp)
+                  </span>
                   <div className="album-actions-group">
                     <button
                       type="button"
@@ -1625,16 +1653,31 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                         }))
                       }
                     >
-                      <img
-                        src={img.thumb || img.url}
-                        alt=""
-                        className="album-img"
-                        loading="lazy"
-                        decoding="async"
-                        onError={(e) => {
-                          e.target.style.display = 'none'
-                        }}
-                      />
+                      {safeThumbSrc(img.thumb, img.url) ? (
+                        <img
+                          src={safeThumbSrc(img.thumb, img.url)}
+                          alt=""
+                          className="album-img"
+                          loading="lazy"
+                          decoding="async"
+                          onError={(e) => {
+                            e.target.style.display = 'none'
+                          }}
+                        />
+                      ) : (
+                        <div className="album-img thumb-placeholder">
+                          <IconVideo className="w-5 h-5" />
+                        </div>
+                      )}
+                      {img.type === 'video' && (
+                        <span className="album-video-badge">
+                          <IconVideo className="w-3 h-3" />
+                          {albumVideoOrder.total > 1
+                            ? `${albumVideoOrder.indexOf.get(img.id)}/${albumVideoOrder.total}`
+                            : 'Video'}
+                          {img.duration ? ` · ${img.duration}` : ''}
+                        </span>
+                      )}
                       <input
                         type="checkbox"
                         className="album-checkbox"
@@ -1648,7 +1691,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                           e.stopPropagation()
                           handleDownloadImage(img)
                         }}
-                        title="Tải ảnh này"
+                        title={img.type === 'video' ? 'Tải video này' : 'Tải ảnh này'}
                       >
                         <IconDownload className="w-3 h-3" />
                       </button>
@@ -1834,16 +1877,22 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                     onClick={(e) => e.stopPropagation()}
                     aria-label={`Chọn ${m.title || 'liên kết'}`}
                   />
-                  <img
-                    src={m.thumbnail || m.highResThumbnail}
-                    alt=""
-                    className="batch-item-thumb"
-                    loading="lazy"
-                    decoding="async"
-                    onError={(e) => {
-                      e.target.style.display = 'none'
-                    }}
-                  />
+                  {safeThumbSrc(m.thumbnail, m.highResThumbnail) ? (
+                    <img
+                      src={safeThumbSrc(m.thumbnail, m.highResThumbnail)}
+                      alt=""
+                      className="batch-item-thumb"
+                      loading="lazy"
+                      decoding="async"
+                      onError={(e) => {
+                        e.target.style.display = 'none'
+                      }}
+                    />
+                  ) : (
+                    <div className="batch-item-thumb thumb-placeholder">
+                      <IconVideo className="w-3.5 h-3.5" />
+                    </div>
+                  )}
                   <div className="batch-item-info">
                     <span className="batch-item-title" title={m.title}>
                       {m.title || 'Liên kết'}
