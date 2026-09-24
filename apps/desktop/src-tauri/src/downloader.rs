@@ -325,49 +325,81 @@ impl DownloaderService {
         open::that(target).map_err(|e| format!("Không thể mở thư mục: {e}"))
     }
 
-    /// Nhận diện platform từ URL để chọn đúng cookie file
+    /// Nhận diện platform từ URL để chọn đúng cookie file.
+    ///
+    /// Dùng hostname-based matching (tương tự `dispatcher.py`) thay vì substring
+    /// `contains()` để tránh nhầm lẫn giữa các tên miền:
+    /// - `fox.com` / `vox.com` KHÔNG khớp với `x.com`
+    /// - `evil.com/?ref=youtube.com` KHÔNG khớp với `youtube.com`
     fn detect_platform_from_url(url: &str) -> Option<&'static str> {
-        let lower = url.to_lowercase();
-        if lower.contains("instagram.com") || lower.contains("instagr.am") {
+        /// Trích hostname từ URL, trả về lowercase không có trailing dot.
+        fn hostname_of(url: &str) -> String {
+            let raw = url.trim();
+            let with_scheme = if raw.starts_with("http://") || raw.starts_with("https://") {
+                raw.to_string()
+            } else {
+                format!("https://{raw}")
+            };
+            url::Url::parse(&with_scheme)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_lowercase().trim_end_matches('.').to_string()))
+                .unwrap_or_default()
+        }
+
+        /// hostname == domain hoặc là subdomain của domain.
+        fn host_is(hostname: &str, domain: &str) -> bool {
+            !hostname.is_empty() && (hostname == domain || hostname.ends_with(&format!(".{domain}")))
+        }
+
+        fn host_in(hostname: &str, domains: &[&str]) -> bool {
+            domains.iter().any(|d| host_is(hostname, d))
+        }
+
+        let host = hostname_of(url);
+        if host.is_empty() {
+            return None;
+        }
+
+        if host_in(&host, &["instagram.com", "instagr.am"]) {
             return Some("instagram");
         }
-        if lower.contains("tiktok.com") {
+        if host_is(&host, "tiktok.com") {
             return Some("tiktok");
         }
-        if lower.contains("facebook.com") || lower.contains("fb.watch") || lower.contains("fb.com") {
+        if host_in(&host, &["facebook.com", "fb.watch", "fb.com", "fb.me"]) {
             return Some("facebook");
         }
-        if lower.contains("twitter.com") || lower.contains("x.com") {
+        if host_in(&host, &["twitter.com", "x.com"]) {
             return Some("twitter");
         }
-        if lower.contains("youtube.com") || lower.contains("youtu.be") {
+        if host_in(&host, &["youtube.com", "youtu.be"]) {
             return Some("youtube");
         }
-        if lower.contains("pinterest.com") || lower.contains("pin.it") {
+        if host_in(&host, &["pinterest.com", "pin.it"]) {
             return Some("pinterest");
         }
-        if lower.contains("reddit.com") || lower.contains("redd.it") || lower.contains("v.redd.it") {
+        if host_in(&host, &["reddit.com", "redd.it"]) {
             return Some("reddit");
         }
-        if lower.contains("threads.net") {
+        if host_is(&host, "threads.net") {
             return Some("threads");
         }
-        if lower.contains("linkedin.com") {
+        if host_is(&host, "linkedin.com") {
             return Some("linkedin");
         }
-        if lower.contains("bilibili.com") || lower.contains("b23.tv") {
+        if host_in(&host, &["bilibili.com", "b23.tv"]) {
             return Some("bilibili");
         }
-        if lower.contains("soundcloud.com") {
+        if host_is(&host, "soundcloud.com") {
             return Some("soundcloud");
         }
-        if lower.contains("pixiv.net") || lower.contains("pixiv.me") {
+        if host_in(&host, &["pixiv.net", "pixiv.me"]) {
             return Some("pixiv");
         }
-        if lower.contains("douyin.com") {
+        if host_is(&host, "douyin.com") {
             return Some("douyin");
         }
-        if lower.contains("tumblr.com") {
+        if host_is(&host, "tumblr.com") {
             return Some("tumblr");
         }
         None
@@ -442,6 +474,11 @@ impl DownloaderService {
     pub async fn unregister_task(task_id: &str) {
         let mut reg = get_download_registry().lock().await;
         reg.remove(task_id);
+        // Dọn cờ huỷ: task đã kết thúc, không cần giữ trong set nữa.
+        // Trước đây entry chỉ được insert mà không bao giờ remove, gây rò rỉ
+        // bộ nhớ chậm và làm is_download_cancelled() chậm dần theo thời gian.
+        drop(reg); // Nhả lock registry trước khi lấy lock cancelled
+        get_cancelled_downloads().lock().await.remove(task_id);
     }
 
     pub async fn cancel_download(task_id: &str) -> Result<bool, String> {

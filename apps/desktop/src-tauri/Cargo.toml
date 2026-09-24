@@ -35,3 +35,4 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "chrono", "uu
 which = "8.0.6"
 zip = { version = "4.2.0", default-features = false, features = ["deflate"] }
 walkdir = "2.5.0"
+url = "2.5.8"
