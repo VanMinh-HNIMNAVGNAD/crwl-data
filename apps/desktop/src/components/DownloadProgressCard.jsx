@@ -70,8 +70,8 @@ export default function DownloadProgressCard({
     Boolean(
       progress?.isIndeterminate ||
       progress?.is_indeterminate ||
-      isPreparing ||
-      isProcessing
+      (isPreparing && percent === 0) ||
+      (isProcessing && percent === 0)
     )
 
   const statusText =

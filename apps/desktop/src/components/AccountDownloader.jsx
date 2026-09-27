@@ -482,8 +482,16 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
       // CASE B: Có video (chỉ video, hoặc cả ảnh + video) hoặc không chọn ZIP
       // Bước 1: Tải toàn bộ ảnh vào thư mục album (chưa nén ZIP)
       if (imageItems.length > 0) {
+        const moreStepsFollow = asZip || videoItems.length > 0
         try {
-          unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+          unlisten = await onDownloadProgress((payload) => {
+            // Bước ảnh xong chưa phải cả lượt xong khi còn video / nén ZIP phía sau
+            if (moreStepsFollow && payload?.status === 'completed') {
+              setNativeProgress({ ...payload, status: 'processing', filePath: undefined })
+            } else {
+              setNativeProgress(payload)
+            }
+          }, taskId)
         } catch (e) {
           console.warn('Cannot attach progress listener:', e)
         }
@@ -545,6 +553,11 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
         let completedVideos = 0
         const videoResults = new Array(videoItems.length)
         const videoErrors = []
+        // Phần trăm của TỪNG video: thanh tiến trình hiển thị trung bình thay vì
+        // nhảy qua lại giữa các video đang tải song song.
+        const videoPercents = new Array(videoItems.length).fill(0)
+        const averageVideoPercent = () =>
+          (videoPercents.reduce((sum, p) => sum + p, 0) / videoItems.length) * 0.9
 
         const downloadNextVideo = async () => {
           while (!isCancelledRef.current) {
@@ -557,9 +570,17 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
 
             try {
               videoUnlisten = await onDownloadProgress((payload) => {
+                videoPercents[index] = Math.max(videoPercents[index], Number(payload?.percent) || 0)
+                // "completed"/"error" của MỘT video không phải trạng thái của cả lượt:
+                // để nguyên sẽ làm thẻ báo "Hoàn tất" và ẩn nút Huỷ giữa chừng.
+                const finishedOne = payload?.status === 'completed' || payload?.status === 'error'
                 setNativeProgress({
                   ...payload,
-                  id: vidTaskId,
+                  id: taskId,
+                  percent: averageVideoPercent(),
+                  status: finishedOne ? 'downloading' : payload?.status,
+                  filePath: undefined,
+                  isIndeterminate: false,
                   phase: `Đang tải video [${index + 1}/${videoItems.length}]...`,
                 })
               }, vidTaskId)
@@ -580,10 +601,11 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
             } finally {
               if (typeof videoUnlisten === 'function') videoUnlisten()
               completedVideos++
+              videoPercents[index] = 100
               setNativeProgress((prev) => ({
                 ...(prev || {}),
                 id: taskId,
-                percent: Math.round((completedVideos / videoItems.length) * 90),
+                percent: averageVideoPercent(),
                 status: 'downloading',
                 phase: `Đã tải ${completedVideos}/${videoItems.length} video`,
               }))

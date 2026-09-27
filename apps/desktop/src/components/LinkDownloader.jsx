@@ -936,7 +936,14 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       let completed = 0
 
       if (imageItems.length > 0) {
-        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+        // Bước ảnh "completed" chưa phải cả lượt ZIP xong
+        unlisten = await onDownloadProgress((payload) => {
+          setNativeProgress(
+            payload?.status === 'completed'
+              ? { ...payload, status: 'processing', filePath: undefined }
+              : payload
+          )
+        }, taskId)
         const imageRes = await downloadAlbumBatch({
           items: generateBatchMediaFilenames(imageItems, null),
           albumName,
@@ -958,9 +965,17 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         let videoUnlisten = null
         try {
           videoUnlisten = await onDownloadProgress((payload) => {
+            // Quy về phần trăm của cả lượt ZIP và không để "completed"/"error" của
+            // một video làm thẻ báo xong (ẩn nút Huỷ) khi các video sau vẫn đang tải.
+            const videoPercent = Math.min(100, Math.max(0, Number(payload?.percent) || 0))
+            const finishedOne = payload?.status === 'completed' || payload?.status === 'error'
             setNativeProgress({
               ...payload,
-              id: videoTaskId,
+              id: taskId,
+              percent: ((completed + videoPercent / 100) / totalUnits) * 90,
+              status: finishedOne ? 'downloading' : payload?.status,
+              filePath: undefined,
+              isIndeterminate: false,
               phase: `Đang tải video [${index + 1}/${videoItems.length}]...`,
             })
           }, videoTaskId)

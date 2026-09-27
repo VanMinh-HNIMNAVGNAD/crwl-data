@@ -60,8 +60,8 @@ pub struct DownloadOptions {
     /// của mình khi có nhiều tệp tải song song.
     #[serde(default, alias = "taskId")]
     pub task_id: Option<String>,
-    /// Bật bộ tải ngoài aria2c. Mặc định TẮT vì aria2c nuốt toàn bộ output tiến
-    /// trình của yt-dlp, khiến thanh tiến trình đứng im suốt lúc tải.
+    /// Bật bộ tải ngoài aria2c. Mặc định TẮT. Khi bật, backend parse output định kỳ
+    /// từ aria2c summary để hiển thị phần trăm, tốc độ và ETA thật.
     #[serde(default, alias = "useAria2c")]
     pub use_aria2c: bool,
     #[serde(alias = "clientIp")]
@@ -104,6 +104,7 @@ impl DownloadProgressPayload {
         }
     }
 
+    #[allow(dead_code)]
     pub fn indeterminate(id: &str, status: &str, phase: &str) -> Self {
         Self {
             id: id.to_string(),
@@ -117,6 +118,15 @@ impl DownloadProgressPayload {
             is_indeterminate: true,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Aria2cProgress {
+    pub percent: f64,
+    pub speed: String,
+    pub eta: String,
+    pub downloaded: String,
+    pub total: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +178,19 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+/// Bỏ hậu tố định dạng của yt-dlp (`Title [id].f137` → `Title [id]`).
+/// Chỉ cắt khi sau ".f" toàn là chữ số, để tiêu đề như "a.film" không bị cắt cụt.
+fn strip_format_suffix(stem: &str) -> &str {
+    match stem.rfind(".f") {
+        Some(idx)
+            if stem.len() > idx + 2 && stem[idx + 2..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            &stem[..idx]
+        }
+        _ => stem,
+    }
+}
+
 pub fn cleanup_task_files(
     dest_dir: Option<&Path>,
     known_paths: &[PathBuf],
@@ -204,20 +227,20 @@ pub fn cleanup_task_files(
         }
 
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            let clean_stem = if let Some(idx) = stem.rfind(".f") {
-                &stem[..idx]
-            } else {
-                stem
-            };
+            let clean_stem = strip_format_suffix(stem);
             if !clean_stem.is_empty() && !candidate_stems.contains(&clean_stem.to_string()) {
                 candidate_stems.push(clean_stem.to_string());
             }
         }
     }
 
-    // 3. Quét dest_dir để dọn sạch bất kỳ tệp dở dang nào
+    // 3. Quét dest_dir để dọn các tệp trung gian của yt-dlp (`<stem>.f137.mp4.part`,
+    //    `<stem>.webp`, ...). Chỉ khớp đúng `<stem>.` — trước đây `starts_with(stem)`
+    //    cộng với việc cắt tại ".f" đầu tiên (vd "a.film [id]" → "a") làm xoá nhầm
+    //    tệp khác của người dùng, và luật "mọi .part mới sửa" xoá luôn tệp đang tải
+    //    của tác vụ song song khác trong cùng thư mục.
     if let Some(dir) = dest_dir {
-        if dir.exists() {
+        if dir.exists() && !candidate_stems.is_empty() {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
@@ -226,19 +249,16 @@ pub fn cleanup_task_files(
                     }
                     let file_name = entry.file_name().to_string_lossy().to_string();
 
-                    let matches_stem = candidate_stems.iter().any(|st| file_name.starts_with(st));
-
-                    let is_partial_ext = file_name.ends_with(".part")
-                        || file_name.ends_with(".ytdl")
-                        || file_name.ends_with(".aria2")
-                        || file_name.ends_with(".temp");
+                    let matches_stem = candidate_stems
+                        .iter()
+                        .any(|st| file_name.starts_with(&format!("{st}.")));
 
                     let is_recent = entry.metadata().ok()
                         .and_then(|m| m.modified().ok())
                         .map(|t| t >= start_time.checked_sub(std::time::Duration::from_secs(5)).unwrap_or(start_time))
                         .unwrap_or(false);
 
-                    if matches_stem || (is_partial_ext && is_recent) {
+                    if matches_stem && is_recent {
                         info!("Hủy tải: Xoá tệp tạm/dở dang trong thư mục {:?}", entry_path);
                         let _ = std::fs::remove_file(&entry_path);
                     }
@@ -484,23 +504,32 @@ impl DownloaderService {
     pub async fn cancel_download(task_id: &str) -> Result<bool, String> {
         info!("Yêu cầu hủy tác vụ tải xuống: {task_id}");
         get_cancelled_downloads().lock().await.insert(task_id.to_string());
-        let mut reg = get_download_registry().lock().await;
-        let matching_keys: Vec<String> = reg
-            .keys()
-            .filter(|k| *k == task_id || k.starts_with(&format!("{task_id}_")))
-            .cloned()
-            .collect();
+        let prefix = format!("{task_id}_");
+        let mut states: Vec<ActiveTaskState> = {
+            let mut reg = get_download_registry().lock().await;
+            let matching_keys: Vec<String> = reg
+                .keys()
+                .filter(|k| *k == task_id || k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            matching_keys.iter().filter_map(|k| reg.remove(k)).collect()
+        };
 
-        if matching_keys.is_empty() {
+        if states.is_empty() {
             info!("Đánh dấu hủy [{task_id}] trong lúc tác vụ đang khởi tạo");
             return Ok(true);
         }
 
-        for key in matching_keys {
-            if let Some(mut state) = reg.remove(&key) {
-                if let Some(tx) = state.cancel_tx.take() {
-                    let _ = tx.send(());
-                }
+        for state in &mut states {
+            if let Some(tx) = state.cancel_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+
+        // Kill tiến trình và xoá tệp là I/O chặn: chạy ngoài lock registry và ngoài
+        // luồng async, nếu không mọi tác vụ tải khác (record_file_path...) đứng chờ.
+        let _ = tokio::task::spawn_blocking(move || {
+            for state in &states {
                 for pid in &state.pids {
                     kill_process_tree(*pid);
                 }
@@ -511,7 +540,8 @@ impl DownloaderService {
                     state.start_time,
                 );
             }
-        }
+        })
+        .await;
         Ok(true)
     }
 
@@ -572,11 +602,11 @@ impl DownloaderService {
         let frags = opts.concurrent_fragments.unwrap_or(2).clamp(1, 8);
         cmd.arg("-N").arg(frags.to_string());
 
-        // aria2c chỉ bật khi người dùng yêu cầu: nó không xuất tiến trình theo
-        // --progress-template, nên thanh tiến trình sẽ đứng im 0% tới lúc tải xong.
+        // aria2c: khi người dùng yêu cầu, cấu hình aria2c xuất tiến trình đều đặn
+        // mỗi giây qua summary-interval để backend parse và cập nhật thanh tiến trình.
         if opts.use_aria2c {
             if BinaryManager::has_binary("aria2c") {
-                info!("Bật bộ tải ngoài aria2c theo yêu cầu (thanh tiến trình sẽ không chi tiết)");
+                info!("Bật bộ tải ngoài aria2c theo yêu cầu (đã kích hoạt parser tiến trình)");
                 cmd.arg("--downloader").arg("aria2c");
                 cmd.arg("--downloader-args")
                     .arg("aria2c:-s 16 -x 16 -k 1M --summary-interval=1");
@@ -654,7 +684,10 @@ impl DownloaderService {
             };
             cmd.arg("--audio-quality").arg(quality);
             cmd.arg("--embed-metadata");
-            cmd.arg("--embed-thumbnail");
+            // yt-dlp báo ERROR (và cả lượt tải thất bại) khi nhúng ảnh bìa vào WAV.
+            if Self::container_supports_thumbnail(safe_fmt) {
+                cmd.arg("--embed-thumbnail");
+            }
         } else if opts.is_mute {
             // Tải video câm (chỉ luồng hình ảnh, không ghép audio)
             if let Some(ref fid) = opts.format_id {
@@ -680,7 +713,7 @@ impl DownloaderService {
                     .arg("--sub-format")
                     .arg(sub_fmt)
                     .arg("--skip-download");
-            } else if fid.starts_with("mp3") || fid.starts_with("m4a") || fid.starts_with("flac") || fid.starts_with("opus") || fid.starts_with("ogg") || fid.starts_with("wav") || fid.starts_with("alac") {
+            } else if Self::is_audio_format_id(fid) {
                 cmd.arg("-x");
                 let fmt = if fid.contains("flac") {
                     "flac"
@@ -699,7 +732,9 @@ impl DownloaderService {
                 };
                 cmd.arg("--audio-format").arg(fmt);
                 cmd.arg("--embed-metadata");
-                cmd.arg("--embed-thumbnail");
+                if Self::container_supports_thumbnail(fmt) {
+                    cmd.arg("--embed-thumbnail");
+                }
             } else if fid == "best" {
                 cmd.arg("-f").arg("bestvideo+bestaudio/best");
             } else if fid.contains('+') || fid.contains('/') {
@@ -713,26 +748,49 @@ impl DownloaderService {
         }
 
         // Tùy chọn chuyển đổi Container Video (MKV, MOV, AVI, WEBM, MP4, GIF)
+        let mut chosen_container: Option<String> = None;
         if !opts.is_audio {
             if let Some(ref vfmt) = opts.video_format {
                 let vf = vfmt.trim().to_lowercase();
                 if vf == "gif" {
                     cmd.arg("--recode-video").arg("gif");
+                    chosen_container = Some(vf);
                 } else if vf == "mkv" || vf == "mov" || vf == "avi" || vf == "webm" || vf == "mp4" {
                     cmd.arg("--remux-video").arg(&vf);
+                    chosen_container = Some(vf);
                 }
             }
         }
 
-        // Nhúng phụ đề vào video nếu được bật
+        // Nhúng phụ đề vào video nếu được bật. Loại `live_chat`: với video từng
+        // livestream, yt-dlp coi toàn bộ chat là một "phụ đề" và tải hàng trăm MB
+        // JSON, khiến lượt tải kéo dài hàng chục phút hoặc lỗi 429.
         if opts.embed_subs && !opts.is_audio {
             cmd.arg("--embed-subs");
-            cmd.arg("--sub-langs").arg("all");
+            cmd.arg("--sub-langs").arg("all,-live_chat");
         }
 
-        // Nhúng thumbnail vào video/audio nếu bật
-        if opts.embed_thumbnail && !opts.is_audio {
-            cmd.arg("--embed-thumbnail");
+        // Nhúng thumbnail vào video nếu bật. yt-dlp chỉ nhúng được vào
+        // mp4/m4v/mov/mkv; với webm/avi/gif nó báo ERROR và cả lượt tải bị tính là
+        // thất bại dù video đã tải xong.
+        let is_video_download = !opts.is_audio
+            && !matches!(opts.format_id.as_deref(), Some(f)
+                if f == "thumbnail" || f.starts_with("subtitle:") || Self::is_audio_format_id(f));
+        if opts.embed_thumbnail && is_video_download {
+            match chosen_container.as_deref() {
+                Some(c) if !Self::container_supports_thumbnail(c) => {
+                    warn!("Bỏ nhúng ảnh bìa: container {c} không hỗ trợ");
+                }
+                Some(_) => {
+                    cmd.arg("--embed-thumbnail");
+                }
+                None => {
+                    // Không chọn container: YouTube hay ghép VP9+Opus thành .webm.
+                    // Remux riêng webm sang mkv (không mã hoá lại) để nhúng được ảnh bìa.
+                    cmd.arg("--remux-video").arg("webm>mkv");
+                    cmd.arg("--embed-thumbnail");
+                }
+            }
         }
 
         // Nhúng metadata & chapters
@@ -830,24 +888,26 @@ impl DownloaderService {
         // chính xác sẽ có mấy lượt tải để quy đổi ra phần trăm tổng thể.
         let formats_regex = Regex::new(r"Downloading \d+ format\(s\): (\S+)").map_err(|e| e.to_string())?;
 
+        // Nhận diện dòng tiến trình từ aria2c khi được kích hoạt:
+        // Ví dụ: "[#2a3b4c 14.5MiB/45.2MiB(32%) CN:8 DL:2.4MiB ETA:12s]"
+        let aria2c_regex = Regex::new(
+            r"\[(?:#\w+|===)\s+([\d\.]+[A-Za-z]+)\s*/\s*([\d\.]+[A-Za-z]+)\s*\((\d+(?:\.\d+)?)%\)(?:.*?DL:([\d\.]+[A-Za-z]+))?(?:.*?ETA:([^\s\]]+))?"
+        ).map_err(|e| e.to_string())?;
+
         let progress_emit = |payload: DownloadProgressPayload| {
             let _ = app_handle.emit("download-progress", payload);
         };
 
-        if opts.use_aria2c {
-            progress_emit(DownloadProgressPayload::indeterminate(
-                &task_id,
-                "processing",
-                "Đang tải qua Aria2c (không hiển thị %)...",
-            ));
-        } else {
-            progress_emit(DownloadProgressPayload::new(
-                &task_id,
-                0.0,
-                "preparing",
-                "Đang lấy thông tin tệp...",
-            ));
-        }
+        progress_emit(DownloadProgressPayload::new(
+            &task_id,
+            0.0,
+            "preparing",
+            if opts.use_aria2c {
+                "Đang kết nối qua Aria2c..."
+            } else {
+                "Đang lấy thông tin tệp..."
+            },
+        ));
 
         // Phần trăm chỉ đi tiến, không bao giờ lùi: trước đây mỗi luồng (video rồi
         // audio) đều chạy 0→100% nên thanh tiến trình tụt về 0 giữa chừng.
@@ -861,6 +921,13 @@ impl DownloaderService {
 
         // Tối đa 96% dành cho giai đoạn tải, 4% còn lại cho ghép/hậu xử lý
         const DOWNLOAD_SHARE: f64 = 96.0;
+
+        // yt-dlp gọi progress hook sau MỖI khối dữ liệu; với `--newline` trên mạng
+        // nhanh là hàng trăm dòng/giây. Mỗi dòng là một sự kiện IPC + một lần React
+        // render, nhân với số video tải song song thì UI giật và CPU tăng vọt.
+        const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        let mut last_progress_emit: Option<std::time::Instant> = None;
+        let mut last_emitted_pass = usize::MAX;
 
         loop {
             tokio::select! {
@@ -916,6 +983,15 @@ impl DownloaderService {
                         let raw = Self::weighted_percent(pass_index, expected_passes, pass_percent);
                         overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
 
+                        let due = last_progress_emit
+                            .map(|t| t.elapsed() >= PROGRESS_EMIT_INTERVAL)
+                            .unwrap_or(true);
+                        if !due && pass_percent < 100.0 && last_emitted_pass == pass_index {
+                            continue;
+                        }
+                        last_progress_emit = Some(std::time::Instant::now());
+                        last_emitted_pass = pass_index;
+
                         let phase = if expected_passes > 1 {
                             format!("Đang tải luồng {}/{}", pass_index + 1, expected_passes)
                         } else {
@@ -936,6 +1012,40 @@ impl DownloaderService {
                         continue;
                     }
 
+                    // Bắt và parse output tiến trình của aria2c nếu có
+                    if let Some(aria_p) = Self::parse_aria2c_progress(&aria2c_regex, &line) {
+                        let raw = Self::weighted_percent(pass_index, expected_passes, aria_p.percent);
+                        overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
+
+                        let phase = if expected_passes > 1 {
+                            format!(
+                                "Đang tải qua Aria2c luồng {}/{} ({}/{})",
+                                pass_index + 1,
+                                expected_passes,
+                                aria_p.downloaded,
+                                aria_p.total
+                            )
+                        } else {
+                            format!(
+                                "Đang tải qua Aria2c ({}/{})",
+                                aria_p.downloaded, aria_p.total
+                            )
+                        };
+
+                        progress_emit(DownloadProgressPayload {
+                            id: task_id.clone(),
+                            percent: overall_percent,
+                            speed: aria_p.speed,
+                            eta: aria_p.eta,
+                            status: "downloading".to_string(),
+                            phase,
+                            file_path: None,
+                            message: None,
+                            is_indeterminate: false,
+                        });
+                        continue;
+                    }
+
                     if let Some(n) = Self::parse_expected_passes(&formats_regex, &line) {
                         expected_passes = n;
                         pass_index = 0;
@@ -945,6 +1055,9 @@ impl DownloaderService {
                     if let Some(rest) = line.strip_prefix("[download] Destination: ") {
                         let path_str = rest.trim().trim_matches('"').to_string();
                         Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
+                        if opts.use_aria2c && downloaded_file_path.is_some() && pass_index + 1 < expected_passes {
+                            pass_index += 1;
+                        }
                         downloaded_file_path = Some(path_str);
                         continue;
                     }
@@ -970,7 +1083,7 @@ impl DownloaderService {
                             phase: "Đang ghép hình và tiếng qua FFmpeg...".to_string(),
                             file_path: None,
                             message: None,
-                            is_indeterminate: opts.use_aria2c,
+                            is_indeterminate: false,
                         });
                         continue;
                     }
@@ -987,7 +1100,7 @@ impl DownloaderService {
                             phase: phase.to_string(),
                             file_path: None,
                             message: None,
-                            is_indeterminate: opts.use_aria2c,
+                            is_indeterminate: false,
                         });
                         continue;
                     }
@@ -1025,10 +1138,16 @@ impl DownloaderService {
                     is_cancelled = true;
                     None
                 }
-                res = child.wait() => {
-                    Some(res.map_err(|e| format!("Lỗi chờ yt-dlp: {e}"))?)
-                }
+                res = child.wait() => Some(res),
             }
+        };
+        let status = match status {
+            Some(Err(e)) => {
+                Self::unregister_task(&task_id).await;
+                return Err(format!("Lỗi chờ yt-dlp: {e}"));
+            }
+            Some(Ok(st)) => Some(st),
+            None => None,
         };
 
         if is_cancelled {
@@ -1041,6 +1160,17 @@ impl DownloaderService {
             let _ = stderr_task.await;
 
             let mut known = Vec::new();
+            // Đọc nốt stdout còn trong ống: dòng "Destination:" của tệp đang tải có
+            // thể chưa kịp xử lý lúc bấm Huỷ. Không quét mù mọi .part trong thư mục
+            // nữa vì sẽ xoá nhầm tệp của lượt tải song song khác.
+            let drain = async {
+                while let Ok(Some(l)) = reader.next_line().await {
+                    if let Some(rest) = l.strip_prefix("[download] Destination: ") {
+                        known.push(PathBuf::from(rest.trim().trim_matches('"')));
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
             if let Some(ref p) = downloaded_file_path {
                 known.push(PathBuf::from(p));
             }
@@ -1081,7 +1211,19 @@ impl DownloaderService {
         let _ = stderr_task.await;
         let collected_stderr = stderr_lines.lock().await.clone();
 
-        if !status.success() {
+        let media_file_exists = printed_final_path
+            .as_deref()
+            .or(downloaded_file_path.as_deref())
+            .map(|p| Path::new(p).is_file())
+            .unwrap_or(false);
+        let thumbnail_only_failure = !status.success()
+            && media_file_exists
+            && Self::is_thumbnail_embed_only_failure(&collected_stderr);
+        if thumbnail_only_failure {
+            warn!("[{task_id}] Tệp đã tải xong nhưng không nhúng được ảnh bìa — vẫn tính là thành công");
+        }
+
+        if !status.success() && !thumbnail_only_failure {
             Self::unregister_task(&task_id).await;
             // Báo đúng nguyên nhân từ yt-dlp thay vì một câu chung chung
             let detail = Self::summarize_ytdlp_error(&collected_stderr);
@@ -1166,12 +1308,88 @@ impl DownloaderService {
         })
     }
 
+    /// format_id do UI gửi lên để yêu cầu tách âm thanh (vd "mp3", "flac_best").
+    fn is_audio_format_id(fid: &str) -> bool {
+        ["mp3", "m4a", "flac", "opus", "ogg", "wav", "alac"]
+            .iter()
+            .any(|p| fid.starts_with(p))
+    }
+
+    /// Các container/định dạng yt-dlp nhúng được ảnh bìa (xem EmbedThumbnailPP).
+    fn container_supports_thumbnail(ext: &str) -> bool {
+        matches!(
+            ext,
+            "mp3" | "mkv" | "mka" | "m4a" | "alac" | "mp4" | "m4v" | "mov" | "ogg" | "vorbis" | "opus" | "flac"
+        )
+    }
+
+    /// yt-dlp thoát mã lỗi khi CHỈ bước nhúng ảnh bìa hỏng (thiếu mutagen cho
+    /// opus/flac/ogg, container không hỗ trợ...) dù tệp media đã tải xong.
+    /// Nhận diện trường hợp này để không báo thất bại oan cho người dùng.
+    fn is_thumbnail_embed_only_failure(stderr_lines: &[String]) -> bool {
+        let errors: Vec<&String> = stderr_lines
+            .iter()
+            .filter(|l| l.starts_with("ERROR:"))
+            .collect();
+        !errors.is_empty()
+            && errors.iter().all(|l| {
+                let lower = l.to_lowercase();
+                lower.contains("postprocessing")
+                    && (lower.contains("thumbnail") || lower.contains("mutagen"))
+            })
+    }
+
     /// Đọc dòng `[info] ...: Downloading N format(s): 137+140` để biết yt-dlp sẽ
     /// chạy mấy lượt tải. Nhờ đó phần trăm tổng thể phản ánh đúng thực tế thay vì
     /// đoán mò từ tuỳ chọn định dạng.
     fn parse_expected_passes(re: &Regex, line: &str) -> Option<usize> {
         let spec = re.captures(line)?.get(1)?.as_str();
         Some(spec.split('+').filter(|s| !s.is_empty()).count().max(1))
+    }
+
+    /// Trích xuất tiến trình tải từ output định kỳ của aria2c:
+    /// Ví dụ: "[#2a3b4c 14.5MiB/45.2MiB(32%) CN:8 DL:2.4MiB ETA:12s]"
+    pub fn parse_aria2c_progress(regex: &Regex, line: &str) -> Option<Aria2cProgress> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // Nếu line chứa ký tự \r do aria2c in-place console update, lấy mẩu cuối cùng
+        let target = line
+            .split('\r')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or(trimmed);
+
+        let caps = regex.captures(target)?;
+        let downloaded = caps.get(1)?.as_str().to_string();
+        let total = caps.get(2)?.as_str().to_string();
+        let percent: f64 = caps.get(3)?.as_str().parse().ok()?;
+        let speed = caps
+            .get(4)
+            .map(|m| {
+                let s = m.as_str();
+                if s.ends_with("/s") {
+                    s.to_string()
+                } else {
+                    format!("{s}/s")
+                }
+            })
+            .unwrap_or_default();
+        let eta = caps
+            .get(5)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
+        Some(Aria2cProgress {
+            percent: percent.clamp(0.0, 100.0),
+            speed,
+            eta,
+            downloaded,
+            total,
+        })
     }
 
     /// Quy đổi phần trăm của một lượt tải thành phần trăm tổng thể.
@@ -1308,7 +1526,9 @@ impl DownloaderService {
         let mut cancel_rx_opt = None;
         if let Some(ref tid) = task_id {
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-            Self::register_task(tid, Some(dest_folder.clone()), cancel_tx).await;
+            // Không đăng ký dest_dir: tệp đích đã được ghi nhận chính xác, quét cả
+            // thư mục tải về chỉ có nguy cơ xoá nhầm tệp khác của người dùng.
+            Self::register_task(tid, None, cancel_tx).await;
             Self::record_file_path(tid, target_path.clone()).await;
             cancel_rx_opt = Some(cancel_rx);
         }
@@ -1453,7 +1673,8 @@ impl DownloaderService {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
-        Self::register_task(&task_id, Some(base_dest.clone()), cancel_tx).await;
+        // Thư mục album và tệp ZIP được ghi nhận riêng; không quét cả base_dest.
+        Self::register_task(&task_id, None, cancel_tx).await;
         Self::record_dir_path(&task_id, target_dir.clone()).await;
 
         let emit = |percent: f64, status: &str, phase: String, file_path: Option<String>| {
@@ -1652,11 +1873,25 @@ impl DownloaderService {
 
             let target_dir_clone = target_dir.clone();
             let zip_path_clone = zip_path.clone();
+            // Luồng spawn_blocking không thể bị huỷ từ bên ngoài: cần cờ để vòng nén
+            // tự dừng, nếu không nó vẫn đọc/ghi hàng GB sau khi người dùng bấm Huỷ.
+            let zip_abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let zip_abort_worker = Arc::clone(&zip_abort);
 
-            let zip_status = tokio::task::spawn_blocking(move || {
-                let res = Self::compress_dir_to_zip(&target_dir_clone, &zip_path_clone);
-                if res.is_err() {
-                    let _ = std::fs::remove_file(&zip_path_clone);
+            let mut zip_status = tokio::task::spawn_blocking(move || {
+                // move_files: thư mục album vốn bị xoá sau khi nén, nên chuyển dần
+                // từng tệp vào ZIP để không cần gấp đôi dung lượng đĩa.
+                let res = Self::compress_dir_to_zip_with(
+                    &target_dir_clone,
+                    &zip_path_clone,
+                    Some(&zip_abort_worker),
+                    true,
+                );
+                if let Err(ref f) = res {
+                    // Chỉ xoá ZIP dở khi chưa có tệp gốc nào bị chuyển hẳn vào đó
+                    if f.moved_files == 0 {
+                        let _ = std::fs::remove_file(&zip_path_clone);
+                    }
                 }
                 res
             });
@@ -1665,12 +1900,20 @@ impl DownloaderService {
             let zip_res = tokio::select! {
                 _ = &mut cancel_rx => {
                     zip_cancelled = true;
+                    zip_abort.store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Chờ luồng nén dừng hẳn và đóng tệp trước khi xoá (Windows không
+                    // cho xoá tệp đang mở).
+                    let _ = (&mut zip_status).await;
                     Err("Cancelled".to_string())
                 }
-                res = zip_status => {
+                res = &mut zip_status => {
                     match res {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(err)) => Err(err),
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(f)) if f.moved_files > 0 => Err(format!(
+                            "{} — {} tệp đã được chuyển vào {}, các tệp còn lại vẫn nằm trong thư mục album",
+                            f.message, f.moved_files, zip_path.display()
+                        )),
+                        Ok(Err(f)) => Err(f.message),
                         Err(join_err) => Err(format!("tiến trình nén bị gián đoạn: {join_err}")),
                     }
                 }
@@ -1694,7 +1937,7 @@ impl DownloaderService {
                     let zip_size = zip_path.metadata().map(|m| m.len() as i64).ok();
                     let zip_str = zip_path.to_string_lossy().to_string();
 
-                    // Dọn dẹp thư mục nguồn sau khi đã nén vào ZIP để tránh nhân đôi dung lượng
+                    // Tệp đã được chuyển dần vào ZIP; chỉ còn thư mục rỗng cần dọn
                     let _ = tokio::fs::remove_dir_all(&target_dir).await;
 
                     db.record_download_history(
@@ -1720,7 +1963,7 @@ impl DownloaderService {
                     });
                 }
                 Err(err) => {
-                    warn!("Nén ZIP thất bại: {err} — giữ nguyên thư mục ảnh đã tải");
+                    warn!("Nén ZIP thất bại: {err} — giữ nguyên các tệp chưa nén trong thư mục album");
                     zip_error = Some(err);
                 }
             }
@@ -2348,6 +2591,10 @@ impl DownloaderService {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000);
         }
+        // Huỷ tải = drop future này (select!/abort). Không có kill_on_drop, curl vẫn
+        // chạy ngầm tới --max-time, tiếp tục ăn băng thông và có thể TẠO LẠI tệp
+        // đích ngay sau khi bước dọn dẹp đã xoá nó.
+        cmd.kill_on_drop(true);
         let output = match cmd
             .arg("-sSL")
             .arg("-f")
@@ -2404,58 +2651,176 @@ impl DownloaderService {
     }
 
     /// Nén toàn bộ tệp và thư mục con trong `src_dir` thành tệp ZIP tại `zip_path` bằng crate native `zip`
+    #[allow(dead_code)]
     pub fn compress_dir_to_zip(src_dir: &Path, zip_path: &Path) -> Result<(), String> {
+        Self::compress_dir_to_zip_with(src_dir, zip_path, None, false)
+            .map(|_| ())
+            .map_err(|f| f.message)
+    }
+
+    /// Nén `src_dir` vào `zip_path`, dừng sớm khi `abort` được bật.
+    ///
+    /// `move_files = true`: xoá từng tệp gốc ngay khi mục của nó trong ZIP đã hoàn
+    /// tất và được đẩy xuống đĩa. Nén 10 video × 2 GB nhờ vậy chỉ cần ~10 GB + 1
+    /// tệp lớn nhất, thay vì 20 GB (bản gốc + ZIP) rồi mới xoá thư mục.
+    /// Khi lỗi giữa chừng, ZIP vẫn được đóng lại hợp lệ với các tệp đã chuyển
+    /// (xem `ZipFailure::moved_files`), phần còn lại vẫn nằm trong thư mục.
+    pub fn compress_dir_to_zip_with(
+        src_dir: &Path,
+        zip_path: &Path,
+        abort: Option<&std::sync::atomic::AtomicBool>,
+        move_files: bool,
+    ) -> Result<usize, ZipFailure> {
+        let fail = |message: String| ZipFailure { message, moved_files: 0 };
         let file = std::fs::File::create(zip_path)
-            .map_err(|e| format!("Không thể tạo tệp zip: {e}"))?;
-        let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
-        let walker = walkdir::WalkDir::new(src_dir);
+            .map_err(|e| fail(format!("Không thể tạo tệp zip: {e}")))?;
+        let mut zip = zip::ZipWriter::new(std::io::BufWriter::with_capacity(1 << 20, file));
+        let mut state = ZipMoveState::default();
+
+        let res = Self::write_zip_entries(&mut zip, src_dir, zip_path, abort, move_files, &mut state);
+        if let Err(message) = res {
+            let cancelled = abort
+                .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+            if move_files && state.moved > 0 && !cancelled {
+                // Mục cuối luôn là tệp CHƯA xoá bản gốc (có thể đang ghi dở): gỡ
+                // nó ra rồi đóng ZIP để các tệp đã chuyển vẫn giải nén được.
+                let _ = zip.abort_file();
+                if let Err(e) = zip.finish().map_err(|e| e.to_string()).and_then(|mut w| {
+                    std::io::Write::flush(&mut w).map_err(|e| e.to_string())
+                }) {
+                    warn!("Không đóng được ZIP dở dang {:?}: {e}", zip_path);
+                }
+            }
+            return Err(ZipFailure { message, moved_files: state.moved });
+        }
+
+        let finished = zip
+            .finish()
+            .map_err(|e| format!("Lỗi hoàn tất tệp zip: {e}"))
+            .and_then(|mut w| {
+                std::io::Write::flush(&mut w).map_err(|e| format!("Lỗi lưu tệp zip: {e}"))
+            });
+        if let Err(message) = finished {
+            return Err(ZipFailure { message, moved_files: state.moved });
+        }
+        if let Some(last) = state.pending.take() {
+            Self::remove_moved_source(&last, &mut state.moved);
+        }
+        Ok(state.zipped)
+    }
+
+    fn write_zip_entries<W: std::io::Write + std::io::Seek>(
+        zip: &mut zip::ZipWriter<W>,
+        src_dir: &Path,
+        zip_path: &Path,
+        abort: Option<&std::sync::atomic::AtomicBool>,
+        move_files: bool,
+        state: &mut ZipMoveState,
+    ) -> Result<(), String> {
+        use std::io::{Read, Write};
+        let is_aborted = || abort.map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false);
+
+        let mut buf = vec![0u8; 1 << 20];
+        let walker = walkdir::WalkDir::new(src_dir).sort_by_file_name();
         for entry in walker.into_iter().filter_map(|e| e.ok()) {
+            if is_aborted() {
+                return Err("Đã hủy nén ZIP".to_string());
+            }
             let path = entry.path();
-            if path == src_dir {
+            // Không ghi mục thư mục riêng: đường dẫn "sub/a.mp4" đã đủ để giải nén
+            // tạo lại thư mục, và nhờ vậy mục cuối trong ZIP luôn là một tệp —
+            // điều kiện để `abort_file()` gỡ đúng mục khi lỗi.
+            if path == src_dir || path == zip_path || !path.is_file() {
+                continue;
+            }
+            // Tệp dở dang của yt-dlp/aria2c (khi một video lỗi giữa chừng) không có
+            // giá trị với người dùng và có thể rất lớn.
+            let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            if [".part", ".ytdl", ".aria2", ".temp"].iter().any(|ext| name.ends_with(ext))
+                || name.contains(".part-Frag")
+            {
                 continue;
             }
 
             let relative_path = path
                 .strip_prefix(src_dir)
                 .map_err(|e| format!("Lỗi xác định đường dẫn tương đối: {e}"))?;
-
             let path_str = relative_path.to_string_lossy().replace('\\', "/");
-            if path.is_dir() {
-                let options = zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Stored);
-                zip.add_directory(&path_str, options)
-                    .map_err(|e| format!("Lỗi thêm thư mục vào zip: {e}"))?;
-            } else if path.is_file() {
-                // Media phổ biến đã được nén sẵn; Deflate lại video/ảnh chỉ làm
-                // tăng CPU và thời gian đóng gói mà hầu như không giảm kích thước.
-                let extension = path
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .map(|value| value.to_ascii_lowercase());
-                let method = match extension.as_deref() {
-                    Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "avif" | "mp4" | "mkv" | "mov" | "webm" | "m4v" | "mp3" | "m4a" | "flac" | "wav" | "aac" | "ogg" | "opus" | "zip" | "7z" | "rar") => {
-                        zip::CompressionMethod::Stored
-                    }
-                    _ => zip::CompressionMethod::Deflated,
-                };
-                let options = zip::write::SimpleFileOptions::default()
-                    .compression_method(method);
-                zip.start_file(&path_str, options)
-                    .map_err(|e| format!("Lỗi tạo mục tệp trong zip: {e}"))?;
-                let mut f = std::fs::File::open(path)
-                    .map_err(|e| format!("Không thể mở tệp {}: {e}", path.display()))?;
-                std::io::copy(&mut f, &mut zip)
+
+            // Media phổ biến đã được nén sẵn; Deflate lại video/ảnh chỉ làm
+            // tăng CPU và thời gian đóng gói mà hầu như không giảm kích thước.
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase());
+            let method = match extension.as_deref() {
+                Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "avif" | "mp4" | "mkv" | "mov" | "webm" | "m4v" | "mp3" | "m4a" | "flac" | "wav" | "aac" | "ogg" | "opus" | "zip" | "7z" | "rar") => {
+                    zip::CompressionMethod::Stored
+                }
+                _ => zip::CompressionMethod::Deflated,
+            };
+            // Tệp >= 4 GiB (video dài) bắt buộc bật ZIP64, nếu không crate `zip`
+            // trả lỗi "Large file option has not been set" giữa chừng.
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(method)
+                .large_file(size >= u32::MAX as u64);
+            let mut f = std::fs::File::open(path)
+                .map_err(|e| format!("Không thể mở tệp {}: {e}", path.display()))?;
+            zip.start_file(&path_str, options)
+                .map_err(|e| format!("Lỗi tạo mục tệp trong zip: {e}"))?;
+
+            // start_file() đã chốt kích thước/CRC của mục trước: đẩy xuống OS rồi
+            // mới xoá tệp gốc của mục đó.
+            if let Some(prev) = state.pending.take() {
+                zip.flush().map_err(|e| format!("Lỗi ghi dữ liệu vào zip: {e}"))?;
+                Self::remove_moved_source(&prev, &mut state.moved);
+            }
+
+            loop {
+                if is_aborted() {
+                    return Err("Đã hủy nén ZIP".to_string());
+                }
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| format!("Không thể đọc tệp {}: {e}", path.display()))?;
+                if n == 0 {
+                    break;
+                }
+                zip.write_all(&buf[..n])
                     .map_err(|e| format!("Lỗi ghi dữ liệu vào zip: {e}"))?;
             }
+            state.zipped += 1;
+            if move_files {
+                state.pending = Some(path.to_path_buf());
+            }
         }
-
-        let mut writer = zip.finish()
-            .map_err(|e| format!("Lỗi hoàn tất tệp zip: {e}"))?;
-        std::io::Write::flush(&mut writer)
-            .map_err(|e| format!("Lỗi lưu tệp zip: {e}"))?;
-
         Ok(())
     }
+
+    fn remove_moved_source(path: &Path, moved: &mut usize) {
+        match std::fs::remove_file(path) {
+            Ok(()) => *moved += 1,
+            Err(e) => warn!("Đã nén nhưng không xoá được tệp gốc {:?}: {e}", path),
+        }
+    }
+}
+
+/// Lỗi khi nén ZIP. `moved_files > 0`: đã có tệp gốc bị xoá sau khi chuyển vào
+/// ZIP, nên tệp ZIP dở KHÔNG được xoá (nó đang giữ bản duy nhất của các tệp đó).
+#[derive(Debug)]
+pub struct ZipFailure {
+    pub message: String,
+    pub moved_files: usize,
+}
+
+#[derive(Default)]
+struct ZipMoveState {
+    /// Tệp đã ghi xong vào ZIP nhưng chưa xoá bản gốc (mục của nó chưa được chốt)
+    pending: Option<PathBuf>,
+    moved: usize,
+    zipped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2520,6 +2885,195 @@ mod tests {
         assert_eq!(D::postprocess_phase("[ExtractAudio] Destination: /tmp/a.mp3"), Some("Đang tách âm thanh..."));
         assert_eq!(D::postprocess_phase("[download] Destination: /tmp/a.mp4"), None);
         assert_eq!(D::postprocess_phase("/tmp/a.mkv"), None);
+    }
+
+    #[test]
+    fn aria2c_summary_lines_are_parsed_correctly() {
+        let re = regex::Regex::new(
+            r"\[(?:#\w+|===)\s+([\d\.]+[A-Za-z]+)\s*/\s*([\d\.]+[A-Za-z]+)\s*\((\d+(?:\.\d+)?)%\)(?:.*?DL:([\d\.]+[A-Za-z]+))?(?:.*?ETA:([^\s\]]+))?"
+        ).unwrap();
+
+        // 1. Dòng summary tiêu chuẩn có đầy đủ GID, %, CN, DL speed, ETA
+        let line1 = "[#2a3b4c 14.5MiB/45.2MiB(32%) CN:8 DL:2.4MiB ETA:12s]";
+        let res1 = D::parse_aria2c_progress(&re, line1).expect("Phải parse được line1");
+        assert_eq!(res1.percent, 32.0);
+        assert_eq!(res1.downloaded, "14.5MiB");
+        assert_eq!(res1.total, "45.2MiB");
+        assert_eq!(res1.speed, "2.4MiB/s");
+        assert_eq!(res1.eta, "12s");
+
+        // 2. Dòng summary khi mới bắt đầu (chưa có ETA)
+        let line2 = "[#2a3b4c 1.2MiB/45.2MiB(2%) CN:8 DL:1.1MiB]";
+        let res2 = D::parse_aria2c_progress(&re, line2).expect("Phải parse được line2");
+        assert_eq!(res2.percent, 2.0);
+        assert_eq!(res2.downloaded, "1.2MiB");
+        assert_eq!(res2.total, "45.2MiB");
+        assert_eq!(res2.speed, "1.1MiB/s");
+        assert_eq!(res2.eta, "");
+
+        // 3. Dòng tổng thể [=== ...]
+        let line3 = "[=== 100MiB/200MiB(50%) CN:16 DL:10.5MiB ETA:10s]";
+        let res3 = D::parse_aria2c_progress(&re, line3).expect("Phải parse được line3");
+        assert_eq!(res3.percent, 50.0);
+        assert_eq!(res3.downloaded, "100MiB");
+        assert_eq!(res3.total, "200MiB");
+        assert_eq!(res3.speed, "10.5MiB/s");
+        assert_eq!(res3.eta, "10s");
+
+        // 4. Dòng có ký tự \r do aria2c in-place console readout
+        let line4 = "[#1 1MiB/10MiB(10%)]\r[#1 3MiB/10MiB(30%) CN:4 DL:3.0MiB ETA:5s]";
+        let res4 = D::parse_aria2c_progress(&re, line4).expect("Phải parse được line4 chứa \\r");
+        assert_eq!(res4.percent, 30.0);
+        assert_eq!(res4.downloaded, "3MiB");
+        assert_eq!(res4.total, "10MiB");
+        assert_eq!(res4.speed, "3.0MiB/s");
+        assert_eq!(res4.eta, "5s");
+
+        // 5. Các dòng không liên quan hoặc rác
+        assert!(D::parse_aria2c_progress(&re, "[download] Destination: /tmp/a.mp4").is_none());
+        assert!(D::parse_aria2c_progress(&re, "Random debug line").is_none());
+        assert!(D::parse_aria2c_progress(&re, "").is_none());
+    }
+
+    #[test]
+    fn format_suffix_is_only_stripped_when_numeric() {
+        assert_eq!(super::strip_format_suffix("Video [abc].f137"), "Video [abc]");
+        // Tiêu đề chứa ".f" không được cắt cụt thành "a" (từng xoá nhầm mọi tệp bắt đầu bằng "a")
+        assert_eq!(super::strip_format_suffix("a.film [xyz]"), "a.film [xyz]");
+        assert_eq!(super::strip_format_suffix("photo.f"), "photo.f");
+    }
+
+    #[test]
+    fn cancel_cleanup_never_touches_unrelated_files() {
+        let dir = std::env::temp_dir().join(format!("test_cleanup_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+
+        // Tệp của tác vụ bị huỷ
+        let own = dir.join("a.film [xyz].f137.mp4");
+        std::fs::write(dir.join("a.film [xyz].f137.mp4.part"), b"p").unwrap();
+        std::fs::write(dir.join("a.film [xyz].webp"), b"t").unwrap();
+        // Tệp khác của người dùng / của một lượt tải song song khác
+        std::fs::write(dir.join("anh_gia_dinh.jpg"), b"u").unwrap();
+        std::fs::write(dir.join("Other [id2].f140.m4a.part"), b"o").unwrap();
+
+        super::cleanup_task_files(Some(&dir), &[own], &[], start);
+
+        assert!(!dir.join("a.film [xyz].f137.mp4.part").exists());
+        assert!(!dir.join("a.film [xyz].webp").exists());
+        assert!(dir.join("anh_gia_dinh.jpg").exists());
+        assert!(dir.join("Other [id2].f140.m4a.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumbnail_embed_failure_is_not_a_download_failure() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(D::is_thumbnail_embed_only_failure(&lines(&[
+            "WARNING: something",
+            "ERROR: Postprocessing: module mutagen was not found. Please install using `python3 -m pip install mutagen`",
+        ])));
+        assert!(D::is_thumbnail_embed_only_failure(&lines(&[
+            "ERROR: Postprocessing: Supported filetypes for thumbnail embedding are: mp3, mkv/mka, ogg/opus/flac, m4a/mp4/m4v/mov",
+        ])));
+        assert!(!D::is_thumbnail_embed_only_failure(&lines(&[
+            "ERROR: [youtube] abc: Sign in to confirm you're not a bot",
+        ])));
+        assert!(!D::is_thumbnail_embed_only_failure(&lines(&[])));
+    }
+
+    #[test]
+    fn zip_cancellation_stops_and_skips_partial_files() {
+        let src = std::env::temp_dir().join(format!("test_zip_cancel_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.jpg"), b"x").unwrap();
+        std::fs::write(src.join("b.mp4.part"), b"partial").unwrap();
+
+        let zip_path = std::env::temp_dir().join(format!("test_zip_cancel_{}.zip", uuid::Uuid::new_v4()));
+        let aborted = std::sync::atomic::AtomicBool::new(true);
+        assert!(D::compress_dir_to_zip_with(&src, &zip_path, Some(&aborted), true).is_err());
+        assert!(src.join("a.jpg").exists(), "huỷ trước khi nén xong không được xoá tệp gốc");
+
+        let _ = std::fs::remove_file(&zip_path);
+        D::compress_dir_to_zip(&src, &zip_path).unwrap();
+        let archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+        let names: Vec<&str> = archive.file_names().collect();
+        assert_eq!(names, vec!["a.jpg"]);
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn move_mode_empties_the_source_dir_and_keeps_every_file_in_the_zip() {
+        use std::io::Read;
+        let src = std::env::temp_dir().join(format!("test_zip_move_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        for i in 0..5 {
+            std::fs::write(src.join(format!("video_{i}.mp4")), vec![i as u8; 300_000]).unwrap();
+        }
+        std::fs::write(src.join("sub/anh.jpg"), b"jpg").unwrap();
+        std::fs::write(src.join("dang_tai.mp4.part"), b"partial").unwrap();
+
+        let zip_path = std::env::temp_dir().join(format!("test_zip_move_{}.zip", uuid::Uuid::new_v4()));
+        let zipped = D::compress_dir_to_zip_with(&src, &zip_path, None, true).unwrap();
+        assert_eq!(zipped, 6);
+
+        // Mọi tệp đã nén đều bị xoá bản gốc; tệp .part bị bỏ qua nên vẫn còn
+        for i in 0..5 {
+            assert!(!src.join(format!("video_{i}.mp4")).exists());
+        }
+        assert!(!src.join("sub/anh.jpg").exists());
+        assert!(src.join("dang_tai.mp4.part").exists());
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 6);
+        for i in 0..5 {
+            let mut data = Vec::new();
+            archive.by_name(&format!("video_{i}.mp4")).unwrap().read_to_end(&mut data).unwrap();
+            assert_eq!(data, vec![i as u8; 300_000]);
+        }
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_mode_failure_keeps_a_valid_zip_with_the_already_moved_files() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let src = std::env::temp_dir().join(format!("test_zip_move_fail_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.mp4"), b"aaaa").unwrap();
+        std::fs::write(src.join("b.mp4"), b"bbbb").unwrap();
+        // c.mp4 không đọc được → lỗi xảy ra sau khi a.mp4 đã chuyển hẳn vào ZIP
+        let c = src.join("c.mp4");
+        std::fs::write(&c, b"cccc").unwrap();
+        std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&c).is_ok() {
+            // Chạy với quyền root: không giả lập được lỗi đọc
+            let _ = std::fs::remove_dir_all(&src);
+            return;
+        }
+
+        let zip_path = std::env::temp_dir().join(format!("test_zip_move_fail_{}.zip", uuid::Uuid::new_v4()));
+        let err = D::compress_dir_to_zip_with(&src, &zip_path, None, true).unwrap_err();
+        assert_eq!(err.moved_files, 1);
+
+        // a.mp4 chỉ còn trong ZIP; b.mp4 (chưa chốt) và c.mp4 vẫn còn bản gốc
+        assert!(!src.join("a.mp4").exists());
+        assert!(src.join("b.mp4").exists());
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap())
+            .expect("ZIP dở vẫn phải mở được");
+        assert_eq!(archive.len(), 1);
+        let mut data = String::new();
+        archive.by_name("a.mp4").unwrap().read_to_string(&mut data).unwrap();
+        assert_eq!(data, "aaaa");
+
+        std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_file(&zip_path);
     }
 
     #[test]
@@ -2791,7 +3345,7 @@ mod tests {
         let zip_file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(zip_file).unwrap();
 
-        assert_eq!(archive.len(), 3); // image1.jpg, subfolder/, subfolder/image2.png
+        assert_eq!(archive.len(), 2); // image1.jpg, subfolder/image2.png
 
         {
             let mut file1 = archive.by_name("image1.jpg").unwrap();
@@ -3379,7 +3933,11 @@ mod tests {
         ).await;
 
         D::record_file_path(&task_id, direct_file.clone()).await;
+        D::record_file_path(&task_id, temp_dir.join("sample_video.mp4")).await;
         D::record_dir_path(&task_id, album_dir.clone()).await;
+        // Tệp dở dang của một lượt tải KHÁC trong cùng thư mục phải được giữ nguyên
+        let foreign_partial = temp_dir.join("other_video.mp4.part");
+        std::fs::write(&foreign_partial, b"other download").unwrap();
 
         // Cancel the task
         let cancelled = D::cancel_download(&task_id).await.unwrap();
@@ -3390,6 +3948,7 @@ mod tests {
         assert!(!ytdl_file.exists(), ".ytdl file must be deleted");
         assert!(!direct_file.exists(), "direct file must be deleted");
         assert!(!album_dir.exists(), "album directory must be deleted");
+        assert!(foreign_partial.exists(), "partial file of another download must survive");
 
         // Clean up temp dir
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -3413,6 +3972,8 @@ mod tests {
         let (cancel_tx2, _rx2) = tokio::sync::oneshot::channel();
         D::register_task(&sub1_id, Some(temp_dir.clone()), cancel_tx1).await;
         D::register_task(&sub2_id, Some(temp_dir.clone()), cancel_tx2).await;
+        D::record_file_path(&sub1_id, temp_dir.join("video_1.mp4")).await;
+        D::record_file_path(&sub2_id, temp_dir.join("video_2.mp4")).await;
 
         // Cancelling by parent_id should match and cancel all subtasks
         let cancelled = D::cancel_download(&parent_id).await.unwrap();
