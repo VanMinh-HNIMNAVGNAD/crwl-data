@@ -207,6 +207,7 @@ class MediaMetadata:
     live_stream_url: Optional[str] = None
     is_reel: Optional[bool] = None
     is_short: Optional[bool] = None
+    is_story: Optional[bool] = None
     playlist_count: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -252,6 +253,8 @@ class MediaMetadata:
             res["isReel"] = self.is_reel
         if self.is_short is not None:
             res["isShort"] = self.is_short
+        if self.is_story is not None:
+            res["isStory"] = self.is_story
         if self.playlist_count is not None:
             res["playlistCount"] = self.playlist_count
         return res

@@ -16,6 +16,7 @@ from .extractors.movie import MovieExtractor
 from .extractors.direct import DirectImageExtractor
 from .extractors.web_scraper import WebScraperExtractor
 from .extractors.stream_sniffer import get_sniffer
+from .extractors.story import StoryExtractor
 
 
 class MediaDispatcher(BaseExtractor):
@@ -30,6 +31,7 @@ class MediaDispatcher(BaseExtractor):
         self.movie = MovieExtractor(self.ytdlp)
         self.direct = DirectImageExtractor()
         self.web_scraper = WebScraperExtractor()
+        self.story = StoryExtractor()
         self.sniffer = get_sniffer()  # Playwright-based stream sniffer (lazy)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -110,8 +112,23 @@ class MediaDispatcher(BaseExtractor):
             if self._host_is(host, "fb.watch"):
                 return True
             path = self._path_of(url)
-            fb_video_markers = ("/reel", "/reels", "/watch", "/videos", "/video", "/share/r", "/share/v")
+            fb_video_markers = ("/reel", "/reels", "/watch", "/videos", "/video", "/share/r", "/share/v", "/stories")
             return any(m in path for m in fb_video_markers)
+
+        return False
+
+    def is_story_url(self, url: str) -> bool:
+        """URL là Story Facebook hoặc Instagram?"""
+        host = self._hostname_of(url)
+        path = self._path_of(url)
+
+        # Instagram Story: /stories/USERNAME/ID/
+        if self._host_in(host, ("instagram.com", "instagr.am")):
+            return "/stories/" in path
+
+        # Facebook Story: /stories/...
+        if self._host_in(host, self._FACEBOOK_DOMAINS):
+            return "/stories/" in path
 
         return False
 
@@ -187,7 +204,31 @@ class MediaDispatcher(BaseExtractor):
         target_url = resolved.resolved_url if resolved.is_shortened else trimmed
         target_url = self._normalize_facebook_single_url(target_url)
 
-        # 1. Tệp ảnh trực tiếp (CDN)
+        # 2. Story (Facebook / Instagram) → ưu tiên StoryExtractor chuyên biệt
+        #    Story CDN URL hết hạn cực nhanh (5-15 phút) nên phải xử lý ngay,
+        #    không để rơi vào chuỗi fallback dài.
+        if self.is_story_url(target_url):
+            try:
+                self.log(f"Story URL → StoryExtractor: {target_url}")
+                res = self.story.extract(target_url, browser=browser)
+                return self._enhance_metadata(res, target_url)
+            except Exception as story_err:
+                self.warn(f"StoryExtractor thất bại ({story_err}), thử gallery-dl fallback...")
+                # Instagram Story: gallery-dl có thể xử lý được
+                if "instagram.com" in target_url:
+                    try:
+                        res = self.gallery.extract_gallery(target_url, browser=browser, timeout=20)
+                        return self._enhance_metadata(res, target_url)
+                    except Exception as gal_err:
+                        if self._is_auth_error(gal_err) or self._is_auth_error(story_err):
+                            raise self._make_login_error(target_url)
+                        self.warn(f"gallery-dl story fallback cũng thất bại: {gal_err}")
+                # Nếu lỗi auth → thông báo rõ ràng
+                if self._is_auth_error(story_err):
+                    raise self._make_login_error(target_url)
+                raise story_err
+
+        # 3. Tệp ảnh trực tiếp (CDN)
         if self.direct.is_direct_image_url(target_url):
             try:
                 self.log(f"Trực tiếp CDN image: {target_url}")
@@ -196,7 +237,7 @@ class MediaDispatcher(BaseExtractor):
             except Exception as e:
                 self.warn(f"Direct image failed ({e}), fallback...")
 
-        # 2. Trang phim / stream HLS
+        # 4. Trang phim / stream HLS
         if self.movie.is_movie_or_stream_url(target_url):
             try:
                 self.log(f"Phim / HLS Stream: {target_url}")
@@ -205,7 +246,7 @@ class MediaDispatcher(BaseExtractor):
             except Exception as e:
                 self.warn(f"Movie extractor error ({e})")
 
-        # 3. Nền tảng video/audio -> ưu tiên yt-dlp
+        # 5. Nền tảng video/audio -> ưu tiên yt-dlp
         if self.is_video_audio_platform(target_url):
             is_fb = "facebook.com" in target_url or "fb.watch" in target_url or "fb.com" in target_url
             try:
@@ -242,7 +283,7 @@ class MediaDispatcher(BaseExtractor):
                         pass
                 raise yt_err
 
-        # 4. Nền tảng gallery/album -> ưu tiên gallery-dl
+        # 6. Nền tảng gallery/album -> ưu tiên gallery-dl
         if self.is_gallery_platform(target_url):
             is_instagram = "instagram.com" in target_url or "instagr.am" in target_url
             is_reddit = "reddit.com" in target_url or "redd.it" in target_url
@@ -286,7 +327,7 @@ class MediaDispatcher(BaseExtractor):
                     except Exception:
                         raise RuntimeError(str(gal_err) or str(yt_err) or "Không thể trích xuất nội dung từ liên kết này")
 
-        # 5. URL không rõ -> yt-dlp -> gallery-dl -> web_scraper -> Playwright sniffer
+        # 7. URL không rõ -> yt-dlp -> gallery-dl -> web_scraper -> Playwright sniffer
         try:
             self.log(f"URL không xác định -> yt-dlp first: {target_url}")
             res = self.ytdlp.extract_metadata(target_url, browser=browser)
@@ -611,6 +652,12 @@ class MediaDispatcher(BaseExtractor):
         m_p = re.search(r"/share/p/(\d+)", clean)
         if m_p:
             return f"https://www.facebook.com/photo/?fbid={m_p.group(1)}"
+
+        # 5. /stories/ → chuẩn hóa mobile → www
+        if "/stories/" in clean.lower():
+            clean = clean.replace("m.facebook.com", "www.facebook.com")
+            if "www.facebook.com" not in clean and "facebook.com" in clean:
+                clean = re.sub(r"(?:web|touch)\.facebook\.com", "www.facebook.com", clean)
 
         return clean
 

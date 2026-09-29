@@ -5,6 +5,7 @@ from .tiktok import TikTokExtractor
 from .movie import MovieExtractor
 from .direct import DirectImageExtractor
 from .web_scraper import WebScraperExtractor, OversizedResponseError
+from .story import StoryExtractor
 
 __all__ = [
     "BaseExtractor",
@@ -15,5 +16,6 @@ __all__ = [
     "DirectImageExtractor",
     "WebScraperExtractor",
     "OversizedResponseError",
+    "StoryExtractor",
 ]
 
