@@ -92,6 +92,9 @@ class YtDlpExtractor(BaseExtractor):
                     pass
 
         if code != 0 or not stdout.strip():
+            # Quá giờ thì chạy lại lần nữa (không cookie) chỉ tốn gấp đôi thời gian.
+            if self.is_timeout(code, stderr):
+                raise RuntimeError(f"yt-dlp quá thời gian {timeout}s khi đọc thông tin liên kết.")
             if browser and browser != "none":
                 self.warn("yt-dlp extract lỗi với cookies, đang thử lại không dùng cookies ('none')...")
                 return self.extract_metadata(url, browser="none", timeout=timeout)
@@ -200,13 +203,22 @@ class YtDlpExtractor(BaseExtractor):
                 except Exception:
                     pass
 
+        timed_out = self.is_timeout(code, stderr)
         if code != 0 and not stdout.strip():
+            if timed_out:
+                raise RuntimeError(
+                    f"Quét quá thời gian {timeout}s. Hãy giảm số lượng cần quét hoặc chọn 'Khoảng' nhỏ hơn."
+                )
             if browser and browser != "none":
                 self.warn("yt-dlp playlist lỗi với cookies, đang thử lại không dùng cookies ('none')...")
                 return self.extract_playlist(url, limit, browser="none", from_item=from_item, to_item=to_item, timeout=timeout)
             raise RuntimeError(f"yt-dlp playlist thất bại: {stderr.strip() or f'Exit code {code}'}")
 
-        return self._parse_playlist_data(stdout, url)
+        result = self._parse_playlist_data(stdout, url)
+        if timed_out and result.media:
+            # --flat-playlist in từng mục ngay khi có: trả về phần đã quét được
+            result.stats = f"{result.stats} (dừng sớm vì hết thời gian)"
+        return result
 
     # ─────────────────────────────────────────────────────────────────────────
     # Normalizers

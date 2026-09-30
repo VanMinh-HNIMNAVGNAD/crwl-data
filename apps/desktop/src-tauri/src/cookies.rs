@@ -163,8 +163,10 @@ impl CookieService {
             }
         }
 
-        // 3. Định dạng chuỗi Header: "name=value; name2=value2"
-        let clean_raw = trimmed.strip_prefix("cookie:").or_else(|| trimmed.strip_prefix("Cookie:")).unwrap_or(trimmed);
+        // 3. Định dạng chuỗi Header: "name=value; name2=value2" — hoặc mỗi cookie
+        //    một dòng như ô nhập gợi ý. Trước đây chỉ tách theo ';' nên dán nhiều
+        //    dòng thì mọi cookie sau dòng đầu bị nhét vào GIÁ TRỊ của cookie đầu
+        //    (vd. Facebook mất `xs` → không đăng nhập được).
         let mut lines = vec![
             "# Netscape HTTP Cookie File".to_string(),
             format!("# Converted for {platform} from Key-Value string"),
@@ -172,8 +174,13 @@ impl CookieService {
         ];
         let mut count = 0;
 
-        for pair in clean_raw.split(';') {
-            let p = pair.trim();
+        for pair in trimmed.split(|c| c == ';' || c == '\n' || c == '\r') {
+            let mut p = pair.trim();
+            for prefix in ["cookie:", "Cookie:", "COOKIE:"] {
+                if let Some(rest) = p.strip_prefix(prefix) {
+                    p = rest.trim();
+                }
+            }
             if p.is_empty() {
                 continue;
             }
@@ -553,6 +560,26 @@ mod tests {
         let (output_insta, count_insta) = CookieService::convert_to_netscape("instagram", "sessionid=abc");
         assert_eq!(count_insta, 1);
         assert!(output_insta.contains(".instagram.com\tTRUE\t/\tFALSE\t"));
+    }
+
+    /// Ô nhập gợi ý dạng "c_user=...\nxs=..." — mỗi cookie một dòng.
+    #[test]
+    fn test_convert_to_netscape_multiline_key_values() {
+        let raw = "c_user=1000123\nxs=2%3Aabc\r\nfr=zzz; datr=yyy";
+        let (output, count) = CookieService::convert_to_netscape("facebook", raw);
+        assert_eq!(count, 4);
+        assert!(output.contains("\tc_user\t1000123\n"));
+        assert!(output.contains("\txs\t2%3Aabc\n"));
+        assert!(output.contains("\tfr\tzzz\n"));
+        assert!(output.ends_with("\tdatr\tyyy"));
+        // Không có giá trị nào chứa xuống dòng làm hỏng tệp Netscape
+        for line in output.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+            assert_eq!(line.split('\t').count(), 7, "Dòng cookie hỏng: {line:?}");
+        }
+
+        let (with_prefix, n) = CookieService::convert_to_netscape("instagram", "Cookie: sessionid=abc; csrftoken=def");
+        assert_eq!(n, 2);
+        assert!(with_prefix.contains("\tsessionid\tabc\n"));
     }
 
     #[test]

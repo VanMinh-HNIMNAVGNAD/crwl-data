@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Any, Tuple
 
 from .base import BaseExtractor
 from ..models import MediaMetadata, MediaImage, StreamFormat
+from ..cancellation import cap_timeout
 
 
 class OversizedResponseError(RuntimeError):
@@ -190,7 +191,7 @@ class WebScraperExtractor(BaseExtractor):
 
         req = urllib.request.Request(target_url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=cap_timeout(timeout)) as resp:
                 content_type = resp.headers.get("Content-Type", "").lower()
                 raw_bytes = self._read_response_safely(resp, max_size=limit)
                 html = raw_bytes.decode("utf-8", errors="ignore")

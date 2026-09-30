@@ -33,21 +33,25 @@ function App() {
   const [accelerate, setAccelerate] = useState(() => getLS('dl_accelerate', false))
   const [embedMetadata, setEmbedMetadata] = useState(() => getLS('dl_embed_metadata', true))
   const [embedThumbnail, setEmbedThumbnail] = useState(() => getLS('dl_embed_thumbnail', false))
+  const [useAria2c, setUseAria2c] = useState(() => getLS('dl_use_aria2c', false))
 
   const handleSetVideoContainer = (v) => { setVideoContainer(v); setLS('dl_video_container', v) }
   const handleSetAccelerate = (v) => { setAccelerate(v); setLS('dl_accelerate', v) }
   const handleSetEmbedMetadata = (v) => { setEmbedMetadata(v); setLS('dl_embed_metadata', v) }
   const handleSetEmbedThumbnail = (v) => { setEmbedThumbnail(v); setLS('dl_embed_thumbnail', v) }
+  const handleSetUseAria2c = (v) => { setUseAria2c(v); setLS('dl_use_aria2c', v) }
 
   const sharedDlOptions = {
     videoContainer,
     accelerate,
     embedMetadata,
     embedThumbnail,
+    useAria2c,
     onVideoContainerChange: handleSetVideoContainer,
     onAccelerateChange: handleSetAccelerate,
     onEmbedMetadataChange: handleSetEmbedMetadata,
     onEmbedThumbnailChange: handleSetEmbedThumbnail,
+    onUseAria2cChange: handleSetUseAria2c,
   }
   // ──────────────────────────────────────────────────────────────────────────
 

@@ -15,7 +15,14 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Dict, Any, Tuple
 from .base import BaseExtractor
 from .ytdlp import YtDlpExtractor
-from ..cancellation import attach_request, current_request_id, detach_request, raise_if_cancelled
+from ..cancellation import (
+    RequestTimedOut,
+    attach_request,
+    current_request_id,
+    detach_request,
+    raise_if_cancelled,
+    remaining_time,
+)
 from ..models import (
     MediaMetadata,
     MediaImage,
@@ -129,7 +136,6 @@ class GalleryDlExtractor(BaseExtractor):
         range_start: Optional[int] = None,
         range_end: Optional[int] = None,
         timeout: Optional[int] = None,
-        _depth: int = 0,
     ) -> ProfileCrawlResult:
         """Quét profile / channel / subreddit / board"""
         if not self.is_available():
@@ -140,8 +146,6 @@ class GalleryDlExtractor(BaseExtractor):
         if timeout is None:
             timeout = self._timeout_for(limit, range_start, range_end)
 
-        args, tmp_cookie = self.get_base_args(target_url=profile_url, browser=browser)
-
         # `range_start`/`range_end` và `limit` nay tính theo BÀI ĐĂNG.
         if range_start and range_end and range_end >= range_start:
             first_post, last_post = range_start, range_end
@@ -150,33 +154,9 @@ class GalleryDlExtractor(BaseExtractor):
         else:
             first_post, last_post = 1, 0  # 0 = quét toàn bộ
 
-        cmd = [self.binary_path, *args, "-j"]
-        category = self._category_of(profile_url)
-        limit_desc = "all"
-
-        if last_post > 0:
-            if category in self._MAX_POSTS_CATEGORIES:
-                # Giới hạn chính xác theo bài đăng; KHÔNG dùng --range để không
-                # cắt ngang carousel.
-                cmd.extend(["-o", f"max-posts={last_post}"])
-                limit_desc = f"max-posts={last_post}"
-            else:
-                budget = min(
-                    self._MAX_RANGE_FILES,
-                    max(last_post, last_post * self._FILES_PER_POST_HEADROOM),
-                )
-                cmd.extend(["--range", f"1-{budget}"])
-                limit_desc = f"posts 1-{last_post} (<= {budget} tệp)"
-
-        cmd.append(profile_url)
-
-        self.log(f"gallery-dl crawl ({limit_desc}): {profile_url}")
-        try:
-            code, stdout, stderr = self.run_process(cmd, timeout=timeout)
-        finally:
-            self._cleanup_cookie(tmp_cookie)
-
-        raw_entries = self._parse_json(stdout)
+        raw_entries, code, stderr, timed_out = self._crawl_entries(
+            profile_url, browser, last_post, timeout
+        )
 
         # gallery-dl -j báo lỗi qua entry [-1, {...}] trên STDOUT (không phải stderr),
         # nên phải soi cả hai nguồn mới nhận ra được trường hợp thiếu cookie đăng nhập.
@@ -184,37 +164,19 @@ class GalleryDlExtractor(BaseExtractor):
         if auth_reason:
             raise RuntimeError(self._login_required_message(profile_url, auth_reason))
 
-        # Kiểm tra nếu gallery-dl trả về thông điệp Message.Queue (code 6) mà chưa bóc tách media (code 3)
-        has_media = any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in (raw_entries or []))
-        queued_urls = [
-            x[1] for x in (raw_entries or [])
-            if isinstance(x, list) and len(x) >= 2 and x[0] == 6 and isinstance(x[1], str) and x[1] != profile_url
-        ]
-        if not has_media and queued_urls:
-            if _depth >= 3:
+        has_media = any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in raw_entries)
+        if not has_media:
+            if timed_out:
                 raise RuntimeError(
-                    f"gallery-dl chuyển tiếp URL quá nhiều lần mà không ra media: {profile_url}"
-                )
-            child_url = queued_urls[0]
-            self.log(f"gallery-dl chuyển tiếp URL con ({limit_desc}): {child_url}")
-            return self.crawl_profile(
-                child_url,
-                limit=limit,
-                media_type=media_type,
-                browser=browser,
-                range_start=range_start,
-                range_end=range_end,
-                timeout=timeout,
-                _depth=_depth + 1,
-            )
-
-        if not raw_entries:
-            if code == -1 and "Timeout" in (stderr or ""):
-                raise RuntimeError(
-                    f"Quét quá thời gian {timeout}s. Hãy giảm số lượng cần quét hoặc chọn 'Khoảng' nhỏ hơn."
+                    "Hết thời gian quét trước khi lấy được bài đăng nào. "
+                    "Hãy giảm số lượng cần quét hoặc chọn 'Khoảng' nhỏ hơn."
                 )
             if code != 0:
                 raise RuntimeError(f"gallery-dl crawl thất bại: {stderr.strip() or f'Exit code {code}'}")
+            # Ở chế độ output.jsonl, gallery-dl KHÔNG in entry lỗi [-1, ...] ra stdout.
+            # Không có media thì chạy lại một lượt thăm dò nhỏ (định dạng -j thường)
+            # để biết lý do thật (thiếu đăng nhập, tài khoản không tồn tại...).
+            self._raise_probe_error(profile_url, browser)
             return ProfileCrawlResult(
                 platform="social",
                 name=None,
@@ -234,7 +196,117 @@ class GalleryDlExtractor(BaseExtractor):
             groups = groups[first_post - 1:last_post]
         groups = self._expand_incomplete_posts(groups, browser)
 
-        return self._parse_crawl_result(groups, raw_entries, profile_url, media_type)
+        result = self._parse_crawl_result(groups, raw_entries, profile_url, media_type)
+        if timed_out:
+            result.stats = f"{result.stats} (dừng sớm vì hết thời gian)"
+        return result
+
+    def _crawl_entries(
+        self,
+        url: str,
+        browser: Optional[str],
+        last_post: int,
+        timeout: float,
+        _depth: int = 0,
+    ) -> Tuple[List[Any], int, str, bool]:
+        """Chạy gallery-dl cho một URL quét, trả về (entries, mã thoát, stderr, đã_quá_giờ).
+
+        Dùng `output.jsonl`: gallery-dl in TỪNG mục ngay khi có thay vì gom lại in
+        một mảng JSON lúc kết thúc — bị kill vì quá giờ thì vẫn giữ được những bài
+        đã quét. (gallery-dl cũ không có tuỳ chọn này thì vẫn in mảng như trước.)
+
+        Nếu URL chỉ chuyển tiếp sang URL con (Message.Queue) mà không trả media,
+        đi theo TẤT CẢ URL con (trước đây chỉ URL đầu tiên) cho tới khi đủ số bài.
+        """
+        args, tmp_cookie = self.get_base_args(target_url=url, browser=browser)
+        cmd = [self.binary_path, *args, "-o", "output.jsonl=true", "-j"]
+        category = self._category_of(url)
+        limit_desc = "all"
+        if last_post > 0:
+            if category in self._MAX_POSTS_CATEGORIES:
+                # Giới hạn chính xác theo bài đăng; KHÔNG dùng --range để không
+                # cắt ngang carousel.
+                cmd.extend(["-o", f"max-posts={last_post}"])
+                limit_desc = f"max-posts={last_post}"
+            else:
+                budget = min(
+                    self._MAX_RANGE_FILES,
+                    max(last_post, last_post * self._FILES_PER_POST_HEADROOM),
+                )
+                cmd.extend(["--range", f"1-{budget}"])
+                limit_desc = f"posts 1-{last_post} (<= {budget} tệp)"
+        cmd.append(url)
+
+        self.log(f"gallery-dl crawl ({limit_desc}): {url}")
+        try:
+            code, stdout, stderr = self.run_process(cmd, timeout=timeout)
+        finally:
+            self._cleanup_cookie(tmp_cookie)
+
+        entries = self._parse_json(stdout) or []
+        timed_out = self.is_timeout(code, stderr)
+        has_media = any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in entries)
+
+        queued: List[str] = []
+        for x in entries:
+            if isinstance(x, list) and len(x) >= 2 and x[0] == 6 and isinstance(x[1], str):
+                if x[1] != url and x[1] not in queued:
+                    queued.append(x[1])
+        if has_media or not queued or timed_out:
+            return entries, code, stderr, timed_out
+        if _depth >= 3:
+            raise RuntimeError(f"gallery-dl chuyển tiếp URL quá nhiều lần mà không ra media: {url}")
+
+        # Giữ entry thông tin tài khoản (code 2) của URL cha, rồi gộp kết quả các URL con
+        collected: List[Any] = [x for x in entries if isinstance(x, list) and x and x[0] == 2]
+        stderr_parts = [stderr or ""]
+        last_code = code
+        max_children = min(len(queued), last_post if last_post > 0 else 25)
+        for child_url in queued[:max_children]:
+            left = remaining_time()
+            if left is not None and left < 3:
+                timed_out = True
+                break
+            self.log(f"gallery-dl chuyển tiếp URL con ({limit_desc}): {child_url}")
+            child_entries, last_code, child_err, child_timed_out = self._crawl_entries(
+                child_url,
+                browser,
+                last_post,
+                timeout if left is None else min(timeout, left),
+                _depth + 1,
+            )
+            collected.extend(child_entries)
+            stderr_parts.append(child_err or "")
+            if child_timed_out:
+                timed_out = True
+                break
+            if last_post > 0 and len(self._group_by_post(collected)) >= last_post:
+                break
+        media_found = any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in collected)
+        return collected, (0 if media_found else last_code), "\n".join(stderr_parts), timed_out
+
+    def _raise_probe_error(self, url: str, browser: Optional[str]) -> None:
+        """Thăm dò ngắn bằng `-j` thường để lộ ra entry lỗi mà chế độ jsonl nuốt mất."""
+        left = remaining_time()
+        if left is not None and left < 5:
+            return
+        args, tmp_cookie = self.get_base_args(target_url=url, browser=browser)
+        # -J (resolve-json) chạy luôn các URL con trong cùng lượt và gom entry lỗi
+        # của chúng — với -j, lỗi nằm ở URL con sẽ không hiện ra.
+        cmd = [self.binary_path, *args, "-J", "--range", "1-2", url]
+        try:
+            code, stdout, stderr = self.run_process(cmd, timeout=30)
+        finally:
+            self._cleanup_cookie(tmp_cookie)
+        entries = self._parse_json(stdout) or []
+        auth_reason = self._detect_auth_error(entries, stderr)
+        if auth_reason:
+            raise RuntimeError(self._login_required_message(url, auth_reason))
+        for x in entries:
+            if isinstance(x, list) and len(x) >= 2 and x[0] == -1 and isinstance(x[1], dict):
+                err = str(x[1].get("error") or "Lỗi")
+                msg = str(x[1].get("message") or "")
+                raise RuntimeError(f"gallery-dl không quét được {url}: {err}: {msg}".strip(": "))
 
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -416,8 +488,17 @@ class GalleryDlExtractor(BaseExtractor):
         self.log(f"Đang bung {len(capped)} bài đăng để lấy đủ ảnh bên trong...")
 
         raise_if_cancelled()
+        # Ngân sách bung bài không được vượt thời gian còn lại của request: để dành
+        # ~10 giây cho việc gom kết quả và gửi về Rust.
+        budget = self._EXPAND_BUDGET_SEC
+        left = remaining_time()
+        if left is not None:
+            budget = min(budget, left - 10)
+        if budget < 5:
+            self.warn(f"Không còn thời gian để bung {len(capped)} bài đăng thiếu tệp — trả về như hiện có.")
+            return groups
         parent_req = current_request_id()
-        deadline = time.monotonic() + self._EXPAND_BUDGET_SEC
+        deadline = time.monotonic() + budget
         skipped = 0
 
         def worker(group: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Any]]:
@@ -429,6 +510,9 @@ class GalleryDlExtractor(BaseExtractor):
                     return group, []
                 raise_if_cancelled()
                 return group, self._fetch_post_entries(group["url"], browser)
+            except RequestTimedOut:
+                # Hết ngân sách giữa chừng: giữ bài như hiện có, không bỏ cả lượt quét
+                return group, []
             except Exception as err:  # một bài lỗi không được làm hỏng cả lượt quét
                 self.warn(f"Bung bài đăng thất bại ({group.get('url')}): {err}")
                 return group, []
@@ -697,7 +781,8 @@ class GalleryDlExtractor(BaseExtractor):
     def _timeout_for(limit: int, range_start: Optional[int], range_end: Optional[int]) -> int:
         """Ước lượng thời gian chờ theo số lượng mục cần quét (giây)."""
         if range_start and range_end and range_end >= range_start:
-            count = range_end - range_start + 1
+            # gallery-dl phải đi qua mọi bài trước range_start nên chi phí tính theo range_end
+            count = range_end
         elif limit and limit > 0:
             count = limit
         else:
@@ -773,18 +858,42 @@ class GalleryDlExtractor(BaseExtractor):
 
     @staticmethod
     def _parse_json(stdout_data: str) -> Optional[List[Any]]:
+        """Đọc output của `gallery-dl -j`: một mảng JSON, hoặc JSON Lines (output.jsonl)."""
         if not stdout_data or not stdout_data.strip():
             return None
         trimmed = stdout_data.strip()
+
+        def is_entry(x: Any) -> bool:
+            return isinstance(x, list) and len(x) >= 1 and isinstance(x[0], int)
+
+        # 1. Một mảng JSON (có thể có rác trước/sau)
         s_idx = trimmed.find("[")
         e_idx = trimmed.rfind("]")
         if s_idx != -1 and e_idx != -1 and e_idx > s_idx:
             try:
                 parsed = json.loads(trimmed[s_idx : e_idx + 1])
-                return parsed if isinstance(parsed, list) else None
-            except Exception:
-                return None
-        return None
+                if isinstance(parsed, list):
+                    if all(is_entry(x) for x in parsed):
+                        return parsed
+                    if is_entry(parsed):  # JSON Lines chỉ có đúng một dòng
+                        return [parsed]
+            except ValueError:
+                pass
+
+        # 2. JSON Lines: mỗi dòng một entry. Dòng cuối có thể bị cắt dở khi tiến
+        #    trình bị kill vì quá giờ — bỏ qua dòng hỏng thay vì mất cả kết quả.
+        entries: List[Any] = []
+        for line in trimmed.splitlines():
+            line = line.strip()
+            if not line.startswith("["):
+                continue
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if is_entry(item):
+                entries.append(item)
+        return entries or None
 
     @staticmethod
     def _extract_author(meta: Dict[str, Any]) -> Optional[str]:

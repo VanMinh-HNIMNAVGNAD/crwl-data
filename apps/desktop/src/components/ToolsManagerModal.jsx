@@ -8,7 +8,7 @@ import {
   restartSidecar,
   getAppSettings,
   saveAppSettings,
-  selectDownloadDirectory,
+  askForDownloadDirectory,
 } from '../services/api'
 import { IconClose, IconRefresh, IconCheck, IconSettings } from './Icons'
 
@@ -153,7 +153,8 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
 
   const handlePickDownloadDir = async () => {
     try {
-      const dir = await selectDownloadDirectory()
+      // Chỉ điền vào ô; bấm "Lưu cấu hình" mới ghi thành thư mục mặc định.
+      const dir = await askForDownloadDirectory()
       if (dir) patchSetting('downloadDir', dir)
     } catch (err) {
       onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi chọn thư mục')
@@ -165,14 +166,18 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
     try {
       // Trường rỗng phải gửi null, nếu không backend coi chuỗi rỗng là giá trị hợp lệ.
       const blank = (v) => (typeof v === 'string' && v.trim() === '' ? null : v ?? null)
-      await saveAppSettings({
+      const engineRestarted = await saveAppSettings({
         downloadDir: blank(settings?.downloadDir),
         ytdlpPath: blank(settings?.ytdlpPath),
         galleryDlPath: blank(settings?.galleryDlPath),
-        databaseUrl: blank(settings?.databaseUrl),
+        proxy: blank(settings?.proxy),
         schemaVersion: settings?.schemaVersion ?? 1,
       })
-      onShowToast?.('Đã lưu cấu hình. Đường dẫn công cụ và DATABASE_URL áp dụng ngay.')
+      onShowToast?.(
+        engineRestarted
+          ? 'Đã lưu cấu hình và khởi động lại engine bóc tách để áp dụng đường dẫn công cụ / proxy mới.'
+          : 'Đã lưu cấu hình.'
+      )
       await fetchStatus()
     } catch (err) {
       onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi lưu cấu hình')
@@ -397,18 +402,19 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
             </label>
 
             <label className="tools-setting-row">
-              <span className="tools-setting-label">DATABASE_URL</span>
+              <span className="tools-setting-label">Proxy</span>
               <input
-                type="password"
+                type="text"
                 className="tools-setting-input"
-                placeholder="postgresql://... — để trống thì chạy chế độ Offline"
-                value={settings?.databaseUrl || ''}
-                onChange={(e) => patchSetting('databaseUrl', e.target.value)}
+                placeholder="http://127.0.0.1:8080 hoặc socks5://... — để trống = không dùng proxy"
+                value={settings?.proxy || ''}
+                onChange={(e) => patchSetting('proxy', e.target.value)}
               />
             </label>
 
             <p className="tools-setting-hint">
-              Lưu tại <code>~/.config/crwl/settings.json</code>. Đổi DATABASE_URL sẽ kết nối lại cơ sở dữ liệu ngay.
+              Lưu tại <code>~/.config/crwl/settings.json</code>. Proxy áp dụng cho cả bóc tách lẫn tải xuống.
+              Đổi đường dẫn công cụ hoặc proxy sẽ khởi động lại engine bóc tách (lượt bóc tách đang chạy bị ngắt).
             </p>
 
             <button

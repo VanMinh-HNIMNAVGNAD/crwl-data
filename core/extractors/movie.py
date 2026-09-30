@@ -12,6 +12,7 @@ from typing import Optional, List, Tuple
 from .base import BaseExtractor
 from .ytdlp import YtDlpExtractor
 from ..models import MediaMetadata
+from ..cancellation import cap_timeout
 
 KNOWN_MOVIE_DOMAINS = [
     "motchill", "phimmoi", "ophim", "kkphim", "subnhanh", "tvhay", "bilutv",
@@ -31,10 +32,11 @@ MOVIE_HOSTNAME_KEYWORDS = [
     "nhac", "music", "audio", "nhacviet",
 ]
 
-# Heuristic cho path URL
+# Heuristic cho path URL. Không dùng "watch?" / "/play/": quá phổ biến (vimeo,
+# nhiều trang video thường) nên kéo mọi URL đó qua bộ bóc tách phim rồi mới tới yt-dlp.
 MOVIE_PATH_KEYWORDS = [
-    "episode", "/tap-", "/phan-", "/season", "watch?", "/play/",
-    "vietsub", "thuyet-minh", "-full-hd", "-vietsub",
+    "/episode", "/tap-", "/phan-", "/season-", "/xem-phim",
+    "vietsub", "thuyet-minh", "-full-hd",
 ]
 
 EXCLUDED_SOCIAL_DOMAINS = [
@@ -89,33 +91,32 @@ class MovieExtractor(BaseExtractor):
             return False
         lower = raw_url.strip().lower()
 
-        # 1. Luồng stream trực tiếp (bất kể domain)
-        if any(ext in lower for ext in (".m3u8", ".mpd", "/hls/", "master.m3u8", "playlist.m3u8")):
-            return True
-
-        # 2. Loại trừ mạng xã hội đã biết
-        if any(d in lower for d in EXCLUDED_SOCIAL_DOMAINS):
+        try:
+            url_to_parse = lower if lower.startswith(("http://", "https://")) else "https://" + lower
+            parsed = urllib.parse.urlparse(url_to_parse)
+            hostname = (parsed.hostname or "").lower().rstrip(".")
+            path = (parsed.path or "").lower()
+        except ValueError:
             return False
 
-        # 3. Web phim/stream đã biết (danh sách cứng)
-        if any(d in lower for d in KNOWN_MOVIE_DOMAINS):
+        # 1. Luồng stream trực tiếp (bất kể domain) — xét trong PATH, không phải cả URL
+        if re.search(r"\.(?:m3u8|mpd)$", path) or "/hls/" in path:
             return True
 
-        # 4. Heuristic dựa trên hostname keyword
-        try:
-            url_to_parse = lower if lower.startswith("http") else "https://" + lower
-            parsed = urllib.parse.urlparse(url_to_parse)
-            hostname = (parsed.hostname or "").lower()
-            path = (parsed.path or "").lower()
+        # 2. Loại trừ mạng xã hội đã biết — so theo hostname: `"x.com" in url` từng
+        #    khớp nhầm netflix.com, vox.com...
+        if any(hostname == d or hostname.endswith("." + d) for d in EXCLUDED_SOCIAL_DOMAINS):
+            return False
 
-            if any(kw in hostname for kw in MOVIE_HOSTNAME_KEYWORDS):
-                return True
-            if any(kw in path for kw in MOVIE_PATH_KEYWORDS):
-                return True
-        except Exception:
-            pass
+        # 3. Web phim/stream đã biết (danh sách cứng) — chỉ xét HOSTNAME. Trước đây
+        #    xét cả URL nên "voe" khớp /voeux-2025, "upstream" khớp path của blog...
+        if any(d in hostname for d in KNOWN_MOVIE_DOMAINS):
+            return True
 
-        return False
+        # 4. Heuristic dựa trên hostname / path keyword
+        if any(kw in hostname for kw in MOVIE_HOSTNAME_KEYWORDS):
+            return True
+        return any(kw in path for kw in MOVIE_PATH_KEYWORDS)
 
     def extract(self, url: str, browser: Optional[str] = None, timeout: int = 45) -> MediaMetadata:
         target_url = url.strip()
@@ -177,7 +178,7 @@ class MovieExtractor(BaseExtractor):
         }
         try:
             req = urllib.request.Request(page_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=cap_timeout(timeout)) as resp:
                 html = resp.read().decode("utf-8", errors="ignore")
         except Exception as e:
             self.warn(f"Scrape movie page error: {e}")

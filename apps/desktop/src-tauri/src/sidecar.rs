@@ -24,6 +24,13 @@ pub const MAX_CONSECUTIVE_RESTARTS: u32 = 3;
 /// Ngưỡng thời gian mà worker chạy ổn định để coi là thành công (giây)
 pub const STABILITY_THRESHOLD: Duration = Duration::from_secs(10);
 
+/// Thời gian chờ tối đa của một lượt quét tài khoản (giây)
+const CRAWL_MAX_SECS: u64 = 660;
+
+/// Python nhận ngân sách ít hơn mốc chờ của Rust chừng này giây, đủ để
+/// dọn tiến trình con và gửi kết quả (dù dở dang) về kịp trước khi Rust bỏ cuộc.
+const BUDGET_MARGIN_SECS: u64 = 10;
+
 /// Trạng thái vòng đời của Python worker
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerStatus {
@@ -145,6 +152,30 @@ impl SidecarManager {
             lc.last_error = None;
         }
         self.start_worker().await;
+    }
+
+    /// Truyền cấu hình của app xuống Python qua biến môi trường.
+    ///
+    /// Trước đây đường dẫn yt-dlp/gallery-dl tự chọn trong "Công cụ" chỉ có tác dụng
+    /// với bước TẢI (Rust), còn bước BÓC TÁCH (Python) vẫn dò trong PATH. Thư mục
+    /// cấu hình cũng được truyền xuống để Python tìm đúng cookie thủ công trên mọi
+    /// hệ điều hành (Python từng cứng `~/.config/crwl`, sai trên Windows/macOS).
+    fn apply_settings_env(cmd: &mut Command) {
+        if let Some(dir) = dirs::config_dir() {
+            cmd.env("CRWL_CONFIG_DIR", dir.join("crwl"));
+        }
+        if let Some(p) = crate::settings::SettingsManager::custom_binary_path("yt-dlp") {
+            cmd.env("YT_DLP_PATH", p);
+        }
+        if let Some(p) = crate::settings::SettingsManager::custom_binary_path("gallery-dl") {
+            cmd.env("GALLERY_DL_PATH", p);
+        }
+        // yt-dlp, gallery-dl (requests), urllib, curl và curl_cffi đều đọc proxy từ môi trường
+        if let Some(proxy) = crate::settings::SettingsManager::proxy() {
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "CRWL_PROXY"] {
+                cmd.env(key, &proxy);
+            }
+        }
     }
 
     /// Tìm đường dẫn extractor_cli.py
@@ -278,6 +309,7 @@ impl SidecarManager {
             let mut cmd = Command::new(&python_bin);
             cmd.arg(&cli).arg("--stdin");
             cmd.env("PYTHONUNBUFFERED", "1");
+            Self::apply_settings_env(&mut cmd);
             #[cfg(windows)]
             {
                 #[allow(unused_imports)]
@@ -662,24 +694,29 @@ impl SidecarManager {
     }
 
     /// Thời gian chờ tối đa theo loại request.
-    /// Quét profile (nhất là khi chọn "Tất cả") có thể mất vài phút, không thể
-    /// dùng chung một mốc 55s với việc giải mã link rút gọn.
+    ///
+    /// Python nhận `budget_sec` (ít hơn mốc này một chút) và tự dừng đúng hạn,
+    /// trả về phần kết quả đã có. Trước đây Python có thể chạy lâu hơn hẳn mốc chờ
+    /// của Rust (vd. quét 100 bài: gallery-dl 360s + 120s bung bài so với 240s),
+    /// nên UI báo Timeout trong khi Python vẫn chạy tiếp và giữ chỗ trong pool.
     fn timeout_for(payload: &Value) -> Duration {
         let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("extract");
         match action {
             "resolve" => Duration::from_secs(30),
             "crawl" => {
                 let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(50);
-                // limit = 0 nghĩa là "Tất cả" → cho thời gian rộng nhất
-                if limit == 0 {
-                    Duration::from_secs(600)
-                } else if limit > 100 {
-                    Duration::from_secs(420)
+                // Với "Khoảng", gallery-dl phải đi qua mọi bài trước range_end nên chi
+                // phí theo range_end chứ không theo số bài trong khoảng.
+                let range_end = payload.get("range_end").and_then(|v| v.as_u64()).unwrap_or(0);
+                let posts = limit.max(range_end);
+                if limit == 0 && range_end == 0 {
+                    // "Tất cả"
+                    Duration::from_secs(CRAWL_MAX_SECS)
                 } else {
-                    Duration::from_secs(240)
+                    Duration::from_secs((180 + posts * 4).clamp(240, CRAWL_MAX_SECS))
                 }
             }
-            _ => Duration::from_secs(150),
+            _ => Duration::from_secs(180),
         }
     }
 
@@ -711,7 +748,13 @@ impl SidecarManager {
             return Err("Thiếu mã tác vụ cần huỷ".to_string());
         }
         let target_id = format!("ui_{target}");
+        self.cancel_request_id(&target_id, "Đã huỷ theo yêu cầu.").await?;
+        info!("[Sidecar] Đã gửi lệnh huỷ cho '{target_id}'");
+        Ok(())
+    }
 
+    /// Gửi lệnh huỷ cho một request-id nội bộ và trả lời caller đang chờ (nếu còn).
+    async fn cancel_request_id(&self, target_id: &str, reply: &str) -> Result<(), String> {
         let (tx, pending) = {
             let lock = self.inner.lock().await;
             match lock.as_ref() {
@@ -735,11 +778,9 @@ impl SidecarManager {
 
         // 2. Giải phóng caller ngay. Python vẫn sẽ trả một response cho request này,
         //    lúc đó không còn ai trong `pending` nên nó bị bỏ qua — đúng như mong muốn.
-        if let Some(reply_tx) = pending.lock().await.remove(&target_id) {
-            let _ = reply_tx.send(Err("Đã huỷ theo yêu cầu.".to_string()));
+        if let Some(reply_tx) = pending.lock().await.remove(target_id) {
+            let _ = reply_tx.send(Err(reply.to_string()));
         }
-
-        info!("[Sidecar] Đã gửi lệnh huỷ cho '{target_id}'");
         Ok(())
     }
 
@@ -748,6 +789,8 @@ impl SidecarManager {
         let req_id = self.resolve_req_id(client_task_id).await;
         let mut payload = payload;
         payload["id"] = Value::String(req_id.clone());
+        let wait_for = Self::timeout_for(&payload);
+        payload["budget_sec"] = Value::from(wait_for.as_secs().saturating_sub(BUDGET_MARGIN_SECS).max(5));
 
         let line = serde_json::to_string(&payload).map_err(|e| format!("Serialize error: {e}"))?;
 
@@ -814,18 +857,23 @@ impl SidecarManager {
             "Sidecar worker không phản hồi — có thể đã bị crash".to_string()
         })?;
 
-        let wait_for = Self::timeout_for(&payload);
         match tokio::time::timeout(wait_for, reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("Sidecar reply channel đóng bất ngờ".to_string()),
             Err(_) => {
-                let lock = self.inner.lock().await;
-                if let Some(inner) = lock.as_ref() {
-                    let mut map = inner.pending.lock().await;
-                    map.remove(&req_id);
+                // Huỷ thật phía Python: nếu chỉ bỏ qua kết quả, yt-dlp/gallery-dl vẫn
+                // chạy và giữ một chỗ trong pool 4 luồng, các request sau phải xếp
+                // hàng rồi lần lượt cũng timeout theo.
+                if let Err(e) = self.cancel_request_id(&req_id, "Timeout").await {
+                    warn!("[Sidecar] Không huỷ được request quá hạn '{req_id}': {e}");
                 }
+                let hint = if payload.get("action").and_then(|v| v.as_str()) == Some("crawl") {
+                    " Hãy giảm số lượng cần quét rồi thử lại."
+                } else {
+                    ""
+                };
                 Err(format!(
-                    "Timeout: máy chủ bóc tách không phản hồi sau {} giây. Hãy giảm số lượng cần quét rồi thử lại.",
+                    "Timeout: máy chủ bóc tách không phản hồi sau {} giây.{hint}",
                     wait_for.as_secs()
                 ))
             }
@@ -917,19 +965,28 @@ mod tests {
         );
         assert_eq!(
             SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 0})),
-            Duration::from_secs(600)
+            Duration::from_secs(CRAWL_MAX_SECS)
         );
         assert_eq!(
             SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 150})),
-            Duration::from_secs(420)
+            Duration::from_secs(CRAWL_MAX_SECS)
         );
         assert_eq!(
-            SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 50})),
-            Duration::from_secs(240)
+            SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 100})),
+            Duration::from_secs(580)
+        );
+        assert_eq!(
+            SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 20})),
+            Duration::from_secs(260)
+        );
+        // "Khoảng" 500-520: chi phí theo range_end
+        assert_eq!(
+            SidecarManager::timeout_for(&json!({"action": "crawl", "limit": 21, "range_end": 520})),
+            Duration::from_secs(CRAWL_MAX_SECS)
         );
         assert_eq!(
             SidecarManager::timeout_for(&json!({"action": "extract"})),
-            Duration::from_secs(150)
+            Duration::from_secs(180)
         );
     }
 

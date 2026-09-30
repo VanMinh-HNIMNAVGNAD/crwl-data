@@ -27,7 +27,8 @@ import {
   askForDownloadDirectory,
   getAlwaysAskDownloadDir,
 } from '../services/api'
-import DownloadProgressCard from './DownloadProgressCard'
+import { DownloadTaskList } from './DownloadProgressCard'
+import { useDownloadTasks } from '../hooks/useDownloadTasks'
 
 /**
  * Loại bỏ ký tự không hợp lệ và nguy hiểm trên Linux, ngăn chặn path traversal.
@@ -110,10 +111,12 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     accelerate = false,
     embedMetadata = true,
     embedThumbnail = false,
+    useAria2c = false,
     onVideoContainerChange,
     onAccelerateChange,
     onEmbedMetadataChange,
     onEmbedThumbnailChange,
+    onUseAria2cChange,
   } = dlOptions
 
   const [mode, setMode] = useState('single') // 'single' | 'batch'
@@ -128,15 +131,21 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const [selectedBatchIds, setSelectedBatchIds] = useState({})
   const [streamFilter, setStreamFilter] = useState('all') // 'all' | 'full' | 'mute' | 'audio'
   const [selectedImages, setSelectedImages] = useState({})
-  const [downloadingId, setDownloadingId] = useState(null)
-  const [nativeProgress, setNativeProgress] = useState(null)
-  const [downloadTaskTitle, setDownloadTaskTitle] = useState('')
+  // Mỗi lượt tải một thẻ tiến trình riêng — tải song song không còn ghi đè nhau
+  const {
+    tasks: downloadTasks,
+    startTask,
+    updateTask,
+    dismissTask,
+    clearFinishedTasks,
+    markCancelled,
+    isCancelled,
+    isSourceBusy,
+  } = useDownloadTasks()
   const [userSelectedSubLang, setUserSelectedSubLang] = useState('')
   const selectedSubLang = userSelectedSubLang || singleMedia?.subtitles?.[0]?.lang || ''
-  const [isZipDownloading, setIsZipDownloading] = useState(false)
   const cancelRef = useRef(false)         // chặn xử lý kết quả sau khi đã hủy
   const activeExtractTaskRef = useRef(null) // task đang chạy, để huỷ thật ở backend
-  const currentDownloadTaskIdRef = useRef(null) // task download đang chạy, để huỷ và dọn dẹp tệp
   const [isCancelling, setIsCancelling] = useState(false)
 
   // Trimmer tool state — chỉ có nghĩa với tải đơn link
@@ -146,8 +155,10 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
   // Advanced options UI state
   const [isOptionsOpen, setIsOptionsOpen] = useState(false)
-  // embedSubs chỉ dùng cho tải đơn (phụ đề gắn kèm với 1 video cụ thể)
+  // embedSubs / SponsorBlock / tách chương chỉ dùng cho tải đơn (gắn với 1 video cụ thể)
   const [embedSubs, setEmbedSubs] = useState(false)
+  const [sponsorBlock, setSponsorBlock] = useState(false)
+  const [splitChapters, setSplitChapters] = useState(false)
 
   // concurrentFragments: tối ưu CPU — accelerate=false→1 (máy yếu), true→4 (mạng tốt)
   const concurrentFragments = accelerate ? 4 : 1
@@ -361,14 +372,29 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     onShowToast?.('Đã hủy giải mã.')
   }
 
-  // Hủy tải xuống hiện tại và xoá sạch tệp dở dang
-  const handleCancelDownload = async () => {
-    const taskId = currentDownloadTaskIdRef.current
+  // Chế độ "Hỏi trước khi tải": undefined = dùng thư mục mặc định, null = người dùng bỏ chọn
+  const pickTargetDir = async (cancelMsg) => {
+    if (!getAlwaysAskDownloadDir()) return undefined
+    try {
+      const dir = await askForDownloadDirectory()
+      if (!dir) {
+        onShowToast?.(cancelMsg)
+        return null
+      }
+      return dir
+    } catch (err) {
+      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi chọn thư mục lưu')
+      return null
+    }
+  }
+
+  // Hủy một tác vụ tải và xoá sạch tệp dở dang của nó
+  const handleCancelDownload = async (taskId) => {
     if (!taskId) return
+    markCancelled(taskId)
     try {
       await cancelDownload(taskId)
-      setNativeProgress({
-        id: taskId,
+      updateTask(taskId, {
         percent: 0,
         speed: '',
         eta: '',
@@ -379,12 +405,40 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       onShowToast?.('Đã hủy tải và dọn dẹp tệp dở dang')
     } catch (err) {
       console.error('Cancel download error:', err)
-    } finally {
-      currentDownloadTaskIdRef.current = null
-      setDownloadingId(null)
-      setIsZipDownloading(false)
     }
   }
+
+  const errorText = (err, fallback) => (typeof err === 'string' ? err : err?.message || fallback)
+  const isCancelError = (taskId, msg) =>
+    isCancelled(taskId) || msg.includes('cancelled') || msg.includes('hủy') || msg.includes('huỷ') || msg.includes('abort')
+
+  // Kết thúc một tác vụ bằng lỗi — phân biệt "đã huỷ" với lỗi thật
+  const reportTaskError = (taskId, err, fallback) => {
+    const errMsg = errorText(err, fallback)
+    if (isCancelError(taskId, errMsg)) {
+      updateTask(taskId, {
+        percent: 0,
+        speed: '',
+        eta: '',
+        status: 'cancelled',
+        phase: 'Đã hủy tải xuống',
+        message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
+      })
+      return
+    }
+    updateTask(taskId, (prev) => ({
+      ...(prev || {}),
+      speed: '',
+      eta: '',
+      status: 'error',
+      phase: 'Tải thất bại',
+      message: errMsg,
+    }))
+    onShowToast?.(errMsg)
+  }
+
+  const streamSourceKey = (media, stream) =>
+    `stream:${media?.id || media?.originalUrl || ''}:${stream?.formatId || stream?.quality || 'stream'}`
 
   // Tải stream video/audio đơn
   const handleDownloadStream = async (stream, media = singleMedia) => {
@@ -393,55 +447,49 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       onShowToast?.('Liên kết này không có nguồn tải hợp lệ để tải về.')
       return
     }
-    const streamId = stream.formatId || stream.quality || 'stream'
-    setDownloadingId(streamId)
 
-    let targetDir = undefined
-    if (getAlwaysAskDownloadDir()) {
-      try {
-        targetDir = await askForDownloadDirectory()
-        if (!targetDir) {
-          onShowToast?.('Đã hủy tải do chưa chọn thư mục lưu')
-          setDownloadingId(null)
-          return
-        }
-      } catch (err) {
-        console.warn('Lỗi chọn thư mục:', err)
-      }
-    }
+    const targetDir = await pickTargetDir('Đã hủy tải do chưa chọn thư mục lưu')
+    if (targetDir === null) return
 
     const taskId = createTaskId()
-    currentDownloadTaskIdRef.current = taskId
-    setDownloadTaskTitle(media.title || stream.quality || 'Video')
-    setNativeProgress({
-      id: taskId,
-      percent: 0,
-      speed: '',
-      eta: '',
-      status: 'preparing',
-      phase: 'Đang chuẩn bị tải...',
+    startTask(taskId, {
+      title: media.title || stream.quality || 'Video',
+      sourceKey: streamSourceKey(media, stream),
+      progress: { percent: 0, speed: '', eta: '', status: 'preparing', phase: 'Đang chuẩn bị tải...' },
     })
 
     let unlisten = null
     try {
       const isAudioOnly = stream.streamType === 'audio'
       const isMute = stream.streamType === 'mute'
+      // Cắt đoạn / SponsorBlock / tách chương chỉ áp dụng cho kết quả tải đơn đang mở
+      const isSingle = media === singleMedia
       onShowToast?.(`Đang tải: ${stream.quality || 'tệp'}`)
 
       try {
         // Chỉ nhận sự kiện của đúng tác vụ này
-        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+        unlisten = await onDownloadProgress((payload) => updateTask(taskId, payload), taskId)
       } catch (e) {
         console.warn('Cannot attach progress listener:', e)
       }
 
       // Với các nền tảng mạng xã hội có extractor chuẩn, luôn dùng URL bài viết gốc + formatId
       // để yt-dlp sử dụng đầy đủ cookies, referer và session đăng nhập, tránh lỗi 403 Forbidden.
+      // Ngoại lệ: stream do engine KHÁC yt-dlp tìm ra (Story, gallery-dl, sniffer, web scraper)
+      // — yt-dlp đã không đọc được trang gốc (vd. không hỗ trợ Facebook Story) nên phải tải
+      // thẳng URL tệp của stream.
+      const fid = stream.formatId || ''
+      const isNonYtdlpStream =
+        media.isStory ||
+        fid === 'original_video' ||
+        fid.startsWith('story_video_') ||
+        fid.startsWith('sniff_') ||
+        fid.startsWith('web_video_')
       const isDirectStreamOnly =
         !media.originalUrl ||
         media.platform === 'movie' ||
         media.platform === 'generic' ||
-        stream.formatId?.startsWith('web_video_') ||
+        isNonYtdlpStream ||
         Boolean(stream.url && (stream.url.includes('.m3u8') || stream.url.includes('.mpd')))
 
       const downloadUrl = isDirectStreamOnly && stream.url ? stream.url : (media.originalUrl || stream.url)
@@ -453,13 +501,16 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         isAudio: isAudioOnly,
         isMute: isMute,
         referer: media.originalUrl || undefined,
-        startTime: trimStart || undefined,
-        endTime: trimEnd || undefined,
+        startTime: (isSingle && trimStart) || undefined,
+        endTime: (isSingle && trimEnd) || undefined,
         title: media.title,
         destDir: targetDir,
-        embedSubs: embedSubs,
+        embedSubs: isSingle && embedSubs,
         embedMetadata: embedMetadata,
         embedThumbnail: embedThumbnail,
+        sponsorBlock: isSingle && sponsorBlock,
+        splitChapters: isSingle && splitChapters && !isAudioOnly,
+        useAria2c,
         concurrentFragments,
         // Container video không thể áp dụng cho stream audio/MP3.
         videoFormat: !isAudioOnly && videoContainer !== 'auto' ? videoContainer : undefined,
@@ -468,8 +519,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       })
 
       if (res?.success) {
-        setNativeProgress({
-          id: taskId,
+        updateTask(taskId, {
           percent: 100,
           speed: '',
           eta: '',
@@ -481,54 +531,19 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         onShowToast?.(`Đã tải xong: ${res.file_path || res.file_name || 'tệp'}`)
       }
     } catch (err) {
-      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải stream'
-      if (errMsg.includes('cancelled') || errMsg.includes('hủy') || errMsg.includes('abort')) {
-        setNativeProgress({
-          id: taskId,
-          percent: 0,
-          speed: '',
-          eta: '',
-          status: 'cancelled',
-          phase: 'Đã hủy tải xuống',
-          message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
-        })
-      } else {
-        setNativeProgress((prev) => {
-          if (prev?.status === 'cancelled') return prev
-          return {
-            id: taskId,
-            percent: 0,
-            speed: '',
-            eta: '',
-            status: 'error',
-            phase: 'Tải thất bại',
-            message: errMsg,
-          }
-        })
-        onShowToast?.(errMsg)
-      }
+      reportTaskError(taskId, err, 'Lỗi khi tải stream')
     } finally {
       // Gỡ listener trong mọi trường hợp — trước đây khi tải lỗi listener bị rò rỉ,
       // tích lũy dần và làm thanh tiến trình nhảy loạn ở các lần tải sau.
       if (typeof unlisten === 'function') unlisten()
-      if (currentDownloadTaskIdRef.current === taskId) {
-        currentDownloadTaskIdRef.current = null
-      }
-      setDownloadingId(null)
     }
   }
 
   // Tải thumbnail
   const handleDownloadThumbnail = async () => {
     if (!singleMedia) return
-    let targetDir
-    if (getAlwaysAskDownloadDir()) {
-      targetDir = await askForDownloadDirectory()
-      if (!targetDir) {
-        onShowToast?.('Đã hủy lưu thumbnail do chưa chọn thư mục')
-        return
-      }
-    }
+    const targetDir = await pickTargetDir('Đã hủy lưu thumbnail do chưa chọn thư mục')
+    if (targetDir === null) return
     try {
       onShowToast?.('Đang tải ảnh thumbnail...')
       const res = await downloadThumbnail({
@@ -540,21 +555,15 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         onShowToast?.(`Đã lưu thumbnail: ${res.file_name}`)
       }
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải thumbnail')
+      onShowToast?.(errorText(err, 'Lỗi khi tải thumbnail'))
     }
   }
 
   // Tải phụ đề
   const handleDownloadSubtitle = async (sub) => {
     if (!singleMedia) return
-    let targetDir
-    if (getAlwaysAskDownloadDir()) {
-      targetDir = await askForDownloadDirectory()
-      if (!targetDir) {
-        onShowToast?.('Đã hủy lưu phụ đề do chưa chọn thư mục')
-        return
-      }
-    }
+    const targetDir = await pickTargetDir('Đã hủy lưu phụ đề do chưa chọn thư mục')
+    if (targetDir === null) return
     try {
       onShowToast?.(`Đang tải phụ đề: ${sub.name || sub.lang}...`)
       const res = await downloadSubtitle({
@@ -568,42 +577,27 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         onShowToast?.(`Đã lưu phụ đề: ${res.file_name}`)
       }
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải phụ đề')
+      onShowToast?.(errorText(err, 'Lỗi khi tải phụ đề'))
     }
   }
 
   // Tải ảnh album đơn lẻ
   const handleDownloadImage = async (img) => {
-    let targetDir = undefined
-    if (getAlwaysAskDownloadDir()) {
-      try {
-        targetDir = await askForDownloadDirectory()
-        if (!targetDir) {
-          onShowToast?.('Đã hủy tải do chưa chọn thư mục lưu')
-          return
-        }
-      } catch (err) {
-        console.warn('Lỗi chọn thư mục:', err)
-      }
-    }
+    const targetDir = await pickTargetDir('Đã hủy tải do chưa chọn thư mục lưu')
+    if (targetDir === null) return
 
     const kind = img.type === 'video' ? 'video' : 'ảnh'
     const taskId = createTaskId()
-    currentDownloadTaskIdRef.current = taskId
-    setDownloadTaskTitle(img.title || (img.type === 'video' ? 'Video' : 'Ảnh'))
-    setNativeProgress({
-      id: taskId,
-      percent: 0,
-      speed: '',
-      eta: '',
-      status: 'downloading',
-      phase: `Đang tải ${kind}...`,
+    startTask(taskId, {
+      title: img.title || (img.type === 'video' ? 'Video' : 'Ảnh'),
+      sourceKey: `image:${img.id}`,
+      progress: { percent: 0, speed: '', eta: '', status: 'downloading', phase: `Đang tải ${kind}...`, isIndeterminate: true },
     })
 
     let unlisten = null
     try {
       try {
-        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+        unlisten = await onDownloadProgress((payload) => updateTask(taskId, payload), taskId)
       } catch (e) {
         console.warn('Cannot attach progress listener:', e)
       }
@@ -620,8 +614,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         taskId,
       })
       if (res?.file_name) {
-        setNativeProgress({
-          id: taskId,
+        updateTask(taskId, {
           percent: 100,
           speed: '',
           eta: '',
@@ -633,37 +626,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         onShowToast?.(`Đã lưu: ${res.file_name}`)
       }
     } catch (err) {
-      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải ảnh'
-      if (errMsg.includes('cancelled') || errMsg.includes('hủy') || errMsg.includes('abort')) {
-        setNativeProgress({
-          id: taskId,
-          percent: 0,
-          speed: '',
-          eta: '',
-          status: 'cancelled',
-          phase: 'Đã hủy tải xuống',
-          message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
-        })
-      } else {
-        setNativeProgress((prev) => {
-          if (prev?.status === 'cancelled') return prev
-          return {
-            id: taskId,
-            percent: 0,
-            speed: '',
-            eta: '',
-            status: 'error',
-            phase: 'Tải thất bại',
-            message: errMsg,
-          }
-        })
-        onShowToast?.(errMsg)
-      }
+      reportTaskError(taskId, err, 'Lỗi khi tải ảnh')
     } finally {
       if (typeof unlisten === 'function') unlisten()
-      if (currentDownloadTaskIdRef.current === taskId) {
-        currentDownloadTaskIdRef.current = null
-      }
     }
   }
 
@@ -687,6 +652,8 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     () => Object.values(selectedImages).filter(Boolean).length,
     [selectedImages]
   )
+  const isAlbumBusy = isSourceBusy('album')
+  const isBatchZipBusy = isSourceBusy('batch-zip')
 
   const handleToggleSelectAllImages = () => {
     if (selectedImageCount === albumImages.length) {
@@ -722,36 +689,26 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       }
     }
 
-    let targetDir = undefined
-    if (getAlwaysAskDownloadDir()) {
-      try {
-        targetDir = await askForDownloadDirectory()
-        if (!targetDir) {
-          onShowToast?.('Đã hủy do chưa chọn thư mục lưu')
-          return
-        }
-      } catch (err) {
-        console.warn('Lỗi chọn thư mục:', err)
-      }
-    }
+    const targetDir = await pickTargetDir('Đã hủy do chưa chọn thư mục lưu')
+    if (targetDir === null) return
 
     const taskId = createTaskId()
-    currentDownloadTaskIdRef.current = taskId
-    setIsZipDownloading(true)
-    setDownloadTaskTitle(`${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} ảnh`)
-    setNativeProgress({
-      id: taskId,
-      percent: 0,
-      speed: '',
-      eta: '',
-      status: 'preparing',
-      phase: `Chuẩn bị tải ${itemsToDownload.length} ảnh...`,
+    startTask(taskId, {
+      title: `${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} tệp`,
+      sourceKey: 'album',
+      progress: {
+        percent: 0,
+        speed: '',
+        eta: '',
+        status: 'preparing',
+        phase: `Chuẩn bị tải ${itemsToDownload.length} tệp...`,
+      },
     })
 
     let unlisten = null
     try {
       try {
-        unlisten = await onDownloadProgress((payload) => setNativeProgress(payload), taskId)
+        unlisten = await onDownloadProgress((payload) => updateTask(taskId, payload), taskId)
       } catch (e) {
         console.warn('Cannot attach progress listener:', e)
       }
@@ -773,8 +730,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       })
       if (res && res.success === false) {
         // Tải xong nhưng nén ZIP hỏng — báo đúng thay vì "Hoàn tất".
-        setNativeProgress({
-          id: taskId,
+        updateTask(taskId, {
           percent: 100,
           speed: '',
           eta: '',
@@ -787,8 +743,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         return
       }
 
-      setNativeProgress({
-        id: taskId,
+      updateTask(taskId, {
         percent: 100,
         speed: '',
         eta: '',
@@ -796,41 +751,13 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         phase: 'Hoàn tất',
         filePath: res?.file_path,
         fileName: res?.file_name,
+        message: res?.message,
       })
-      onShowToast?.(res?.message || (res?.file_path ? `Đã lưu tại: ${res.file_path}` : `Đã tải xong ${itemsToDownload.length} ảnh!`))
+      onShowToast?.(res?.message || (res?.file_path ? `Đã lưu tại: ${res.file_path}` : `Đã tải xong ${itemsToDownload.length} tệp!`))
     } catch (err) {
-      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải album'
-      if (errMsg.includes('cancelled') || errMsg.includes('hủy') || errMsg.includes('abort')) {
-        setNativeProgress({
-          id: taskId,
-          percent: 0,
-          speed: '',
-          eta: '',
-          status: 'cancelled',
-          phase: 'Đã hủy tải xuống',
-          message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
-        })
-      } else {
-        setNativeProgress((prev) => {
-          if (prev?.status === 'cancelled') return prev
-          return {
-            id: taskId,
-            percent: 0,
-            speed: '',
-            eta: '',
-            status: 'error',
-            phase: 'Tải thất bại',
-            message: errMsg,
-          }
-        })
-        onShowToast?.(errMsg)
-      }
+      reportTaskError(taskId, err, 'Lỗi khi tải album')
     } finally {
       if (typeof unlisten === 'function') unlisten()
-      if (currentDownloadTaskIdRef.current === taskId) {
-        currentDownloadTaskIdRef.current = null
-      }
-      setIsZipDownloading(false)
     }
   }
 
@@ -866,32 +793,26 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     if (promptResult === null) return
     const albumName = promptResult.trim() || 'Batch_Media'
 
-    let targetDir = undefined
-    if (getAlwaysAskDownloadDir()) {
-      try {
-        targetDir = await askForDownloadDirectory()
-        if (!targetDir) {
-          onShowToast?.('Đã hủy do chưa chọn thư mục lưu')
-          return
-        }
-      } catch (err) {
-        console.warn('Lỗi chọn thư mục:', err)
-      }
-    }
+    const targetDir = await pickTargetDir('Đã hủy do chưa chọn thư mục lưu')
+    if (targetDir === null) return
 
     const taskId = createTaskId()
-    currentDownloadTaskIdRef.current = taskId
-    setIsZipDownloading(true)
-    setDownloadTaskTitle(`Nén ZIP: ${itemsToDownload.length} mục`)
-    setNativeProgress({
-      id: taskId,
-      percent: 0,
-      speed: '',
-      eta: '',
-      status: 'preparing',
-      phase: `Chuẩn bị nén ${itemsToDownload.length} mục...`,
+    startTask(taskId, {
+      title: `Nén ZIP: ${itemsToDownload.length} mục`,
+      sourceKey: 'batch-zip',
+      progress: {
+        percent: 0,
+        speed: '',
+        eta: '',
+        status: 'preparing',
+        phase: `Chuẩn bị nén ${itemsToDownload.length} mục...`,
+      },
     })
 
+    // Một mục lỗi (link hết hạn, video bị chặn...) không được làm hỏng cả gói ZIP:
+    // ghi lại rồi tải tiếp, cuối cùng nén những gì đã tải được.
+    const failures = []
+    let failedCount = 0
     let unlisten = null
     try {
       // Tạo thư mục trước. Video phải đi qua yt-dlp với URL gốc vì stream URL
@@ -936,30 +857,40 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       let completed = 0
 
       if (imageItems.length > 0) {
-        // Bước ảnh "completed" chưa phải cả lượt ZIP xong
+        // Bước ảnh "completed"/"error" chưa phải kết cục của cả lượt ZIP
         unlisten = await onDownloadProgress((payload) => {
-          setNativeProgress(
-            payload?.status === 'completed'
-              ? { ...payload, status: 'processing', filePath: undefined }
-              : payload
-          )
+          const stepDone = payload?.status === 'completed' || payload?.status === 'error'
+          updateTask(taskId, stepDone ? { ...payload, status: 'processing', filePath: undefined } : payload)
         }, taskId)
-        const imageRes = await downloadAlbumBatch({
-          items: generateBatchMediaFilenames(imageItems, null),
-          albumName,
-          destDir: targetDir,
-          albumDir: albumFolder,
-          asZip: false,
-          taskId,
-          platform: itemsToDownload[0]?.platform,
-        })
-        if (imageRes?.success === false) throw new Error(imageRes.message || 'Không tải được ảnh')
-        unlisten()
-        unlisten = null
+        try {
+          const imageRes = await downloadAlbumBatch({
+            items: generateBatchMediaFilenames(imageItems, null),
+            albumName,
+            destDir: targetDir,
+            albumDir: albumFolder,
+            asZip: false,
+            taskId,
+            platform: itemsToDownload[0]?.platform,
+          })
+          const failedImages = Number(imageRes?.message?.match(/(\d+) tệp thất bại/)?.[1] || 0)
+          if (failedImages > 0) {
+            failedCount += failedImages
+            failures.push(imageRes.message)
+          }
+        } catch (err) {
+          const msg = errorText(err, 'Không tải được ảnh')
+          if (isCancelError(taskId, msg)) throw err
+          failedCount += imageItems.length
+          failures.push(msg)
+        } finally {
+          unlisten()
+          unlisten = null
+        }
         completed = imageItems.length
       }
 
       for (let index = 0; index < videoItems.length; index++) {
+        if (isCancelled(taskId)) return
         const { media, url: videoUrl, title: videoTitle } = videoItems[index]
         const videoTaskId = `${taskId}_video_${index}`
         let videoUnlisten = null
@@ -969,9 +900,8 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             // một video làm thẻ báo xong (ẩn nút Huỷ) khi các video sau vẫn đang tải.
             const videoPercent = Math.min(100, Math.max(0, Number(payload?.percent) || 0))
             const finishedOne = payload?.status === 'completed' || payload?.status === 'error'
-            setNativeProgress({
+            updateTask(taskId, {
               ...payload,
-              id: taskId,
               percent: ((completed + videoPercent / 100) / totalUnits) * 90,
               status: finishedOne ? 'downloading' : payload?.status,
               filePath: undefined,
@@ -986,6 +916,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             destDir: albumFolder,
             embedMetadata,
             embedThumbnail,
+            useAria2c,
             concurrentFragments,
             videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
             taskId: videoTaskId,
@@ -994,43 +925,55 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
           if (!videoRes?.success) {
             throw new Error(videoRes?.message || `Không tải được video thứ ${index + 1}`)
           }
+        } catch (err) {
+          const msg = errorText(err, `Không tải được video thứ ${index + 1}`)
+          if (isCancelError(taskId, msg)) throw err
+          failedCount++
+          failures.push(`${videoTitle || `Video ${index + 1}`}: ${msg}`)
         } finally {
           if (typeof videoUnlisten === 'function') videoUnlisten()
           completed++
-          setNativeProgress((prev) => ({
+          updateTask(taskId, (prev) => ({
             ...(prev || {}),
-            id: taskId,
             percent: Math.round((completed / totalUnits) * 90),
             status: 'downloading',
-            phase: `Đã tải ${completed}/${totalUnits} tệp`,
+            phase: `Đã xử lý ${completed}/${totalUnits} tệp`,
           }))
         }
       }
 
-      if (typeof unlisten === 'function') {
-        unlisten()
-        unlisten = null
-      }
-      setNativeProgress({
-        id: taskId,
+      if (isCancelled(taskId)) return
+      updateTask(taskId, {
         percent: 92,
         speed: '',
         eta: '',
         status: 'processing',
         phase: 'Đang nén các tệp đã tải...',
       })
-      const res = await downloadAlbumBatch({
-        items: [],
-        albumName,
-        destDir: targetDir,
-        albumDir: albumFolder,
-        asZip: true,
-        taskId,
-        platform: itemsToDownload[0]?.platform,
-      })
+      let res
+      try {
+        res = await downloadAlbumBatch({
+          items: [],
+          albumName,
+          destDir: targetDir,
+          albumDir: albumFolder,
+          asZip: true,
+          taskId,
+          platform: itemsToDownload[0]?.platform,
+        })
+      } catch (err) {
+        // Không mục nào tải được: báo nguyên nhân thật của mục đầu tiên
+        if (failures.length > 0 && !isCancelError(taskId, errorText(err, ''))) {
+          throw new Error(`Không tải được mục nào để nén ZIP. ${failures[0]}`, { cause: err })
+        }
+        throw err
+      }
       if (res?.success === false) throw new Error(res.message || 'Nén ZIP thất bại')
-      setNativeProgress({
-        id: taskId,
+
+      const summary = failedCount > 0
+        ? `Đã nén ZIP, ${failedCount} tệp lỗi — ${failures[0]}`
+        : res?.message
+      updateTask(taskId, {
         percent: 100,
         speed: '',
         eta: '',
@@ -1038,34 +981,13 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         phase: 'Hoàn tất',
         filePath: res?.file_path,
         fileName: res?.file_name,
+        message: summary,
       })
-      onShowToast?.(res?.message || `Đã lưu ZIP: ${res?.file_path || res?.file_name || 'Batch_Media.zip'}`)
+      onShowToast?.(summary || `Đã lưu ZIP: ${res?.file_path || res?.file_name || 'Batch_Media.zip'}`)
     } catch (err) {
-      const errMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi tải ZIP'
-      if (errMsg.includes('cancelled') || errMsg.includes('hủy') || errMsg.includes('abort')) {
-        setNativeProgress({
-          id: taskId,
-          percent: 0,
-          speed: '',
-          eta: '',
-          status: 'cancelled',
-          phase: 'Đã hủy tải ZIP',
-          message: 'Đã hủy tải xuống và dọn dẹp tệp tạm',
-        })
-      } else {
-        setNativeProgress((prev) => ({
-          ...(prev || {}),
-          id: taskId,
-          status: 'error',
-          phase: 'Tải ZIP thất bại',
-          message: errMsg,
-        }))
-        onShowToast?.(errMsg)
-      }
+      reportTaskError(taskId, err, 'Lỗi khi tải ZIP')
     } finally {
       if (typeof unlisten === 'function') unlisten()
-      if (currentDownloadTaskIdRef.current === taskId) currentDownloadTaskIdRef.current = null
-      setIsZipDownloading(false)
     }
   }
 
@@ -1085,10 +1007,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     setSelectedBatchIds({})
     setAsyncResolved(null)
     setSelectedImages({})
-    setNativeProgress(null)
-    setDownloadTaskTitle('')
-    setDownloadingId(null)
-    setIsZipDownloading(false)
+    clearFinishedTasks()
     setIsTrimmerOpen(false)
   }
 
@@ -1097,9 +1016,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     setBatchMedias([])
     setSelectedBatchIds({})
     setSelectedImages({})
-    setNativeProgress(null)
-    setDownloadingId(null)
-    setIsZipDownloading(false)
+    clearFinishedTasks()
   }
 
   const handleCopy = (text) => {
@@ -1149,8 +1066,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                     setSingleMedia(null)
                     setBatchMedias([])
                     setSelectedImages({})
-                    setNativeProgress(null)
-                    setDownloadTaskTitle('')
+                    clearFinishedTasks()
                   }
                 }}
                 disabled={isLoading}
@@ -1239,7 +1155,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   if (!val.trim()) {
                     setBatchMedias([])
                     setSelectedImages({})
-                    setNativeProgress(null)
+                    clearFinishedTasks()
                   }
                 }}
                 disabled={isLoading}
@@ -1320,6 +1236,14 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   />
                   <span>Nhúng Thumbnail</span>
                 </label>
+                <label className="checkbox-opt-label" title="Tải bằng aria2c (16 kết nối) — cần cài aria2c">
+                  <input
+                    type="checkbox"
+                    checked={useAria2c}
+                    onChange={(e) => onUseAria2cChange?.(e.target.checked)}
+                  />
+                  <span>Tải bằng aria2c</span>
+                </label>
               </div>
             )}
 
@@ -1362,6 +1286,10 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
       {/* Khu vực hiển thị kết quả (Scrollable) */}
       <div className="pane-results-container">
+        {/* Tiến trình của mọi lượt tải trong khung này — nằm ngoài khối kết quả để
+            đóng kết quả không làm mất nút Huỷ của lượt tải đang chạy */}
+        <DownloadTaskList tasks={downloadTasks} onCancel={handleCancelDownload} onDismiss={dismissTask} />
+
         {/* Kết quả tải đơn */}
         {singleMedia && (
           <div className="result-content-wrap">
@@ -1406,7 +1334,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                 <p className="media-meta-line">
                   {singleMedia.platform?.toUpperCase()}
                   {singleMedia.author && ` • @${singleMedia.author}`}
-                  {singleMedia.viewCount && ` • ${singleMedia.viewCount}`}
+                  {singleMedia.views && ` • ${singleMedia.views}`}
                 </p>
 
                 {/* Các nút công cụ nhanh */}
@@ -1534,6 +1462,33 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   <span>Nhúng Phụ đề</span>
                 </label>
 
+                <label className="checkbox-opt-label" title="Tự động cắt bỏ đoạn quảng cáo tài trợ, intro... (chỉ video YouTube, dữ liệu từ SponsorBlock)">
+                  <input
+                    type="checkbox"
+                    checked={sponsorBlock}
+                    onChange={(e) => setSponsorBlock(e.target.checked)}
+                  />
+                  <span>Bỏ đoạn tài trợ (YouTube)</span>
+                </label>
+
+                <label className="checkbox-opt-label" title="Tách video thành nhiều tệp theo từng chương (nếu video có chương)">
+                  <input
+                    type="checkbox"
+                    checked={splitChapters}
+                    onChange={(e) => setSplitChapters(e.target.checked)}
+                  />
+                  <span>Tách theo chương</span>
+                </label>
+
+                <label className="checkbox-opt-label" title="Tải bằng aria2c (16 kết nối) — cần cài aria2c; nếu chưa cài sẽ tự dùng bộ tải mặc định">
+                  <input
+                    type="checkbox"
+                    checked={useAria2c}
+                    onChange={(e) => onUseAria2cChange?.(e.target.checked)}
+                  />
+                  <span>Tải bằng aria2c</span>
+                </label>
+
                 <div className="format-container-picker">
                   <span className="picker-label">Định dạng file:</span>
                   <select
@@ -1551,16 +1506,6 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   <span className="tools-setting-hint">Chỉ áp dụng khi tải video; stream âm thanh vẫn là audio.</span>
                 </div>
               </div>
-            )}
-
-            {/* Thẻ hiển thị Tiến trình tải xuống */}
-            {nativeProgress && (
-              <DownloadProgressCard
-                progress={nativeProgress}
-                title={downloadTaskTitle}
-                onCancel={handleCancelDownload}
-                onDismiss={() => setNativeProgress(null)}
-              />
             )}
 
             {/* Phụ đề có sẵn (Nếu nhiều hơn 2 thì dùng Dropdown chọn gọn gàng) */}
@@ -1636,7 +1581,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                           type="button"
                           className="minimal-small-btn btn-success"
                           onClick={() => handleDownloadAlbum(false)}
-                          disabled={isZipDownloading}
+                          disabled={isAlbumBusy}
                           title="Tải ảnh trực tiếp vào một thư mục riêng biệt"
                         >
                           <span>📁 Tải thư mục ({selectedImageCount})</span>
@@ -1645,7 +1590,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                           type="button"
                           className="minimal-small-btn btn-success"
                           onClick={() => handleDownloadAlbum(true)}
-                          disabled={isZipDownloading}
+                          disabled={isAlbumBusy}
                           title="Đóng gói toàn bộ ảnh đã chọn thành file nén ZIP"
                         >
                           <IconZip className="w-3 h-3" />
@@ -1767,7 +1712,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                     className={`stream-tab-btn ${streamFilter === 'audio' ? 'active' : ''}`}
                     onClick={() => setStreamFilter('audio')}
                   >
-                    Âm thanh (MP3)
+                    Âm thanh
                   </button>
                 </div>
 
@@ -1776,7 +1721,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   {filteredStreams.map((stream, sIdx) => {
                     const isAudio = stream.streamType === 'audio'
                     const streamId = stream.formatId || stream.quality || sIdx
-                    const isCurrentDownloading = downloadingId === streamId
+                    const isCurrentDownloading = isSourceBusy(streamSourceKey(singleMedia, stream))
 
                     return (
                       <div key={streamId} className="stream-row-item">
@@ -1791,9 +1736,10 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                               {stream.quality || (isAudio ? 'MP3 Audio' : 'Video Stream')}
                             </span>
                             <span className="stream-details-sub">
-                              {stream.ext?.toUpperCase() || (isAudio ? 'MP3' : 'MP4')}
-                              {stream.filesize ? ` • ${stream.filesize}` : ''}
-                              {stream.resolution ? ` • ${stream.resolution}` : ''}
+                              {stream.format || (isAudio ? 'Âm thanh' : 'Video')}
+                              {stream.size ? ` • ${stream.size}` : ''}
+                              {stream.fps ? ` • ${stream.fps}` : ''}
+                              {stream.bitrate ? ` • ${stream.bitrate}` : ''}
                             </span>
                           </div>
                         </div>
@@ -1843,7 +1789,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                     type="button"
                     className="minimal-small-btn btn-success"
                     onClick={handleDownloadBatchZip}
-                    disabled={isZipDownloading}
+                    disabled={isBatchZipBusy}
                     title="Đóng gói các mục đã chọn thành file ZIP"
                   >
                     <IconZip className="w-3 h-3" />
@@ -1863,15 +1809,6 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
               </div>
             </div>
 
-            {/* Tiến trình tải của chế độ nhiều link */}
-            {nativeProgress && (
-              <DownloadProgressCard
-                progress={nativeProgress}
-                title={downloadTaskTitle}
-                onCancel={handleCancelDownload}
-                onDismiss={() => setNativeProgress(null)}
-              />
-            )}
             <div className="batch-items-stack">
               {batchMedias.map((m, idx) => (
                 <div

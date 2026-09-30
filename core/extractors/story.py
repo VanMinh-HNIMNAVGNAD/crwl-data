@@ -13,6 +13,7 @@ API nội bộ của Facebook/Instagram, parse CDN URL và trả về MediaMetad
 cho Rust downloader tải ngay — không đi qua yt-dlp hay gallery-dl.
 """
 
+import html as html_lib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from .base import BaseExtractor
 from ..models import MediaMetadata, MediaImage, StreamFormat
 from ..cookies.browser_cookies import get_browser_cookies_txt
+from ..cancellation import cap_timeout, raise_if_cancelled
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -407,9 +409,12 @@ class StoryExtractor(BaseExtractor):
                     break
 
             if not target_item and items:
-                # Nếu không match ID cụ thể, có thể user paste link story
-                # mà không có ID chính xác → lấy item đầu tiên
-                target_item = items[0]
+                # Story được yêu cầu không còn trong danh sách (hết 24 giờ, hoặc là
+                # story ghim trong Highlight). KHÔNG lấy đại story đầu tiên — người
+                # dùng sẽ tải nhầm story khác mà không hề biết. Để bước sau tra
+                # thẳng theo ID (media/{id}/info).
+                self.warn(f"Không thấy story {story_id} trong {len(items)} story hiện có của tài khoản")
+                continue
 
             if target_item:
                 return self._parse_ig_story_item(
@@ -470,11 +475,15 @@ class StoryExtractor(BaseExtractor):
         video_versions = item.get("video_versions") or []
         video_urls = [v.get("url") for v in video_versions if v.get("url")]
 
-        # Ảnh
-        image_candidates = (
-            (item.get("image_versions2") or {}).get("candidates") or []
-        )
-        image_urls = [c.get("url") for c in image_candidates if c.get("url")]
+        # Ảnh: `candidates` là CÙNG MỘT ảnh ở nhiều độ phân giải, không phải nhiều
+        # ảnh. Trước đây mỗi candidate thành một ảnh riêng → story 1 ảnh hiện thành
+        # "album" gồm các bản sao nhỏ dần. Chỉ giữ bản lớn nhất.
+        image_candidates = sorted(
+            [c for c in ((item.get("image_versions2") or {}).get("candidates") or []) if c.get("url")],
+            key=lambda c: (c.get("width") or 0) * (c.get("height") or 0),
+            reverse=True,
+        )[:1]
+        image_urls = [c.get("url") for c in image_candidates]
 
         is_video = bool(video_urls) or item.get("media_type") == 2
 
@@ -564,13 +573,14 @@ class StoryExtractor(BaseExtractor):
         """GET request ưu tiên curl_cffi (TLS impersonation), fallback requests."""
         if cffi_requests:
             for target in self._IMPERSONATE_TARGETS:
+                raise_if_cancelled()
                 try:
                     resp = cffi_requests.get(
                         url,
                         impersonate=target,
                         cookies=cookies,
                         headers=headers,
-                        timeout=15,
+                        timeout=cap_timeout(15),
                         allow_redirects=True,
                     )
                     if resp.status_code == 200:
@@ -589,7 +599,7 @@ class StoryExtractor(BaseExtractor):
                     url,
                     cookies=cookies,
                     headers=headers,
-                    timeout=15,
+                    timeout=cap_timeout(15),
                     allow_redirects=True,
                 )
                 if resp.status_code == 200:
@@ -609,6 +619,7 @@ class StoryExtractor(BaseExtractor):
         """POST request ưu tiên curl_cffi, fallback requests."""
         if cffi_requests:
             for target in self._IMPERSONATE_TARGETS:
+                raise_if_cancelled()
                 try:
                     resp = cffi_requests.post(
                         url,
@@ -616,7 +627,7 @@ class StoryExtractor(BaseExtractor):
                         impersonate=target,
                         cookies=cookies,
                         headers=headers,
-                        timeout=15,
+                        timeout=cap_timeout(15),
                     )
                     if resp.status_code == 200:
                         return resp.text
@@ -633,7 +644,7 @@ class StoryExtractor(BaseExtractor):
                     data=data,
                     cookies=cookies,
                     headers=headers,
-                    timeout=15,
+                    timeout=cap_timeout(15),
                 )
                 if resp.status_code == 200:
                     return resp.text
@@ -713,18 +724,27 @@ class StoryExtractor(BaseExtractor):
         seen = set()
         for pattern in patterns:
             for match in re.finditer(pattern, html):
-                raw = match.group(1)
-                # Unescape JSON unicode
-                try:
-                    clean = raw.encode().decode("unicode_escape")
-                except Exception:
-                    clean = raw.replace("\\/", "/")
-
+                clean = StoryExtractor._decode_js_string(match.group(1))
                 if clean not in seen and clean.startswith("http"):
                     seen.add(clean)
                     urls.append(clean)
 
         return urls
+
+    @staticmethod
+    def _decode_js_string(raw: str) -> str:
+        """Giải mã một chuỗi lấy từ JSON/JS nhúng trong HTML.
+
+        Trước đây dùng `raw.encode().decode("unicode_escape")`: cách này để nguyên
+        `\\/` (URL ra dạng `https:\\/\\/scontent...`, tải về hỏng) và làm vỡ ký tự
+        UTF-8 (tiếng Việt thành mojibake). Giải mã đúng theo cú pháp chuỗi JSON,
+        rồi bỏ mã thực thể HTML (`&amp;`) trong thuộc tính thẻ <source>.
+        """
+        try:
+            decoded = json.loads(f'"{raw}"')
+        except (ValueError, TypeError):
+            decoded = raw.replace("\\/", "/")
+        return html_lib.unescape(decoded)
 
     @staticmethod
     def _extract_from_embedded_json(html: str) -> Tuple[List[str], List[str]]:
@@ -812,12 +832,14 @@ class StoryExtractor(BaseExtractor):
 
         if video_urls:
             for i, vurl in enumerate(video_urls):
-                # Ưu tiên HD trước
-                quality = "HD" if i == 0 else ("SD" if i == 1 else f"Variant {i + 1}")
+                # Các URL được quét từ HTML/JSON của trang theo thứ tự xuất hiện: không
+                # biết chắc URL nào là HD/SD, cũng không chắc chúng cùng một story (trang
+                # story có thể chứa story kế tiếp). Gắn nhãn đúng sự thật thay vì bịa HD/SD.
+                quality = "Nguồn chính" if i == 0 else f"Nguồn phụ {i}"
                 streams.append(
                     StreamFormat(
                         format_id=f"story_video_{i}",
-                        quality=f"{quality} — Video Story chất lượng cao",
+                        quality=f"{quality} — Video Story",
                         format="MP4",
                         size=None,
                         raw_size=None,

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -67,6 +66,9 @@ pub struct DownloadOptions {
     pub use_aria2c: bool,
     #[serde(alias = "clientIp")]
     pub client_ip: Option<String>,
+    /// Nền tảng do engine bóc tách nhận diện (youtube, tiktok...), để ghi lịch sử.
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,19 +151,40 @@ pub struct ActiveTaskState {
 }
 
 static DOWNLOAD_REGISTRY: OnceLock<AsyncMutex<HashMap<String, ActiveTaskState>>> = OnceLock::new();
-static CANCELLED_DOWNLOADS: OnceLock<AsyncMutex<HashSet<String>>> = OnceLock::new();
-static ALBUM_REGISTRY: OnceLock<AsyncMutex<HashMap<String, PathBuf>>> = OnceLock::new();
+/// task_id → thời điểm bấm Huỷ. Giữ thời điểm để dọn các cờ huỷ của tác vụ đã
+/// kết thúc từ trước (huỷ muộn) thay vì để chúng nằm trong bộ nhớ mãi mãi.
+static CANCELLED_DOWNLOADS: OnceLock<AsyncMutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+/// task_id → (thư mục album, thời điểm cấp phát)
+static ALBUM_REGISTRY: OnceLock<AsyncMutex<HashMap<String, (PathBuf, std::time::Instant)>>> = OnceLock::new();
+/// Thư mục người dùng đã chọn qua hộp thoại gốc của hệ điều hành trong phiên này.
+static APPROVED_DIRS: OnceLock<std::sync::Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// Cờ huỷ của tác vụ không bao giờ đăng ký (huỷ sau khi đã xong) được giữ tối đa chừng này.
+const CANCEL_FLAG_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Thư mục album được nhớ cho các bước nối tiếp (ảnh → video → nén) tối đa chừng này.
+const ALBUM_DIR_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 fn get_download_registry() -> &'static AsyncMutex<HashMap<String, ActiveTaskState>> {
     DOWNLOAD_REGISTRY.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
-fn get_cancelled_downloads() -> &'static AsyncMutex<HashSet<String>> {
-    CANCELLED_DOWNLOADS.get_or_init(|| AsyncMutex::new(HashSet::new()))
+fn get_cancelled_downloads() -> &'static AsyncMutex<HashMap<String, std::time::Instant>> {
+    CANCELLED_DOWNLOADS.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
-fn get_album_registry() -> &'static AsyncMutex<HashMap<String, PathBuf>> {
+fn get_album_registry() -> &'static AsyncMutex<HashMap<String, (PathBuf, std::time::Instant)>> {
     ALBUM_REGISTRY.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+fn get_approved_dirs() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    APPROVED_DIRS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// `task_id` có thuộc một tác vụ đã bị huỷ không (chính nó hoặc tác vụ con `<cha>_...`).
+fn is_cancelled_in(cancelled: &HashMap<String, std::time::Instant>, task_id: &str) -> bool {
+    cancelled
+        .keys()
+        .any(|parent| task_id == parent || task_id.starts_with(&format!("{parent}_")))
 }
 
 fn kill_process_tree(pid: u32) {
@@ -334,34 +357,71 @@ impl DownloaderService {
         if !canonical.is_dir() {
             return Err("Đường dẫn tải phải là một thư mục".to_string());
         }
-        if !canonical.starts_with(&configured_root) {
-            return Err("Thư mục tải phải nằm trong thư mục tải đã được cấu hình".to_string());
+        // Chỉ nhận thư mục tải đã cấu hình hoặc thư mục người dùng tự chọn qua hộp
+        // thoại của hệ điều hành. Trước đây chỉ nhận thư mục đã cấu hình, nên chọn
+        // ~/Videos ở nút 📁 hay ở chế độ "Hỏi trước khi tải" là mọi lượt tải đều lỗi.
+        let approved = get_approved_dirs()
+            .lock()
+            .map(|dirs| dirs.iter().any(|d| canonical.starts_with(d)))
+            .unwrap_or(false);
+        if !canonical.starts_with(&configured_root) && !approved {
+            return Err(
+                "Thư mục tải chưa được cho phép. Hãy chọn lại thư mục bằng nút 📁 rồi thử lại.".to_string(),
+            );
+        }
+        Ok(canonical)
+    }
+
+    /// Ghi nhận một thư mục người dùng vừa chọn qua hộp thoại gốc là nơi được phép tải về.
+    fn approve_dir(path: &Path) -> Result<PathBuf, String> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| format!("Không xác định được thư mục đã chọn: {e}"))?;
+        if !canonical.is_dir() {
+            return Err("Đường dẫn đã chọn không phải thư mục".to_string());
+        }
+        if let Ok(mut dirs) = get_approved_dirs().lock() {
+            dirs.insert(canonical.clone());
         }
         Ok(canonical)
     }
 
     async fn remember_album_dir(task_id: &str, path: PathBuf) {
-        get_album_registry().lock().await.insert(task_id.to_string(), path);
+        let mut reg = get_album_registry().lock().await;
+        reg.retain(|_, (_, at)| at.elapsed() < ALBUM_DIR_TTL);
+        reg.insert(task_id.to_string(), (path, std::time::Instant::now()));
     }
 
     async fn album_dir_for_task(task_id: &str) -> Option<PathBuf> {
-        get_album_registry().lock().await.get(task_id).cloned()
+        get_album_registry().lock().await.get(task_id).map(|(p, _)| p.clone())
     }
 
-    /// Mở hộp thoại chọn thư mục lưu (Native File Dialog)
-    pub async fn select_directory() -> Option<String> {
+    async fn forget_album_dir(task_id: &str) {
+        get_album_registry().lock().await.remove(task_id);
+    }
+
+    /// Mở hộp thoại chọn thư mục lưu (Native File Dialog).
+    ///
+    /// Thư mục được chọn luôn được phép dùng trong phiên hiện tại. `remember = true`
+    /// còn lưu nó thành thư mục tải mặc định trong settings.json để giữ qua các lần mở app.
+    pub async fn select_directory(remember: bool) -> Result<Option<String>, String> {
         let default_dir = Self::get_default_download_dir();
         let dialog = rfd::AsyncFileDialog::new()
             .set_title("Chọn thư mục lưu tệp tải về")
             .set_directory(&default_dir);
 
-        if let Some(folder) = dialog.pick_folder().await {
-            let path_str = folder.path().to_string_lossy().to_string();
-            info!("Người dùng đã chọn thư mục tải về: {path_str}");
-            Some(path_str)
-        } else {
-            None
+        let Some(folder) = dialog.pick_folder().await else {
+            return Ok(None);
+        };
+        let canonical = Self::approve_dir(folder.path())?;
+        let path_str = canonical.to_string_lossy().to_string();
+        info!("Người dùng đã chọn thư mục tải về: {path_str}");
+
+        if remember {
+            let mut settings = SettingsManager::load();
+            settings.download_dir = Some(path_str.clone());
+            SettingsManager::save(&settings)?;
         }
+        Ok(Some(path_str))
     }
 
     /// Mở thư mục tải về bằng File Manager Linux (Nautilus, Dolphin, Thunar, ...)
@@ -461,17 +521,22 @@ impl DownloaderService {
         None
     }
 
+    /// Nền tảng để ghi lịch sử: giá trị UI gửi lên, nếu không có thì đoán theo URL.
+    fn history_platform(explicit: Option<&str>, url: &str) -> String {
+        explicit
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && *p != "auto")
+            .map(str::to_string)
+            .or_else(|| Self::detect_platform_from_url(url).map(str::to_string))
+            .unwrap_or_else(|| "other".to_string())
+    }
+
     pub async fn register_task(
         task_id: &str,
         dest_dir: Option<PathBuf>,
         cancel_tx: tokio::sync::oneshot::Sender<()>,
     ) {
-        let already_cancelled = {
-            let cancelled = get_cancelled_downloads().lock().await;
-            cancelled.iter().any(|parent| {
-                task_id == parent || task_id.starts_with(&format!("{parent}_"))
-            })
-        };
+        let already_cancelled = is_cancelled_in(&*get_cancelled_downloads().lock().await, task_id);
         let mut reg = get_download_registry().lock().await;
         reg.insert(
             task_id.to_string(),
@@ -494,10 +559,7 @@ impl DownloaderService {
     }
 
     pub async fn is_download_cancelled(task_id: &str) -> bool {
-        let cancelled = get_cancelled_downloads().lock().await;
-        cancelled.iter().any(|parent| {
-            task_id == parent || task_id.starts_with(&format!("{parent}_"))
-        })
+        is_cancelled_in(&*get_cancelled_downloads().lock().await, task_id)
     }
 
     pub async fn register_pid(task_id: &str, pid: u32) {
@@ -539,7 +601,13 @@ impl DownloaderService {
 
     pub async fn cancel_download(task_id: &str) -> Result<bool, String> {
         info!("Yêu cầu hủy tác vụ tải xuống: {task_id}");
-        get_cancelled_downloads().lock().await.insert(task_id.to_string());
+        {
+            let mut cancelled = get_cancelled_downloads().lock().await;
+            // Cờ huỷ của tác vụ đã xong từ lâu (huỷ muộn) không bao giờ được
+            // unregister_task() gỡ đi — dọn theo tuổi để không rò rỉ mãi.
+            cancelled.retain(|_, at| at.elapsed() < CANCEL_FLAG_TTL);
+            cancelled.insert(task_id.to_string(), std::time::Instant::now());
+        }
         let prefix = format!("{task_id}_");
         let mut states: Vec<ActiveTaskState> = {
             let mut reg = get_download_registry().lock().await;
@@ -550,6 +618,28 @@ impl DownloaderService {
                 .collect();
             matching_keys.iter().filter_map(|k| reg.remove(k)).collect()
         };
+
+        // Chuỗi album nhiều bước (ảnh → video → nén ZIP) dùng chung một task_id nhưng
+        // giữa các bước thì thư mục album không thuộc tác vụ nào đang chạy. Huỷ lúc
+        // đó (vd. khi đang tải video con `<task>_vid_0`) phải dọn luôn thư mục này.
+        let album_dir = get_album_registry()
+            .lock()
+            .await
+            .remove(task_id)
+            .map(|(dir, _)| dir);
+        if let Some(dir) = album_dir {
+            match states.first_mut() {
+                Some(state) => state.known_dirs.push(dir),
+                None => states.push(ActiveTaskState {
+                    pids: Vec::new(),
+                    dest_dir: None,
+                    known_paths: Vec::new(),
+                    known_dirs: vec![dir],
+                    start_time: std::time::SystemTime::now(),
+                    cancel_tx: None,
+                }),
+            }
+        }
 
         if states.is_empty() {
             info!("Đánh dấu hủy [{task_id}] trong lúc tác vụ đang khởi tạo");
@@ -592,10 +682,13 @@ impl DownloaderService {
 
         // Giới hạn cả title và id ngay trong template: yt-dlp mở file trước khi
         // backend có cơ hội đổi tên sau đó, nên chỉ sanitize ở Rust là chưa đủ.
-        let output_template = dest_folder
-            .join("%(title).60s [%(id).50s].%(ext)s")
-            .to_string_lossy()
-            .to_string();
+        // Template TƯƠNG ĐỐI + `-P <thư mục tải>`: mọi loại tệp (video, ảnh bìa, phụ
+        // đề, tệp tách chương) đều nằm trong thư mục tải. Nếu dùng đường dẫn tuyệt
+        // đối trong `-o` thì template "chapter:" mặc định vẫn là tương đối và các tệp
+        // tách chương bị ghi ra thư mục làm việc hiện tại của ứng dụng.
+        let output_template = "%(title).60s [%(id).50s].%(ext)s";
+        let chapter_template =
+            "chapter:%(title).50s - %(section_number)03d %(section_title).40s [%(id).50s].%(ext)s";
 
         let mut cmd = Command::new(&ytdlp_path);
         #[cfg(windows)]
@@ -605,7 +698,9 @@ impl DownloaderService {
             cmd.creation_flags(0x08000000);
         }
         cmd.arg(&opts.url);
-        cmd.arg("-o").arg(&output_template);
+        cmd.arg("-P").arg(&dest_folder);
+        cmd.arg("-o").arg(output_template);
+        cmd.arg("-o").arg(chapter_template);
         cmd.arg("--no-playlist");
         cmd.arg("--trim-filenames").arg("140");
         cmd.arg("--newline");
@@ -670,11 +765,16 @@ impl DownloaderService {
             cmd.arg("--sponsorblock-remove").arg("default");
         }
 
-        // Proxy nếu được chỉ định
-        if let Some(ref proxy) = opts.proxy {
-            if !proxy.trim().is_empty() {
-                cmd.arg("--proxy").arg(proxy.trim());
-            }
+        // Proxy: tuỳ chọn riêng của lượt tải, nếu không có thì dùng proxy trong cấu hình
+        let proxy = opts
+            .proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .or_else(SettingsManager::proxy);
+        if let Some(ref proxy) = proxy {
+            cmd.arg("--proxy").arg(proxy);
         }
 
         if let Some(ref referer) = opts.referer {
@@ -684,36 +784,25 @@ impl DownloaderService {
         }
 
         // Tùy chọn định dạng Video hoặc Audio
-        if opts.is_audio {
+        let audio_fid = opts
+            .format_id
+            .as_deref()
+            .filter(|f| Self::is_audio_format_id(f));
+        if opts.is_audio || audio_fid.is_some() {
+            // Trước đây nhánh `is_audio` bỏ qua format_id nên UI chọn FLAC/WAV/OPUS...
+            // (gửi isAudio + formatId "flac_lossless") đều ra MP3. Nay định dạng lấy từ
+            // `audio_format` nếu có, nếu không thì suy ra từ format_id.
+            let (fmt, quality) = Self::audio_target(
+                opts.audio_format.as_deref(),
+                opts.audio_bitrate.as_deref(),
+                audio_fid,
+            );
             cmd.arg("-x");
-            let fmt = opts.audio_format.as_deref().unwrap_or("mp3");
-            let safe_fmt = if fmt == "opus" {
-                "opus"
-            } else if fmt == "ogg" || fmt == "vorbis" {
-                "vorbis"
-            } else if fmt == "flac" {
-                "flac"
-            } else if fmt == "wav" {
-                "wav"
-            } else if fmt == "m4a" || fmt == "aac" {
-                "m4a"
-            } else if fmt == "alac" {
-                "alac"
-            } else {
-                "mp3"
-            };
-            cmd.arg("--audio-format").arg(safe_fmt);
-            let quality = match opts.audio_bitrate.as_deref() {
-                Some("320") | Some("320k") | Some("320kbps") => "0",
-                Some("256") | Some("256k") | Some("256kbps") => "2",
-                Some("192") | Some("192k") | Some("192kbps") => "4",
-                Some("128") | Some("128k") | Some("128kbps") => "6",
-                _ => "0",
-            };
-            cmd.arg("--audio-quality").arg(quality);
+            cmd.arg("--audio-format").arg(fmt);
+            cmd.arg("--audio-quality").arg(&quality);
             cmd.arg("--embed-metadata");
             // yt-dlp báo ERROR (và cả lượt tải thất bại) khi nhúng ảnh bìa vào WAV.
-            if Self::container_supports_thumbnail(safe_fmt) {
+            if Self::container_supports_thumbnail(fmt) {
                 cmd.arg("--embed-thumbnail");
             }
         } else if opts.is_mute {
@@ -741,28 +830,6 @@ impl DownloaderService {
                     .arg("--sub-format")
                     .arg(sub_fmt)
                     .arg("--skip-download");
-            } else if Self::is_audio_format_id(fid) {
-                cmd.arg("-x");
-                let fmt = if fid.contains("flac") {
-                    "flac"
-                } else if fid.contains("opus") {
-                    "opus"
-                } else if fid.contains("ogg") {
-                    "vorbis"
-                } else if fid.contains("wav") {
-                    "wav"
-                } else if fid.contains("alac") {
-                    "alac"
-                } else if fid.contains("m4a") {
-                    "m4a"
-                } else {
-                    "mp3"
-                };
-                cmd.arg("--audio-format").arg(fmt);
-                cmd.arg("--embed-metadata");
-                if Self::container_supports_thumbnail(fmt) {
-                    cmd.arg("--embed-thumbnail");
-                }
             } else if fid == "best" {
                 cmd.arg("-f").arg("bestvideo+bestaudio/best");
             } else if fid.contains('+') || fid.contains('/') {
@@ -863,6 +930,7 @@ impl DownloaderService {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let history_platform = Self::history_platform(opts.platform.as_deref(), &opts.url);
 
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
         Self::register_task(&task_id, Some(dest_folder.clone()), cancel_tx).await;
@@ -1223,7 +1291,7 @@ impl DownloaderService {
                 &opts.device_id,
                 opts.title.as_deref().unwrap_or("Untitled"),
                 "cancelled_download",
-                "auto",
+                &history_platform,
                 None,
                 None,
                 "cancelled",
@@ -1278,7 +1346,7 @@ impl DownloaderService {
                 &opts.device_id,
                 opts.title.as_deref().unwrap_or("Untitled"),
                 "failed_download",
-                "auto",
+                &history_platform,
                 None,
                 None,
                 "failed",
@@ -1318,7 +1386,7 @@ impl DownloaderService {
             &opts.device_id,
             opts.title.as_deref().unwrap_or(&file_name),
             &file_name,
-            "auto",
+            &history_platform,
             file_size,
             None,
             "success",
@@ -1341,6 +1409,61 @@ impl DownloaderService {
         ["mp3", "m4a", "flac", "opus", "ogg", "wav", "alac"]
             .iter()
             .any(|p| fid.starts_with(p))
+    }
+
+    /// (--audio-format, --audio-quality) cho một lượt tách âm thanh.
+    ///
+    /// Ưu tiên giá trị UI gửi riêng, sau đó tới format_id kiểu "mp3_320k",
+    /// "flac_lossless", "m4a_aac"... do engine bóc tách trả về. `--audio-quality`
+    /// nhận thẳng bitrate ("320K") hoặc mức VBR ("0" = tốt nhất).
+    fn audio_target(
+        audio_format: Option<&str>,
+        audio_bitrate: Option<&str>,
+        format_id: Option<&str>,
+    ) -> (&'static str, String) {
+        let source = audio_format
+            .filter(|f| !f.trim().is_empty())
+            .or(format_id)
+            .unwrap_or("mp3")
+            .to_lowercase();
+        let fmt = if source.contains("flac") {
+            "flac"
+        } else if source.contains("opus") {
+            "opus"
+        } else if source.contains("ogg") || source.contains("vorbis") {
+            "vorbis"
+        } else if source.contains("wav") {
+            "wav"
+        } else if source.contains("alac") {
+            "alac"
+        } else if source.contains("m4a") || source.contains("aac") {
+            "m4a"
+        } else {
+            "mp3"
+        };
+
+        // "320", "320k", "320kbps" hoặc phần sau "_" của format_id ("mp3_320k" →
+        // 320). Không gom mọi chữ số: "mp3_320k" sẽ thành 3320.
+        let bitrate_digits = |raw: &str| -> Option<u32> {
+            let tail = raw.rsplit('_').next().unwrap_or(raw).trim();
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u32>().ok().filter(|kbps| (32..=512).contains(kbps))
+        };
+        let kbps = audio_bitrate
+            .and_then(bitrate_digits)
+            .or_else(|| format_id.and_then(bitrate_digits))
+            .or(match format_id {
+                Some(f) if f.starts_with("m4a") => Some(256),
+                Some(f) if f.starts_with("ogg") => Some(192),
+                _ => None,
+            });
+        let quality = match (fmt, kbps) {
+            // Định dạng lossless bỏ qua bitrate
+            ("flac" | "wav" | "alac", _) => "0".to_string(),
+            (_, Some(k)) => format!("{k}K"),
+            _ => "0".to_string(),
+        };
+        (fmt, quality)
     }
 
     /// Các container/định dạng yt-dlp nhúng được ảnh bìa (xem EmbedThumbnailPP).
@@ -1528,6 +1651,7 @@ impl DownloaderService {
         dest_dir: Option<&str>,
         device_id: &str,
         client_ip: Option<&str>,
+        platform: Option<&str>,
         task_id: Option<String>,
         db: Arc<Database>,
     ) -> Result<DownloadResult, String> {
@@ -1610,7 +1734,7 @@ impl DownloaderService {
             device_id,
             &clean_name,
             &clean_name,
-            "image",
+            &Self::history_platform(platform, url),
             file_size,
             None,
             "success",
@@ -1625,8 +1749,8 @@ impl DownloaderService {
         Ok(DownloadResult {
             success: true,
             file_path: Some(path_str),
+            message: format!("Đã tải xong {clean_name}"),
             file_name: Some(clean_name),
-            message: "Tải tệp ảnh thành công!".to_string(),
         })
     }
 
@@ -1668,9 +1792,14 @@ impl DownloaderService {
         device_id: &str,
         task_id: Option<String>,
         client_ip: Option<&str>,
+        platform: Option<&str>,
         db: Arc<Database>,
     ) -> Result<DownloadResult, String> {
         let base_dest = Self::canonical_download_dir(dest_dir)?;
+        let history_platform = Self::history_platform(
+            platform,
+            items.first().map(|i| i.url.as_str()).unwrap_or(""),
+        );
 
         let raw_title = album_name.unwrap_or("Album_Media");
         let clean_title = Self::sanitize_file_name(raw_title, "Album_Media");
@@ -1748,8 +1877,11 @@ impl DownloaderService {
             }
 
             if downloaded_files.is_empty() {
+                // Mọi mục của lượt ZIP đều lỗi: đừng để lại thư mục album rỗng.
+                let _ = std::fs::remove_dir(&target_dir);
+                Self::forget_album_dir(&task_id).await;
                 Self::unregister_task(&task_id).await;
-                return Err("Danh sách tệp cần tải đang trống".to_string());
+                return Err("Không có tệp nào tải được để nén ZIP".to_string());
             }
         } else {
             emit(0.0, "downloading", format!("Chuẩn bị tải {total} tệp..."), None);
@@ -1860,6 +1992,7 @@ impl DownloaderService {
                 for handle in handles {
                     let _ = handle.await;
                 }
+                Self::forget_album_dir(&task_id).await;
                 info!("Hủy album batch: Xoá sạch thư mục {:?}", target_dir);
                 if target_dir.exists() {
                     let _ = tokio::fs::remove_dir_all(&target_dir).await;
@@ -1948,6 +2081,9 @@ impl DownloaderService {
                 }
             };
 
+            // Lượt nén là bước cuối của chuỗi ảnh → video → ZIP: không cần nhớ thư mục nữa.
+            Self::forget_album_dir(&task_id).await;
+
             if zip_cancelled {
                 info!("Hủy nén ZIP album: Xoá tệp ZIP và thư mục {:?}", target_dir);
                 if zip_path.exists() {
@@ -1973,7 +2109,7 @@ impl DownloaderService {
                         device_id,
                         &format!("Album ZIP: {clean_title}"),
                         &zip_filename,
-                        "album",
+                        &history_platform,
                         zip_size,
                         None,
                         "success",
@@ -2012,7 +2148,7 @@ impl DownloaderService {
                 device_id,
                 &format!("Album: {clean_title}"),
                 &clean_title,
-                "album",
+                &history_platform,
                 None,
                 None,
                 "failed",
@@ -2049,7 +2185,7 @@ impl DownloaderService {
             device_id,
             &format!("Album: {clean_title}"),
             &clean_title,
-            "album",
+            &history_platform,
             None,
             None,
             "success",
@@ -2459,6 +2595,21 @@ impl DownloaderService {
             }
         }
 
+        // SVG là ảnh hợp lệ nhưng cũng là XML: nhận nếu server/đuôi tệp nói là SVG
+        // và nội dung đúng là một tài liệu <svg>, trước khi các bước chặn HTML/XML
+        // bên dưới coi nó là trang lỗi.
+        let dest_ext = dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if (mime == "image/svg+xml" || dest_ext == "svg")
+            && String::from_utf8_lossy(trimmed).to_lowercase().contains("<svg")
+            && !String::from_utf8_lossy(trimmed).to_lowercase().contains("<html")
+        {
+            return Ok(());
+        }
+
         // Kiểm tra HTML/XML tag ở đầu nội dung
         let trimmed_lower_slice = if trimmed.len() > 100 {
             &trimmed[..100]
@@ -2606,7 +2757,10 @@ impl DownloaderService {
         Self::curl_to_file_with_meta(url, referer, dest).await.0
     }
 
-    fn is_public_http_url(raw_url: &str) -> bool {
+    /// URL http(s) trỏ tới địa chỉ công khai (không phải localhost / mạng nội bộ).
+    /// DNS được phân giải bất đồng bộ: trước đây `to_socket_addrs()` chặn luồng
+    /// của tokio trong lúc chờ DNS, mỗi tệp của album chiếm một luồng runtime.
+    async fn is_public_http_url(raw_url: &str) -> bool {
         let parsed = match url::Url::parse(raw_url) {
             Ok(value) if matches!(value.scheme(), "http" | "https") => value,
             _ => return false,
@@ -2616,106 +2770,130 @@ impl DownloaderService {
             return true;
         }
         let host = match parsed.host_str() {
-            Some(value) if !value.eq_ignore_ascii_case("localhost") => value,
+            Some(value) if !value.eq_ignore_ascii_case("localhost") => value.to_string(),
             _ => return false,
         };
         let port = parsed.port_or_known_default().unwrap_or(443);
-        let addresses = match (host, port).to_socket_addrs() {
-            Ok(value) => value,
+        let addresses: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(value) => value.collect(),
             Err(_) => return false,
         };
-        addresses.into_iter().all(|address| {
-            let ip = address.ip();
-            !ip.is_loopback()
-                && !ip.is_unspecified()
-                && !ip.is_multicast()
-                && match ip {
-                    std::net::IpAddr::V4(value) => {
-                        !value.is_private() && !value.is_link_local() && !value.is_broadcast()
+        !addresses.is_empty()
+            && addresses.iter().all(|address| {
+                let ip = address.ip();
+                !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && match ip {
+                        std::net::IpAddr::V4(value) => {
+                            !value.is_private() && !value.is_link_local() && !value.is_broadcast()
+                        }
+                        std::net::IpAddr::V6(value) => !value.is_unique_local() && !value.is_unicast_link_local(),
                     }
-                    std::net::IpAddr::V6(value) => !value.is_unique_local() && !value.is_unicast_link_local(),
-                }
-        })
+            })
     }
 
     /// Tải 1 URL về đường dẫn bằng curl, trả về (kết_quả, Content-Type_nhận_được)
+    ///
+    /// Redirect được đi theo THỦ CÔNG, tối đa `MAX_REDIRECTS` bước, và mỗi bước đều
+    /// kiểm tra lại đích có phải địa chỉ công khai không. Trước đây dùng `-L` kèm
+    /// `--max-redirs 0` nên mọi URL có chuyển hướng (CDN TikTok, imgur, Reddit...)
+    /// đều thất bại với lỗi curl 47.
     pub(crate) async fn curl_to_file_with_meta(
         url: &str,
         referer: &str,
         dest: &Path,
     ) -> (bool, Option<String>) {
-        if !Self::is_public_http_url(url) {
-            warn!("Từ chối URL tải không hợp lệ hoặc trỏ vào mạng nội bộ");
-            return (false, None);
-        }
+        const MAX_REDIRECTS: usize = 5;
+        const META_MARKER: &str = "---CURL_META---";
         const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-        let mut cmd = Command::new("curl");
-        #[cfg(windows)]
-        {
-            #[allow(unused_imports)]
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
-        // Huỷ tải = drop future này (select!/abort). Không có kill_on_drop, curl vẫn
-        // chạy ngầm tới --max-time, tiếp tục ăn băng thông và có thể TẠO LẠI tệp
-        // đích ngay sau khi bước dọn dẹp đã xoá nó.
-        cmd.kill_on_drop(true);
-        let output = match cmd
-            .arg("-sSL")
-            .arg("-f")
-            .arg("--proto").arg("=http,https")
-            .arg("--proto-redir").arg("=http,https")
-            .arg("--max-redirs").arg("0")
-            .arg("--retry").arg("2")
-            .arg("--retry-delay").arg("1")
-            .arg("--connect-timeout").arg("20")
-            .arg("--max-time").arg("300")
-            .arg("-A").arg(USER_AGENT)
-            .arg("-e").arg(referer)
-            .arg("-w").arg("\n---CURL_META---\n%{http_code}\n%{content_type}\n")
-            .arg(url)
-            .arg("-o").arg(dest)
-            .output()
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                warn!("Không thể thực thi lệnh curl cho {url}: {e}");
+        let proxy = SettingsManager::proxy();
+
+        let mut current = url.to_string();
+        let mut hops = 0usize;
+        loop {
+            if !Self::is_public_http_url(&current).await {
+                warn!("Từ chối URL tải không hợp lệ hoặc trỏ vào mạng nội bộ");
                 let _ = std::fs::remove_file(dest);
                 return (false, None);
             }
-        };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("curl thất bại khi tải {url} (code {:?}): {}", output.status.code(), stderr.trim());
-            let _ = std::fs::remove_file(dest);
-            return (false, None);
-        }
-
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let mut http_status = 0u16;
-        let mut content_type = String::new();
-
-        if let Some(pos) = stdout_str.rfind("---CURL_META---") {
-            let meta_part = &stdout_str[pos + "---CURL_META---".len()..];
-            let mut lines = meta_part.lines().filter(|l| !l.trim().is_empty());
-            if let Some(code_line) = lines.next() {
-                http_status = code_line.trim().parse::<u16>().unwrap_or(0);
+            let mut cmd = Command::new("curl");
+            #[cfg(windows)]
+            {
+                #[allow(unused_imports)]
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
             }
-            if let Some(ct_line) = lines.next() {
-                content_type = ct_line.trim().to_string();
+            // Huỷ tải = drop future này (select!/abort). Không có kill_on_drop, curl vẫn
+            // chạy ngầm, tiếp tục ăn băng thông và có thể TẠO LẠI tệp đích ngay sau
+            // khi bước dọn dẹp đã xoá nó.
+            cmd.kill_on_drop(true);
+            cmd.arg("-sS")
+                .arg("-f")
+                .arg("--proto").arg("=http,https")
+                .arg("--retry").arg("2")
+                .arg("--retry-delay").arg("1")
+                .arg("--connect-timeout").arg("20")
+                // Không giới hạn tổng thời gian (video lớn trên mạng chậm cần hơn 5 phút),
+                // chỉ bỏ cuộc khi kết nối gần như đứng yên suốt 60 giây.
+                .arg("--speed-limit").arg("1024")
+                .arg("--speed-time").arg("60")
+                .arg("-A").arg(USER_AGENT)
+                .arg("-e").arg(referer)
+                .arg("-w").arg(format!("\n{META_MARKER}\n%{{http_code}}\n%{{content_type}}\n%{{redirect_url}}\n"));
+            if let Some(ref p) = proxy {
+                cmd.arg("-x").arg(p);
             }
-        }
+            let output = match cmd.arg(&current).arg("-o").arg(dest).output().await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!("Không thể thực thi lệnh curl cho {current}: {e}");
+                    let _ = std::fs::remove_file(dest);
+                    return (false, None);
+                }
+            };
 
-        if let Err(reason) = Self::validate_downloaded_media(dest, http_status, &content_type, url) {
-            warn!("Tải tệp media không hợp lệ: {reason}");
-            let _ = std::fs::remove_file(dest);
-            return (false, None);
-        }
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("curl thất bại khi tải {current} (code {:?}): {}", output.status.code(), stderr.trim());
+                let _ = std::fs::remove_file(dest);
+                return (false, None);
+            }
 
-        let opt_ct = if content_type.is_empty() { None } else { Some(content_type) };
-        (true, opt_ct)
+            // Phần sau dấu mốc có vị trí cố định: mã HTTP, Content-Type, URL chuyển hướng.
+            // Không lọc dòng trống vì Content-Type của phản hồi 3xx thường rỗng.
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let mut http_status = 0u16;
+            let mut content_type = String::new();
+            let mut redirect_url = String::new();
+            if let Some(pos) = stdout_str.rfind(META_MARKER) {
+                let mut fields = stdout_str[pos + META_MARKER.len()..].lines().skip(1);
+                http_status = fields.next().unwrap_or("").trim().parse::<u16>().unwrap_or(0);
+                content_type = fields.next().unwrap_or("").trim().to_string();
+                redirect_url = fields.next().unwrap_or("").trim().to_string();
+            }
+
+            if (300..400).contains(&http_status) && !redirect_url.is_empty() {
+                hops += 1;
+                if hops > MAX_REDIRECTS {
+                    warn!("Quá {MAX_REDIRECTS} lần chuyển hướng khi tải {url}");
+                    let _ = std::fs::remove_file(dest);
+                    return (false, None);
+                }
+                current = redirect_url;
+                continue;
+            }
+
+            if let Err(reason) = Self::validate_downloaded_media(dest, http_status, &content_type, &current) {
+                warn!("Tải tệp media không hợp lệ: {reason}");
+                let _ = std::fs::remove_file(dest);
+                return (false, None);
+            }
+
+            let opt_ct = if content_type.is_empty() { None } else { Some(content_type) };
+            return (true, opt_ct);
+        }
     }
 
     /// Nén toàn bộ tệp và thư mục con trong `src_dir` thành tệp ZIP tại `zip_path` bằng crate native `zip`
@@ -3142,6 +3320,22 @@ mod tests {
         std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o644)).unwrap();
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[test]
+    fn audio_presets_keep_their_format_and_bitrate() {
+        // UI gửi isAudio + formatId của preset; trước đây mọi preset đều ra MP3.
+        assert_eq!(D::audio_target(None, None, Some("flac_lossless")), ("flac", "0".to_string()));
+        assert_eq!(D::audio_target(None, None, Some("wav_lossless")), ("wav", "0".to_string()));
+        assert_eq!(D::audio_target(None, None, Some("alac_lossless")), ("alac", "0".to_string()));
+        assert_eq!(D::audio_target(None, None, Some("opus_best")), ("opus", "0".to_string()));
+        assert_eq!(D::audio_target(None, None, Some("mp3_320k")), ("mp3", "320K".to_string()));
+        assert_eq!(D::audio_target(None, None, Some("mp3_192k")), ("mp3", "192K".to_string()));
+        assert_eq!(D::audio_target(None, None, Some("m4a_aac")), ("m4a", "256K".to_string()));
+        assert_eq!(D::audio_target(None, None, Some("ogg_vorbis")), ("vorbis", "192K".to_string()));
+        // Giá trị gửi riêng được ưu tiên
+        assert_eq!(D::audio_target(Some("m4a"), Some("128k"), Some("mp3_320k")), ("m4a", "128K".to_string()));
+        assert_eq!(D::audio_target(None, None, None), ("mp3", "0".to_string()));
     }
 
     #[test]
@@ -3616,6 +3810,24 @@ mod tests {
                             let first_line = req.lines().next().unwrap_or("");
                             let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
+                            // Chuyển hướng tương đối, như CDN thật hay làm
+                            if path == "/redirect_to_image" || path == "/redirect_twice" {
+                                let target = if path == "/redirect_twice" { "/redirect_to_image" } else { "/valid_image.jpg" };
+                                let response = format!(
+                                    "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                );
+                                let _ = socket.write_all(response.as_bytes()).await;
+                                let _ = socket.flush().await;
+                                return;
+                            }
+                            if path == "/redirect_loop" {
+                                let _ = socket
+                                    .write_all(b"HTTP/1.1 302 Found\r\nLocation: /redirect_loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                    .await;
+                                let _ = socket.flush().await;
+                                return;
+                            }
+
                             let (status, content_type, body): (&str, &str, Vec<u8>) = match path {
                                 "/valid_image.jpg" => (
                                     "200 OK",
@@ -3660,6 +3872,29 @@ mod tests {
         (format!("http://{}", addr), shutdown_tx)
     }
 
+    /// Trước đây `-L --max-redirs 0` làm mọi URL có chuyển hướng thất bại (curl 47).
+    #[tokio::test]
+    async fn direct_download_follows_redirects_but_not_forever() {
+        let (server_url, _shutdown) = run_mock_server().await;
+        let temp_dir = std::env::temp_dir().join(format!("test_redirect_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let one = temp_dir.join("one.jpg");
+        let (ok, ct) = D::curl_to_file_with_meta(&format!("{server_url}/redirect_to_image"), "", &one).await;
+        assert!(ok, "Một lần chuyển hướng phải tải được");
+        assert_eq!(ct.as_deref(), Some("image/jpeg"));
+        assert!(one.is_file());
+
+        let two = temp_dir.join("two.jpg");
+        assert!(D::curl_to_file(&format!("{server_url}/redirect_twice"), "", &two).await);
+
+        let looped = temp_dir.join("loop.jpg");
+        assert!(!D::curl_to_file(&format!("{server_url}/redirect_loop"), "", &looped).await);
+        assert!(!looped.exists(), "Vòng chuyển hướng vô hạn phải dừng và không để lại tệp");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[tokio::test]
     async fn test_red_04_download_validation_flow_test1_and_test2() {
         let (server_url, _shutdown) = run_mock_server().await;
@@ -3701,6 +3936,20 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn svg_images_are_accepted_but_html_pages_are_not() {
+        let dir = std::env::temp_dir().join(format!("test_svg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg = dir.join("logo.svg");
+        std::fs::write(&svg, "<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>").unwrap();
+        assert!(D::validate_downloaded_media(&svg, 200, "image/svg+xml", "https://x/logo.svg").is_ok());
+
+        let fake = dir.join("fake.svg");
+        std::fs::write(&fake, "<!DOCTYPE html><html><body>Access denied</body></html>").unwrap();
+        assert!(D::validate_downloaded_media(&fake, 200, "text/html", "https://x/fake.svg").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -12,10 +12,14 @@ import subprocess
 from typing import List, Optional, Tuple, Dict, Any
 
 from ..cancellation import (
+    cap_timeout,
     raise_if_cancelled,
     register_process,
     unregister_process,
 )
+
+# Đuôi stderr mà run_process() gắn vào khi phải kill tiến trình vì quá giờ
+TIMEOUT_MARK = "Timeout after"
 
 
 class BaseExtractor:
@@ -23,6 +27,11 @@ class BaseExtractor:
 
     def __init__(self):
         self.project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    @staticmethod
+    def is_timeout(code: int, stderr: str) -> bool:
+        """run_process() đã kill tiến trình vì quá giờ (stdout có thể vẫn có dữ liệu dở dang)."""
+        return code == -1 and TIMEOUT_MARK in (stderr or "")
 
     @staticmethod
     def log(msg: str) -> None:
@@ -67,7 +76,7 @@ class BaseExtractor:
     def run_process(
         self,
         cmd: List[str],
-        timeout: int = 60,
+        timeout: float = 60,
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
     ) -> Tuple[int, str, str]:
@@ -88,6 +97,9 @@ class BaseExtractor:
 
         # Đã bị huỷ trước khi kịp chạy thì đừng khởi động tiến trình nào nữa.
         raise_if_cancelled()
+        # Không chạy quá ngân sách thời gian Rust cấp cho request; hết hẳn thì
+        # cap_timeout() ném RequestTimedOut để dispatcher không thử engine kế tiếp.
+        timeout = cap_timeout(timeout)
 
         try:
             # Tạo process group riêng (CREATE_NEW_PROCESS_GROUP trên Windows, start_new_session trên POSIX) để kill cả nhóm khi timeout
@@ -109,7 +121,7 @@ class BaseExtractor:
                 raise_if_cancelled()
                 return proc.returncode, stdout, stderr
             except subprocess.TimeoutExpired:
-                self.warn(f"Command timed out ({timeout}s): {' '.join(cmd[:4])}...")
+                self.warn(f"Command timed out ({timeout:.0f}s): {' '.join(cmd[:4])}...")
                 # Kill toàn bộ process group / process tree để không để zombie
                 if sys.platform == "win32":
                     try:
@@ -131,12 +143,16 @@ class BaseExtractor:
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     except (ProcessLookupError, OSError):
                         proc.kill()
+                # Giữ lại phần output đã nhận: yt-dlp --flat-playlist và gallery-dl
+                # (output.jsonl) in từng mục ngay khi có, nên quét dở vẫn dùng được.
+                partial_out, partial_err = "", ""
                 try:
-                    proc.communicate(timeout=3)
+                    partial_out, partial_err = proc.communicate(timeout=3)
                 except Exception:
                     pass
                 raise_if_cancelled()
-                return -1, "", f"Timeout after {timeout} seconds"
+                tail = f"{TIMEOUT_MARK} {timeout:.0f} seconds"
+                return -1, partial_out or "", f"{(partial_err or '').strip()}\n{tail}".strip()
             finally:
                 unregister_process(proc)
         except Exception as e:

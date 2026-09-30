@@ -7,12 +7,15 @@ Ported from MediaDispatcherService into standalone Python.
 
 import os
 import time
+import urllib.parse
 import urllib.request
 from typing import Optional
 from .base import BaseExtractor
 from ..models import MediaMetadata, MediaImage
+from ..cancellation import cap_timeout
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".bmp", ".avif", ".heic")
+VIDEO_EXTENSIONS = (".mp4", ".m4v", ".mov", ".webm", ".mkv", ".m3u8", ".mpd", ".ts", ".m4s", ".mp3", ".m4a")
 KNOWN_IMAGE_CDNS = [
     "images.unsplash.com", "i.pinimg.com", "pbs.twimg.com/media",
     "i.imgur.com", "fbcdn.net", "cdninstagram.com", "pximg.net",
@@ -25,9 +28,20 @@ class DirectImageExtractor(BaseExtractor):
 
     @staticmethod
     def is_direct_image_url(url: str) -> bool:
-        clean = url.split("?")[0].lower()
+        clean = url.split("?")[0].split("#")[0].lower()
         if any(clean.endswith(ext) for ext in IMAGE_EXTENSIONS):
             return True
+        # fbcdn.net / cdninstagram.com phục vụ cả VIDEO. Trước đây mọi link của
+        # các CDN này đều bị coi là ảnh: link .mp4 bị gắn type="image" và bị đưa
+        # vào <img> làm thumbnail (WebKitGTK giải mã video trong <img> ngốn vài GB RAM).
+        if any(clean.endswith(ext) for ext in VIDEO_EXTENSIONS):
+            return False
+        try:
+            host = (urllib.parse.urlparse(url.strip()).hostname or "").lower()
+        except ValueError:
+            host = ""
+        if host.startswith("video.") or host.startswith("video-"):
+            return False
         lower = url.lower()
         return any(cdn in lower for cdn in KNOWN_IMAGE_CDNS)
 
@@ -50,7 +64,7 @@ class DirectImageExtractor(BaseExtractor):
                 headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0 Safari/537.36"},
                 method="HEAD",
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=cap_timeout(10)) as resp:
                 cl = resp.headers.get("Content-Length")
                 if cl and cl.isdigit():
                     from .ytdlp import YtDlpExtractor

@@ -38,6 +38,10 @@ pub struct AppSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gallery_dl_path: Option<String>,
 
+    /// Proxy dùng cho cả bóc tách lẫn tải (vd. http://127.0.0.1:8080, socks5://...)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+
     /// Phiên bản settings schema (để migrate sau này)
     #[serde(default = "default_version")]
     pub schema_version: u32,
@@ -53,6 +57,7 @@ impl Default for AppSettings {
             download_dir: None,
             ytdlp_path: None,
             gallery_dl_path: None,
+            proxy: None,
             schema_version: 1,
         }
     }
@@ -101,11 +106,19 @@ impl SettingsManager {
         }
     }
 
+    /// Proxy người dùng cấu hình (đã bỏ khoảng trắng), None nếu để trống.
+    pub fn proxy() -> Option<String> {
+        Self::load()
+            .proxy
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+    }
+
     /// Đọc settings từ file. Trả về default nếu file chưa tồn tại.
     pub fn load() -> AppSettings {
         let path = settings_path();
         if !path.exists() {
-            info!("[Settings] Chưa có file settings, dùng mặc định");
+            log::debug!("[Settings] Chưa có file settings, dùng mặc định");
             return AppSettings::default();
         }
 
@@ -113,7 +126,7 @@ impl SettingsManager {
             Ok(content) => {
                 match serde_json::from_str::<AppSettings>(&content) {
                     Ok(settings) => {
-                        info!("[Settings] Đã tải settings từ {:?}", path);
+                        log::debug!("[Settings] Đã tải settings từ {:?}", path);
                         settings
                     }
                     Err(e) => {

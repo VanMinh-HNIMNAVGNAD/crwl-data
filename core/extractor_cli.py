@@ -35,6 +35,7 @@ if PROJECT_ROOT not in sys.path:
 
 from core.cancellation import (
     RequestCancelled,
+    RequestTimedOut,
     begin_request,
     cancel_request,
     end_request,
@@ -68,7 +69,11 @@ def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict
     if not url:
         return {"id": req_id, "success": False, "error": "Missing 'url' parameter"}
 
-    begin_request(req_id)
+    try:
+        budget = float(req.get("budget_sec") or 0) or None
+    except (TypeError, ValueError):
+        budget = None
+    begin_request(req_id, budget)
     try:
         if action == "extract":
             res = dispatcher.extract(url, browser=req.get("browser"))
@@ -96,6 +101,15 @@ def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict
             return {"id": req_id, "success": True, "data": res.to_dict()}
 
         return {"id": req_id, "success": False, "error": f"Unknown action: '{action}'"}
+    except RequestTimedOut:
+        sys.stderr.write(f"[Sidecar] Request {req_id} dừng vì hết ngân sách {budget}s\n")
+        sys.stderr.flush()
+        hint = " Hãy giảm số lượng cần quét rồi thử lại." if action == "crawl" else ""
+        return {
+            "id": req_id,
+            "success": False,
+            "error": f"Timeout: quá {int(budget or 0)} giây mà chưa bóc tách xong.{hint}",
+        }
     except RequestCancelled:
         sys.stderr.write(f"[Sidecar] Request {req_id} đã bị huỷ theo yêu cầu người dùng\n")
         sys.stderr.flush()
@@ -130,7 +144,14 @@ def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None
     )
 
     def process(raw_req: dict) -> None:
-        output_json(handle_request(dispatcher, resolver, raw_req))
+        # Luôn phải trả lời: một request rơi mất (lỗi ngoài handle_request, dữ liệu
+        # không serialize được...) khiến Rust chờ tới hết timeout mới biết.
+        try:
+            output_json(handle_request(dispatcher, resolver, raw_req))
+        except BaseException as e:  # noqa: BLE001 — luồng pool, không được chết im lặng
+            sys.stderr.write(f"[Sidecar:ERROR] Không gửi được phản hồi cho {raw_req.get('id')}: {e}\n")
+            sys.stderr.flush()
+            output_json({"id": raw_req.get("id"), "success": False, "error": f"Lỗi nội bộ engine bóc tách: {e}"})
 
     try:
         for line in sys.stdin:

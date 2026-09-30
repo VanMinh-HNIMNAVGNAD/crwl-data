@@ -132,12 +132,15 @@ impl BinaryManager {
 
     /// Lấy version của binary bằng cách chạy `{binary} --version`
     async fn get_version(path: &PathBuf) -> Option<String> {
-        let output = Command::new(path)
-            .arg("--version")
+        // Một binary hỏng/treo khi chạy `--version` không được làm treo cả màn hình Công cụ
+        let mut cmd = Command::new(path);
+        cmd.arg("--version")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
             .await
+            .ok()?
             .ok()?;
 
         let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();

@@ -238,6 +238,9 @@ class MediaDispatcher(BaseExtractor):
                 self.warn(f"Direct image failed ({e}), fallback...")
 
         # 4. Trang phim / stream HLS
+        # MovieExtractor luôn kết thúc bằng yt-dlp trên chính URL này; nếu nó đã thất
+        # bại thì bước 7 không chạy yt-dlp lần nữa (trước đây tốn thêm 30-60 giây).
+        movie_err: Optional[Exception] = None
         if self.movie.is_movie_or_stream_url(target_url):
             try:
                 self.log(f"Phim / HLS Stream: {target_url}")
@@ -245,6 +248,7 @@ class MediaDispatcher(BaseExtractor):
                 return self._enhance_metadata(res, target_url)
             except Exception as e:
                 self.warn(f"Movie extractor error ({e})")
+                movie_err = e
 
         # 5. Nền tảng video/audio -> ưu tiên yt-dlp
         if self.is_video_audio_platform(target_url):
@@ -328,29 +332,32 @@ class MediaDispatcher(BaseExtractor):
                         raise RuntimeError(str(gal_err) or str(yt_err) or "Không thể trích xuất nội dung từ liên kết này")
 
         # 7. URL không rõ -> yt-dlp -> gallery-dl -> web_scraper -> Playwright sniffer
-        try:
-            self.log(f"URL không xác định -> yt-dlp first: {target_url}")
-            res = self.ytdlp.extract_metadata(target_url, browser=browser)
-            return self._enhance_metadata(res, target_url)
-        except Exception as yt_err:
-            self.warn(f"yt-dlp thất bại ({yt_err}), gallery-dl fallback...")
+        yt_err: Optional[Exception] = movie_err
+        if movie_err is None:
             try:
-                res = self.gallery.extract_gallery(target_url, browser=browser)
-                self._fill_video_posters(res, target_url, browser)
+                self.log(f"URL không xác định -> yt-dlp first: {target_url}")
+                res = self.ytdlp.extract_metadata(target_url, browser=browser)
                 return self._enhance_metadata(res, target_url)
-            except Exception as gal_err:
-                self.warn(f"gallery-dl thất bại ({gal_err}), web_scraper fallback...")
-                try:
-                    res = self.web_scraper.extract(target_url)
-                    # Nếu web_scraper tìm thấy streams → trả về
-                    if res.streams:
-                        return self._enhance_metadata(res, target_url)
-                    # Nếu không có streams → thử Playwright sniffer
-                    raise RuntimeError("web_scraper không tìm được stream")
-                except Exception as web_err:
-                    # Thử Playwright sniffer (headless browser intercept)
-                    self.warn(f"web_scraper thất bại ({web_err}), thử Playwright stream sniffer...")
-                    return self._try_playwright_sniff(target_url, gal_err, yt_err)
+            except Exception as e:
+                yt_err = e
+        self.warn(f"yt-dlp thất bại ({yt_err}), gallery-dl fallback...")
+        try:
+            res = self.gallery.extract_gallery(target_url, browser=browser)
+            self._fill_video_posters(res, target_url, browser)
+            return self._enhance_metadata(res, target_url)
+        except Exception as gal_err:
+            self.warn(f"gallery-dl thất bại ({gal_err}), web_scraper fallback...")
+            try:
+                res = self.web_scraper.extract(target_url)
+                # Nếu web_scraper tìm thấy streams → trả về
+                if res.streams:
+                    return self._enhance_metadata(res, target_url)
+                # Nếu không có streams → thử Playwright sniffer
+                raise RuntimeError("web_scraper không tìm được stream")
+            except Exception as web_err:
+                # Thử Playwright sniffer (headless browser intercept)
+                self.warn(f"web_scraper thất bại ({web_err}), thử Playwright stream sniffer...")
+                return self._try_playwright_sniff(target_url, gal_err, yt_err)
 
 
     # ─────────────────────────────────────────────────────────────────────────

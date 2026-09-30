@@ -98,9 +98,11 @@ pub async fn start_download(
     DownloaderService::start_download(app, Arc::clone(&state.db), options).await
 }
 
+/// `remember = true`: lưu thư mục vừa chọn thành thư mục tải mặc định (nút 📁).
+/// `remember = false`: chỉ dùng cho lượt tải này (chế độ "Hỏi trước khi tải").
 #[tauri::command]
-pub async fn select_download_directory() -> Option<String> {
-    DownloaderService::select_directory().await
+pub async fn select_download_directory(remember: Option<bool>) -> Result<Option<String>, String> {
+    DownloaderService::select_directory(remember.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -186,7 +188,7 @@ pub async fn download_thumbnail(
         title,
         browser,
         dest_dir,
-        device_id: device_id.unwrap_or_default(),
+        device_id: device_id.unwrap_or_else(|| "desktop_default".to_string()),
         task_id,
         ..Default::default()
     };
@@ -216,7 +218,7 @@ pub async fn download_subtitle(
         title,
         browser,
         dest_dir,
-        device_id: device_id.unwrap_or_default(),
+        device_id: device_id.unwrap_or_else(|| "desktop_default".to_string()),
         task_id,
         ..Default::default()
     };
@@ -303,12 +305,22 @@ pub fn get_app_settings() -> AppSettings {
     SettingsManager::load()
 }
 
+/// Lưu cấu hình. Trả về true nếu engine bóc tách đã được khởi động lại để nhận
+/// đường dẫn công cụ / proxy mới (các lượt bóc tách đang chạy sẽ bị ngắt).
 #[tauri::command]
 pub async fn save_app_settings(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     settings: AppSettings,
-) -> Result<(), String> {
-    SettingsManager::save(&settings)
+) -> Result<bool, String> {
+    let before = SettingsManager::load();
+    SettingsManager::save(&settings)?;
+    let sidecar_env_changed = before.ytdlp_path != settings.ytdlp_path
+        || before.gallery_dl_path != settings.gallery_dl_path
+        || before.proxy != settings.proxy;
+    if sidecar_env_changed {
+        state.sidecar.reset_and_start().await;
+    }
+    Ok(sidecar_env_changed)
 }
 
 
@@ -327,6 +339,7 @@ pub async fn download_direct_file(
     device_id: Option<String>,
     task_id: Option<String>,
     client_ip: Option<String>,
+    platform: Option<String>,
 ) -> Result<DownloadResult, String> {
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
     DownloaderService::download_direct_file(
@@ -336,6 +349,7 @@ pub async fn download_direct_file(
         dest_dir.as_deref(),
         &dev_id,
         client_ip.as_deref(),
+        platform.as_deref(),
         task_id,
         Arc::clone(&state.db),
     ).await
@@ -353,6 +367,7 @@ pub async fn download_album_batch(
     device_id: Option<String>,
     task_id: Option<String>,
     client_ip: Option<String>,
+    platform: Option<String>,
 ) -> Result<DownloadResult, String> {
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
     DownloaderService::download_album_batch(
@@ -365,6 +380,7 @@ pub async fn download_album_batch(
         &dev_id,
         task_id,
         client_ip.as_deref(),
+        platform.as_deref(),
         Arc::clone(&state.db),
     ).await
 }

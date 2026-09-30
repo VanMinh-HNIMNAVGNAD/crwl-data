@@ -123,29 +123,48 @@ class BrowserCookieExporter:
     def __init__(self):
         self.home = os.path.expanduser("~")
 
+    # Thư mục dữ liệu của từng trình duyệt nhân Chromium trên Linux, gồm cả bản
+    # Flatpak/Snap — khớp với danh sách mà app (Rust) nhận diện và cho người dùng chọn.
+    # Trước đây Opera/Vivaldi hiện trong danh sách nhưng không bao giờ đọc được cookie.
+    _CHROMIUM_BASES = {
+        "edge": [".config/microsoft-edge", ".config/microsoft-edge-beta", ".config/microsoft-edge-dev",
+                 ".var/app/com.microsoft.Edge/config/microsoft-edge"],
+        "chrome": [".config/google-chrome", ".config/google-chrome-beta",
+                   ".var/app/com.google.Chrome/config/google-chrome"],
+        "brave": [".config/BraveSoftware/Brave-Browser",
+                  ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"],
+        "chromium": [".config/chromium", "snap/chromium/common/chromium",
+                     ".var/app/org.chromium.Chromium/config/chromium"],
+        "opera": [".config/opera", "snap/opera/current/.config/opera"],
+        "vivaldi": [".config/vivaldi", ".var/app/com.vivaldi.Vivaldi/config/vivaldi"],
+    }
+    _BROWSER_ALIASES = {
+        "microsoft-edge": "edge", "google-chrome": "chrome", "brave-browser": "brave",
+        "chromium-browser": "chromium", "vivaldi-stable": "vivaldi",
+    }
+
     def get_chromium_cookie_db_paths(self, browser: str) -> List[str]:
         browser = browser.lower()
-        candidates = []
-        if browser in ("edge", "microsoft-edge"):
-            base = os.path.join(self.home, ".config/microsoft-edge")
-        elif browser in ("chrome", "google-chrome"):
-            base = os.path.join(self.home, ".config/google-chrome")
-        elif browser in ("brave", "brave-browser"):
-            base = os.path.join(self.home, ".config/BraveSoftware/Brave-Browser")
-        elif browser in ("chromium", "chromium-browser"):
-            base = os.path.join(self.home, ".config/chromium")
-        else:
+        browser = self._BROWSER_ALIASES.get(browser, browser)
+        bases = self._CHROMIUM_BASES.get(browser)
+        if not bases:
             return []
 
-        # Profiles are user-created and Chromium moved the DB to Network/Cookies.
-        # Inspect both locations instead of assuming only the first few profiles.
-        for profile_dir in glob.glob(os.path.join(base, "*")):
-            if not os.path.isdir(profile_dir):
-                continue
-            candidates.append(os.path.join(profile_dir, "Cookies"))
-            candidates.append(os.path.join(profile_dir, "Network", "Cookies"))
+        candidates = []
+        for rel in bases:
+            base = os.path.join(self.home, rel)
+            # Opera lưu thẳng Cookies trong thư mục gốc, không chia profile
+            candidates.append(os.path.join(base, "Cookies"))
+            candidates.append(os.path.join(base, "Network", "Cookies"))
+            # Profiles are user-created and Chromium moved the DB to Network/Cookies.
+            # Inspect both locations instead of assuming only the first few profiles.
+            for profile_dir in glob.glob(os.path.join(base, "*")):
+                if not os.path.isdir(profile_dir):
+                    continue
+                candidates.append(os.path.join(profile_dir, "Cookies"))
+                candidates.append(os.path.join(profile_dir, "Network", "Cookies"))
 
-        return [p for p in candidates if os.path.exists(p)]
+        return [p for p in candidates if os.path.isfile(p)]
 
     def get_firefox_cookie_db_paths(self) -> List[str]:
         patterns = [
@@ -224,11 +243,13 @@ class BrowserCookieExporter:
         for _, pwd in candidate_passwords:
             key = hashlib.pbkdf2_hmac("sha1", pwd, b"saltysalt", 1, 16)
             for enc in sample_encrypted:
-                is_v11 = enc.startswith(b"v11")
                 ciphertext = enc[3:]
-                result = self.decrypt_aes_cbc(key, ciphertext, hash_prefix=is_v11)
-                if result and any(ch.isalnum() for ch in result):
-                    return key
+                # Có hay không có 32 byte hash ở đầu phụ thuộc phiên bản DB, KHÔNG
+                # phụ thuộc tiền tố v10/v11 — thử cả hai cách.
+                for hash_prefix in (True, False):
+                    result = self.decrypt_aes_cbc(key, ciphertext, hash_prefix=hash_prefix)
+                    if result and any(ch.isalnum() for ch in result):
+                        return key
         return None
 
     def extract_chromium_cookies(self, browser: str) -> List[Tuple[str, str, str, str, int, str, str]]:
@@ -269,18 +290,26 @@ class BrowserCookieExporter:
                 c = conn.cursor()
                 c.execute("SELECT host_key, path, is_secure, expires_utc, name, encrypted_value, value FROM cookies")
                 rows = c.fetchall()
+                # Từ schema 24 (Chrome ~130) giá trị giải mã có 32 byte SHA256(host)
+                # ở đầu. DB cũ hơn thì KHÔNG có — cắt 32 byte ở đó làm hỏng mọi
+                # cookie dài hơn 32 ký tự (vd. sessionid).
+                try:
+                    c.execute("SELECT value FROM meta WHERE key = 'version'")
+                    meta_row = c.fetchone()
+                    db_version = int(meta_row[0]) if meta_row else 0
+                except (sqlite3.Error, TypeError, ValueError):
+                    db_version = 0
                 conn.close()
             except Exception:
                 return []
+            has_host_hash = db_version >= 24
 
             for host, path, is_sec, exp, name, enc, val in rows:
                 cookie_val = val or ""
                 if enc and (enc.startswith(b"v10") or enc.startswith(b"v11")):
                     if key:
-                        # Chromium cookie plaintext may contain a 32-byte host hash
-                        # (v10/v11). Try the modern layout first, then legacy.
-                        dec = self.decrypt_aes_cbc(key, enc[3:], hash_prefix=True)
-                        if dec is None:
+                        dec = self.decrypt_aes_cbc(key, enc[3:], hash_prefix=has_host_hash)
+                        if dec is None and has_host_hash:
                             dec = self.decrypt_aes_cbc(key, enc[3:], hash_prefix=False)
                         if dec is not None:
                             cookie_val = dec
@@ -339,7 +368,7 @@ class BrowserCookieExporter:
 
     def find_best_browser(self, domain_filter: Optional[str] = None) -> Optional[str]:
         """Tự động tìm trình duyệt phù hợp nhất có chứa cookies cho domain"""
-        candidates = ["firefox", "edge", "chrome", "brave", "chromium"]
+        candidates = ["firefox", "edge", "chrome", "brave", "chromium", "opera", "vivaldi"]
         clean_d = registrable_domain(domain_filter)
 
         # 1. Ưu tiên trình duyệt thực sự có cookies cho domain chỉ định
@@ -445,10 +474,29 @@ _DOMAIN_TO_PLATFORM = {
 }
 
 
-def _find_manual_cookie_file(domain: Optional[str] = None) -> Optional[str]:
-    """Tìm file cookie thủ công trong ~/.config/crwl/cookies/ theo domain hoặc platform."""
+def crwl_config_dir() -> str:
+    """Thư mục cấu hình của app — PHẢI trùng với `dirs::config_dir()/crwl` bên Rust.
+
+    Rust truyền đường dẫn chính xác qua CRWL_CONFIG_DIR. Khi chạy CLI độc lập thì
+    tự suy ra theo từng hệ điều hành (trước đây cứng `~/.config/crwl`, nên trên
+    Windows/macOS không bao giờ thấy cookie đã lưu trong Cookie Manager).
+    """
+    env_dir = os.environ.get("CRWL_CONFIG_DIR")
+    if env_dir:
+        return env_dir
     home = os.path.expanduser("~")
-    cookies_dir = os.path.join(home, ".config", "crwl", "cookies")
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return os.path.join(base, "crwl")
+
+
+def _find_manual_cookie_file(domain: Optional[str] = None) -> Optional[str]:
+    """Tìm file cookie thủ công trong <config>/crwl/cookies/ theo domain hoặc platform."""
+    cookies_dir = os.path.join(crwl_config_dir(), "cookies")
     if not os.path.isdir(cookies_dir):
         return None
 

@@ -92,6 +92,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
       }
     } catch (err) {
       console.warn('Lỗi khi chọn thư mục:', err)
+      showToast(typeof err === 'string' ? err : err?.message || 'Lỗi khi chọn thư mục')
     }
   }
 

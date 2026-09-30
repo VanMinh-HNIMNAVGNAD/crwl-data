@@ -60,24 +60,13 @@ export function setActiveBrowser(browserId) {
   }
 }
 
-export function getCustomDownloadDir() {
-  try {
-    return localStorage.getItem('custom_download_dir') || ''
-  } catch {
-    return ''
-  }
-}
-
-export function setCustomDownloadDir(dir) {
-  try {
-    if (dir) {
-      localStorage.setItem('custom_download_dir', dir)
-    } else {
-      localStorage.removeItem('custom_download_dir')
-    }
-  } catch (err) {
-    void err
-  }
+// Thư mục lưu mặc định nay do backend giữ (settings.json) — backend chỉ cho tải
+// vào thư mục đã cấu hình hoặc thư mục vừa chọn qua hộp thoại. Bản cũ lưu lựa
+// chọn trong localStorage nên backend từ chối mọi thư mục ngoài ~/Downloads.
+try {
+  localStorage.removeItem('custom_download_dir')
+} catch {
+  // localStorage không khả dụng — không có gì để dọn
 }
 
 export function getAlwaysAskDownloadDir() {
@@ -235,7 +224,7 @@ export async function startNativeDownload({
   platform = null,
 }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  const customDir = destDir || getCustomDownloadDir() || null
+  const customDir = destDir || null
 
   try {
     return await invoke('start_download', {
@@ -277,7 +266,7 @@ export async function startNativeDownload({
  */
 export async function downloadThumbnail({ url, title, destDir = null, browser = null, taskId = null }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  const customDir = destDir || getCustomDownloadDir() || null
+  const customDir = destDir || null
   try {
     return await invoke('download_thumbnail', {
       url: url.trim(),
@@ -297,7 +286,7 @@ export async function downloadThumbnail({ url, title, destDir = null, browser = 
  */
 export async function downloadSubtitle({ url, lang, format = 'vtt', title, destDir = null, browser = null, taskId = null }) {
   const targetBrowser = browser !== null ? browser : getActiveBrowser()
-  const customDir = destDir || getCustomDownloadDir() || null
+  const customDir = destDir || null
   try {
     return await invoke('download_subtitle', {
       url: url.trim(),
@@ -319,11 +308,7 @@ export async function downloadSubtitle({ url, lang, format = 'vtt', title, destD
  */
 export async function selectDownloadDirectory() {
   try {
-    const dir = await invoke('select_download_directory')
-    if (dir) {
-      setCustomDownloadDir(dir)
-    }
-    return dir
+    return await invoke('select_download_directory', { remember: true })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi chọn thư mục lưu tệp', { cause: err })
   }
@@ -334,16 +319,13 @@ export async function selectDownloadDirectory() {
  */
 export async function askForDownloadDirectory() {
   try {
-    const dir = await invoke('select_download_directory')
-    return dir
+    return await invoke('select_download_directory', { remember: false })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi chọn thư mục lưu tệp', { cause: err })
   }
 }
 
 export async function getDefaultDownloadDirectory() {
-  const custom = getCustomDownloadDir()
-  if (custom) return custom
   try {
     return await invoke('get_default_download_directory')
   } catch {
@@ -465,7 +447,7 @@ export async function deletePlatformCookies(platform = null) {
  * Tải một tệp ảnh trực tiếp về thư mục Downloads với header chống chặn 403
  */
 export async function downloadDirectFile({ url, filename, referer, destDir, taskId = null, platform = null }) {
-  const customDir = destDir || getCustomDownloadDir() || null
+  const customDir = destDir || null
 
   try {
     return await invoke('download_direct_file', {
@@ -491,7 +473,7 @@ export async function downloadDirectFile({ url, filename, referer, destDir, task
  *   thư mục. Bỏ trống thì backend cấp phát thư mục mới, sạch.
  */
 export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, albumDir = null, asZip = false, taskId = null, platform = null }) {
-  const customDir = destDir || getCustomDownloadDir() || null
+  const customDir = destDir || null
 
   try {
     return await invoke('download_album_batch', {

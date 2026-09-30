@@ -12,6 +12,7 @@ import subprocess
 from typing import Optional, List, Dict, Any
 from .base import BaseExtractor
 from ..models import CrawlMediaItem, ProfileCrawlResult
+from ..cancellation import cap_timeout
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -55,7 +56,7 @@ class TikTokExtractor(BaseExtractor):
             for imp in targets:
                 try:
                     url = f"https://www.tiktok.com/embed/@{username}"
-                    resp = cffi_requests.get(url, impersonate=imp, timeout=10)
+                    resp = cffi_requests.get(url, impersonate=imp, timeout=cap_timeout(10))
                     if resp.status_code == 200 and "<script" in resp.text:
                         m = re.search(
                             r'<script[^>]+id=[\"\']__FRONTITY_CONNECT_STATE__[\"\'][^>]*>(.*?)</script>',

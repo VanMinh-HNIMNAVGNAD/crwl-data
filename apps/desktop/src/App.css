@@ -1129,6 +1129,14 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
    DOWNLOAD PROGRESS CARD & STATS PANEL
    ============================================================================== */
 
+/* Nhiều tác vụ tải song song: mỗi tác vụ một thẻ, cuộn khi quá nhiều */
+.download-task-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
 .download-progress-card {
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);

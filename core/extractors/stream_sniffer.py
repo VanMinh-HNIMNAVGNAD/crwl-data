@@ -29,6 +29,7 @@ from urllib.parse import urljoin
 from .base import BaseExtractor
 from ..models import StreamFormat, MediaImage
 from ..cookies.browser_cookies import get_browser_cookies_txt
+from ..cancellation import cap_timeout, current_request_id, is_cancelled, raise_if_cancelled
 
 # Media URL patterns để lọc các request có giá trị
 MEDIA_URL_PATTERNS = [
@@ -106,6 +107,12 @@ class _PlaywrightWorkerThread(threading.Thread):
                 self._tasks.task_done()
                 break
             fn, args, kwargs, result_holder, done_event = item
+            # Người gửi đã bỏ cuộc (quá giờ / huỷ) trong lúc task còn xếp hàng: bỏ qua,
+            # nếu không các task "ma" cứ lần lượt chạy và làm task mới timeout theo.
+            if result_holder.get("abandoned"):
+                done_event.set()
+                self._tasks.task_done()
+                continue
             try:
                 result_holder["result"] = fn(*args, **kwargs)
             except Exception as e:
@@ -114,12 +121,37 @@ class _PlaywrightWorkerThread(threading.Thread):
                 done_event.set()
                 self._tasks.task_done()
 
-    def submit(self, fn: Callable, *args, timeout: Optional[float] = None, **kwargs) -> Any:
+    def submit(
+        self,
+        fn: Callable,
+        *args,
+        timeout: Optional[float] = None,
+        stop_when: Optional[Callable[[], bool]] = None,
+        **kwargs,
+    ) -> Any:
+        """Chạy `fn` trên luồng Playwright và chờ kết quả.
+
+        `fn` nhận thêm `should_stop()`: trả True khi người gửi đã bỏ cuộc (quá giờ)
+        hoặc `stop_when()` báo dừng (vd. request bị huỷ) — để task đang chạy tự kết
+        thúc sớm thay vì chiếm luồng duy nhất cho tới hết các mốc chờ của nó.
+        """
         done_event = threading.Event()
-        result_holder = {"result": None, "error": None}
+        result_holder = {"result": None, "error": None, "abandoned": False}
+
+        def should_stop() -> bool:
+            return bool(result_holder["abandoned"] or (stop_when and stop_when()))
+
+        kwargs["should_stop"] = should_stop
         self._tasks.put((fn, args, kwargs, result_holder, done_event))
-        if not done_event.wait(timeout=timeout):
-            raise TimeoutError(f"Playwright worker task timed out after {timeout}s")
+        deadline = time.monotonic() + timeout if timeout else None
+        # Chờ theo từng nhịp ngắn để phát hiện huỷ ngay cả khi task đang chạy
+        while not done_event.wait(timeout=0.5):
+            if stop_when and stop_when():
+                result_holder["abandoned"] = True
+                raise TimeoutError("Playwright task đã bị huỷ")
+            if deadline is not None and time.monotonic() >= deadline:
+                result_holder["abandoned"] = True
+                raise TimeoutError(f"Playwright worker task timed out after {timeout:.0f}s")
         if result_holder["error"] is not None:
             raise result_holder["error"]
         return result_holder["result"]
@@ -138,7 +170,13 @@ class _PlaywrightWorkerThread(threading.Thread):
         if self._pw is None:
             self._pw = sync_playwright().start()
 
+        launch_kwargs: Dict[str, Any] = {}
+        proxy = os.environ.get("CRWL_PROXY")
+        if proxy:
+            # Chromium không tự đọc HTTP(S)_PROXY như yt-dlp/gallery-dl
+            launch_kwargs["proxy"] = {"server": proxy}
         self._browser = self._pw.chromium.launch(
+            **launch_kwargs,
             headless=True,
             args=[
                 "--no-sandbox",
@@ -273,13 +311,19 @@ class PlaywrightStreamSniffer(BaseExtractor):
             timeout_sec = (self.PLAYWRIGHT_TIMEOUT / 1000.0) + (wait_ms / 1000.0) + 15.0
             if follow_iframes:
                 timeout_sec += 30.0
-            return worker.submit(
+            # Không chờ quá ngân sách thời gian còn lại của request
+            timeout_sec = cap_timeout(timeout_sec, minimum=3.0)
+            req_id = current_request_id()
+            result = worker.submit(
                 self._do_sniff_streams,
                 page_url,
                 wait_ms,
                 follow_iframes,
                 timeout=timeout_sec,
+                stop_when=(lambda: is_cancelled(req_id)) if req_id else None,
             )
+            raise_if_cancelled()
+            return result
         except Exception as e:
             self.warn(f"[Sniffer] Playwright error: {e}")
             return {
@@ -297,19 +341,22 @@ class PlaywrightStreamSniffer(BaseExtractor):
         page_url: str,
         wait_ms: int = 5000,
         follow_iframes: bool = True,
+        should_stop: Callable[[], bool] = lambda: False,
     ) -> Dict[str, Any]:
         """Thực thi sniffing trên luồng chuyên biệt của Playwright worker"""
         worker = self._get_worker()
         browser = worker._ensure_browser()
 
-        captured_urls, iframe_urls, captured_images = self._sniff_page(browser, page_url, wait_ms)
+        captured_urls, iframe_urls, captured_images = self._sniff_page(browser, page_url, wait_ms, should_stop)
 
         # Nếu chưa tìm được stream từ main page, thử navigate từng iframe embed
         if not captured_urls and iframe_urls and follow_iframes:
             for iframe_url in iframe_urls[:3]:  # Giới hạn 3 iframes
+                if should_stop():
+                    break
                 self.log(f"[Sniffer] Thử sniff iframe: {iframe_url[:100]}")
                 try:
-                    i_urls, _, _ = self._sniff_page(browser, iframe_url, min(wait_ms, 8000))
+                    i_urls, _, _ = self._sniff_page(browser, iframe_url, min(wait_ms, 8000), should_stop)
                     if i_urls:
                         captured_urls.extend(i_urls)
                         break
@@ -335,6 +382,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
         browser,
         target_url: str,
         wait_ms: int,
+        should_stop: Callable[[], bool] = lambda: False,
     ) -> Tuple[List[str], List[str], List[MediaImage]]:
         """Mở một context/page mới trên instance browser hiện có, sniff và đóng context khi xong"""
         captured_urls: List[str] = []
@@ -447,9 +495,16 @@ class PlaywrightStreamSniffer(BaseExtractor):
             except Exception as nav_err:
                 self.warn(f"[Sniffer] Lỗi navigate: {nav_err}")
 
-            # Đợi để JS chạy và requests được phát
+            # Đợi để JS chạy và requests được phát — theo từng nhịp ngắn để dừng
+            # ngay khi người gửi đã bỏ cuộc hoặc request bị huỷ.
+            waited = 0
             actual_wait = min(wait_ms, 12000)
-            page.wait_for_timeout(actual_wait)
+            while waited < actual_wait and not should_stop():
+                step = min(500, actual_wait - waited)
+                page.wait_for_timeout(step)
+                waited += step
+            if should_stop():
+                return captured_urls, iframe_urls, captured_images
 
             # Player có thể được tạo động trong iframe và không xuất hiện
             # trong HTML ban đầu. Đọc cả DOM media elements và resource

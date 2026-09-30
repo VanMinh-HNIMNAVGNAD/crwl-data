@@ -11,6 +11,7 @@ import urllib.request
 import urllib.parse
 from typing import Optional, Dict, Any, List, Tuple
 from ..models import ResolveUrlResult
+from ..cancellation import cap_timeout
 
 SUPPORTED_PLATFORMS = [
     {
@@ -272,14 +273,15 @@ class UrlResolver:
         try:
             import subprocess
             for _ in range(max_hops):
+                hop_timeout = max(1, int(cap_timeout(timeout)))
                 cmd = [
                     "curl", "-sS", "-D", "-", "-o", "/dev/null", "--max-redirs", "0",
                     "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                     "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                     "-H", "Sec-Fetch-Mode: navigate", "-H", "Sec-Fetch-Site: none",
-                    "--max-time", str(timeout), current_url,
+                    "--max-time", str(hop_timeout), current_url,
                 ]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=hop_timeout + 2)
                 location = next((line.split(":", 1)[1].strip() for line in proc.stdout.splitlines()
                                  if line.lower().startswith("location:")), None)
                 if not location:
@@ -309,7 +311,7 @@ class UrlResolver:
                 break
             try:
                 req = urllib.request.Request(current_url, headers=headers, method="HEAD")
-                with opener.open(req, timeout=timeout) as resp:
+                with opener.open(req, timeout=cap_timeout(timeout)) as resp:
                     next_url = resp.geturl()
                     location = resp.headers.get("Location")
                     next_url = urllib.parse.urljoin(current_url, location) if location else current_url
@@ -320,7 +322,7 @@ class UrlResolver:
                 if e.code in (405, 403):
                     try:
                         req = urllib.request.Request(current_url, headers=headers, method="GET")
-                        with opener.open(req, timeout=timeout) as resp:
+                        with opener.open(req, timeout=cap_timeout(timeout)) as resp:
                             location = resp.headers.get("Location")
                             next_url = urllib.parse.urljoin(current_url, location) if location else current_url
                             if next_url == current_url or not cls._validate_network_url(next_url):

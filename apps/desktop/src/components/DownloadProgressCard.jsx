@@ -77,7 +77,7 @@ export default function DownloadProgressCard({
   const statusText =
     customStatusText ||
     (isDone
-      ? '✓ Tải hoàn tất thành công!'
+      ? `✓ ${progress?.message || 'Tải hoàn tất thành công!'}`
       : isCancelled
       ? (progress?.message || '✕ Đã hủy tải xuống (toàn bộ tệp dở dang đã được xoá sạch)')
       : isError
@@ -192,6 +192,25 @@ export default function DownloadProgressCard({
           </strong>
         </div>
       </div>
+    </div>
+  )
+}
+
+/** Một thẻ tiến trình cho mỗi tác vụ tải (xem hooks/useDownloadTasks). */
+export function DownloadTaskList({ tasks, onCancel, onDismiss }) {
+  if (!tasks?.length) return null
+  return (
+    <div className="download-task-list">
+      {tasks.map((task) => (
+        <DownloadProgressCard
+          key={task.id}
+          progress={task.progress}
+          title={task.title}
+          startTime={task.startedAt}
+          onCancel={() => onCancel?.(task.id)}
+          onDismiss={() => onDismiss?.(task.id)}
+        />
+      ))}
     </div>
   )
 }
