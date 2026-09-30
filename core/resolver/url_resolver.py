@@ -5,6 +5,8 @@ Expands shortened URLs, cleans tracking params, and identifies target platforms.
 """
 
 import re
+import ipaddress
+import socket
 import urllib.request
 import urllib.parse
 from typing import Optional, Dict, Any, List, Tuple
@@ -147,6 +149,28 @@ TRACKING_QUERY_PARAMS = {
 
 
 class UrlResolver:
+    @staticmethod
+    def _validate_network_url(raw_url: str) -> bool:
+        """Chỉ cho phép HTTP(S) tới địa chỉ public, kiểm tra lại sau mỗi hop."""
+        try:
+            parsed = urllib.parse.urlparse(raw_url)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+                return False
+            hostname = parsed.hostname.rstrip(".")
+            try:
+                literal_ip = ipaddress.ip_address(hostname)
+                addresses = [literal_ip]
+            except ValueError:
+                addresses = [
+                    ipaddress.ip_address(info[4][0])
+                    for info in socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+                ]
+            return all(not (address.is_private or address.is_loopback or address.is_link_local
+                            or address.is_reserved or address.is_multicast or address.is_unspecified)
+                       for address in addresses)
+        except (ValueError, OSError, socket.gaierror):
+            return False
+
     """Xác thực, phân giải redirect và chuẩn hóa URL"""
 
     @staticmethod
@@ -241,24 +265,30 @@ class UrlResolver:
         current_url = url.strip()
         if not re.match(r"^https?://", current_url, re.IGNORECASE):
             current_url = "https://" + current_url
+        if not cls._validate_network_url(current_url):
+            return current_url
 
-        # 1. Thử dùng curl -sIL để lấy url_effective (nhanh, chuẩn HTTP/2, không bị Facebook chặn 400)
+        # Không dùng -L: mỗi redirect phải được kiểm tra trước khi kết nối hop kế tiếp.
         try:
             import subprocess
-            cmd = [
-                "curl", "-sIL", "-o", "/dev/null", "-w", "%{url_effective}",
-                "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "-H", "Sec-Fetch-Mode: navigate",
-                "-H", "Sec-Fetch-Site: none",
-                "--max-time", str(timeout),
-                current_url,
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
-            if proc.returncode == 0:
-                eff = proc.stdout.strip()
-                if eff and eff.startswith("http") and eff != current_url:
-                    return eff
+            for _ in range(max_hops):
+                cmd = [
+                    "curl", "-sS", "-D", "-", "-o", "/dev/null", "--max-redirs", "0",
+                    "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "-H", "Sec-Fetch-Mode: navigate", "-H", "Sec-Fetch-Site: none",
+                    "--max-time", str(timeout), current_url,
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+                location = next((line.split(":", 1)[1].strip() for line in proc.stdout.splitlines()
+                                 if line.lower().startswith("location:")), None)
+                if not location:
+                    break
+                next_url = urllib.parse.urljoin(current_url, location)
+                if not cls._validate_network_url(next_url):
+                    break
+                current_url = next_url
+            return current_url
         except Exception:
             pass
 
@@ -269,29 +299,41 @@ class UrlResolver:
             "Sec-Fetch-Mode": "navigate",
         }
 
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
         for _ in range(max_hops):
+            if not cls._validate_network_url(current_url):
+                break
             try:
                 req = urllib.request.Request(current_url, headers=headers, method="HEAD")
-                opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler)
                 with opener.open(req, timeout=timeout) as resp:
                     next_url = resp.geturl()
-                    if next_url == current_url:
+                    location = resp.headers.get("Location")
+                    next_url = urllib.parse.urljoin(current_url, location) if location else current_url
+                    if next_url == current_url or not cls._validate_network_url(next_url):
                         break
                     current_url = next_url
             except urllib.error.HTTPError as e:
                 if e.code in (405, 403):
                     try:
                         req = urllib.request.Request(current_url, headers=headers, method="GET")
-                        with urllib.request.urlopen(req, timeout=timeout) as resp:
-                            next_url = resp.geturl()
-                            if next_url == current_url:
+                        with opener.open(req, timeout=timeout) as resp:
+                            location = resp.headers.get("Location")
+                            next_url = urllib.parse.urljoin(current_url, location) if location else current_url
+                            if next_url == current_url or not cls._validate_network_url(next_url):
                                 break
                             current_url = next_url
                     except Exception:
                         break
                 elif 300 <= e.code < 400 and "Location" in e.headers:
                     loc = e.headers["Location"]
-                    current_url = urllib.parse.urljoin(current_url, loc)
+                    next_url = urllib.parse.urljoin(current_url, loc)
+                    if not cls._validate_network_url(next_url):
+                        break
+                    current_url = next_url
                 else:
                     break
             except Exception:

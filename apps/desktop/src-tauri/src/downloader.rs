@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
@@ -149,6 +150,7 @@ pub struct ActiveTaskState {
 
 static DOWNLOAD_REGISTRY: OnceLock<AsyncMutex<HashMap<String, ActiveTaskState>>> = OnceLock::new();
 static CANCELLED_DOWNLOADS: OnceLock<AsyncMutex<HashSet<String>>> = OnceLock::new();
+static ALBUM_REGISTRY: OnceLock<AsyncMutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
 fn get_download_registry() -> &'static AsyncMutex<HashMap<String, ActiveTaskState>> {
     DOWNLOAD_REGISTRY.get_or_init(|| AsyncMutex::new(HashMap::new()))
@@ -156,6 +158,10 @@ fn get_download_registry() -> &'static AsyncMutex<HashMap<String, ActiveTaskStat
 
 fn get_cancelled_downloads() -> &'static AsyncMutex<HashSet<String>> {
     CANCELLED_DOWNLOADS.get_or_init(|| AsyncMutex::new(HashSet::new()))
+}
+
+fn get_album_registry() -> &'static AsyncMutex<HashMap<String, PathBuf>> {
+    ALBUM_REGISTRY.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
 fn kill_process_tree(pid: u32) {
@@ -310,6 +316,36 @@ impl DownloaderService {
                 .map(|h| h.join("Downloads"))
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
         })
+    }
+
+    fn canonical_download_dir(raw_dir: Option<&str>) -> Result<PathBuf, String> {
+        let dir = raw_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(Self::get_default_download_dir);
+        let configured_root = Self::get_default_download_dir();
+        std::fs::create_dir_all(&configured_root)
+            .map_err(|e| format!("Không tạo được thư mục tải mặc định: {e}"))?;
+        let configured_root = std::fs::canonicalize(&configured_root)
+            .map_err(|e| format!("Không xác định được thư mục tải mặc định: {e}"))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Không tạo được thư mục tải: {e}"))?;
+        let canonical = std::fs::canonicalize(&dir)
+            .map_err(|e| format!("Không xác định được thư mục tải: {e}"))?;
+        if !canonical.is_dir() {
+            return Err("Đường dẫn tải phải là một thư mục".to_string());
+        }
+        if !canonical.starts_with(&configured_root) {
+            return Err("Thư mục tải phải nằm trong thư mục tải đã được cấu hình".to_string());
+        }
+        Ok(canonical)
+    }
+
+    async fn remember_album_dir(task_id: &str, path: PathBuf) {
+        get_album_registry().lock().await.insert(task_id.to_string(), path);
+    }
+
+    async fn album_dir_for_task(task_id: &str) -> Option<PathBuf> {
+        get_album_registry().lock().await.get(task_id).cloned()
     }
 
     /// Mở hộp thoại chọn thư mục lưu (Native File Dialog)
@@ -552,15 +588,7 @@ impl DownloaderService {
         opts: DownloadOptions,
     ) -> Result<DownloadResult, String> {
         let ytdlp_path = Self::find_ytdlp()?;
-        let dest_folder = opts
-            .dest_dir
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::get_default_download_dir);
-
-        if !dest_folder.exists() {
-            let _ = tokio::fs::create_dir_all(&dest_folder).await;
-        }
+        let dest_folder = Self::canonical_download_dir(opts.dest_dir.as_deref())?;
 
         // Giới hạn cả title và id ngay trong template: yt-dlp mở file trước khi
         // backend có cơ hội đổi tên sau đó, nên chỉ sanitize ở Rust là chưa đủ.
@@ -1503,13 +1531,7 @@ impl DownloaderService {
         task_id: Option<String>,
         db: Arc<Database>,
     ) -> Result<DownloadResult, String> {
-        let dest_folder = dest_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::get_default_download_dir);
-
-        if !dest_folder.exists() {
-            let _ = tokio::fs::create_dir_all(&dest_folder).await;
-        }
+        let dest_folder = Self::canonical_download_dir(dest_dir)?;
 
         let ext = Self::determine_extension(url, None);
         let initial_name = Self::build_target_filename(url, file_name, None);
@@ -1641,25 +1663,31 @@ impl DownloaderService {
         items: Vec<DirectFileItem>,
         album_name: Option<&str>,
         dest_dir: Option<&str>,
-        album_dir: Option<&str>,
+        _album_dir: Option<&str>,
         as_zip: bool,
         device_id: &str,
         task_id: Option<String>,
         client_ip: Option<&str>,
         db: Arc<Database>,
     ) -> Result<DownloadResult, String> {
-        let base_dest = dest_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::get_default_download_dir);
+        let base_dest = Self::canonical_download_dir(dest_dir)?;
 
         let raw_title = album_name.unwrap_or("Album_Media");
         let clean_title = Self::sanitize_file_name(raw_title, "Album_Media");
 
-        // `album_dir` = thư mục do một lượt gọi trước trả về (luồng tải ảnh rồi
-        // tải video rồi mới nén). Không có thì cấp phát thư mục mới, sạch.
-        let target_dir = match album_dir.map(str::trim).filter(|d| !d.is_empty()) {
-            Some(d) => PathBuf::from(d),
-            None => Self::allocate_album_dir(&base_dest, &clean_title),
+        let task_id = task_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        // Client chỉ được gửi task_id; đường dẫn album luôn do backend cấp phát.
+        let target_dir = match Self::album_dir_for_task(&task_id).await {
+            Some(path) if path.starts_with(&base_dest) => path,
+            Some(_) => return Err("Thư mục album không thuộc thư mục tải đã chọn".to_string()),
+            None => {
+                let path = Self::allocate_album_dir(&base_dest, &clean_title);
+                Self::remember_album_dir(&task_id, path.clone()).await;
+                path
+            }
         };
 
         if !target_dir.exists() {
@@ -1667,10 +1695,11 @@ impl DownloaderService {
                 .await
                 .map_err(|e| format!("Không tạo được thư mục album: {e}"))?;
         }
-
-        let task_id = task_id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let target_dir = std::fs::canonicalize(&target_dir)
+            .map_err(|e| format!("Không xác định được thư mục album: {e}"))?;
+        if !target_dir.starts_with(&base_dest) {
+            return Err("Thư mục album nằm ngoài thư mục tải đã chọn".to_string());
+        }
 
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
         // Thư mục album và tệp ZIP được ghi nhận riêng; không quét cả base_dest.
@@ -2577,12 +2606,48 @@ impl DownloaderService {
         Self::curl_to_file_with_meta(url, referer, dest).await.0
     }
 
+    fn is_public_http_url(raw_url: &str) -> bool {
+        let parsed = match url::Url::parse(raw_url) {
+            Ok(value) if matches!(value.scheme(), "http" | "https") => value,
+            _ => return false,
+        };
+        #[cfg(test)]
+        if parsed.host_str().is_some_and(|host| host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1") {
+            return true;
+        }
+        let host = match parsed.host_str() {
+            Some(value) if !value.eq_ignore_ascii_case("localhost") => value,
+            _ => return false,
+        };
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let addresses = match (host, port).to_socket_addrs() {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        addresses.into_iter().all(|address| {
+            let ip = address.ip();
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && match ip {
+                    std::net::IpAddr::V4(value) => {
+                        !value.is_private() && !value.is_link_local() && !value.is_broadcast()
+                    }
+                    std::net::IpAddr::V6(value) => !value.is_unique_local() && !value.is_unicast_link_local(),
+                }
+        })
+    }
+
     /// Tải 1 URL về đường dẫn bằng curl, trả về (kết_quả, Content-Type_nhận_được)
     pub(crate) async fn curl_to_file_with_meta(
         url: &str,
         referer: &str,
         dest: &Path,
     ) -> (bool, Option<String>) {
+        if !Self::is_public_http_url(url) {
+            warn!("Từ chối URL tải không hợp lệ hoặc trỏ vào mạng nội bộ");
+            return (false, None);
+        }
         const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
         let mut cmd = Command::new("curl");
         #[cfg(windows)]
@@ -2598,6 +2663,9 @@ impl DownloaderService {
         let output = match cmd
             .arg("-sSL")
             .arg("-f")
+            .arg("--proto").arg("=http,https")
+            .arg("--proto-redir").arg("=http,https")
+            .arg("--max-redirs").arg("0")
             .arg("--retry").arg("2")
             .arg("--retry-delay").arg("1")
             .arg("--connect-timeout").arg("20")

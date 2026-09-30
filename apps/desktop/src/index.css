@@ -1,14 +1,14 @@
 :root {
   /* Soft, gentle neutral color palette */
-  --bg-main: #0f1117;
-  --bg-surface: #151821;
-  --bg-surface-hover: #1b1f2b;
-  --bg-surface-elevated: #222736;
-  --bg-input: #12141c;
+  --bg-main: #ffffff;
+  --bg-surface: #ffffff;
+  --bg-surface-hover: #f1f5f9;
+  --bg-surface-elevated: #ffffff;
+  --bg-input: #f8fafc;
   
-  --border-subtle: #262a36;
-  --border-strong: #363c4d;
-  --border-focus: #4b556b;
+  --border-subtle: #d8dee8;
+  --border-strong: #aeb8c8;
+  --border-focus: #64748b;
   
   --primary: #3b82f6;
   --primary-hover: #2563eb;
@@ -19,9 +19,9 @@
   --accent-warning: #f59e0b;
   --accent-danger: #ef4444;
 
-  --text-main: #f1f5f9;
-  --text-muted: #94a3b8;
-  --text-dim: #64748b;
+  --text-main: #172033;
+  --text-muted: #64748b;
+  --text-dim: #94a3b8;
   
   --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -34,9 +34,9 @@
   --radius-xl: 6px;
   --radius-full: 4px; /* Force rectangular even for pills */
 
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.12);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.16);
+  --shadow-lg: 0 12px 32px rgba(15, 23, 42, 0.2);
 }
 
 * {
@@ -69,16 +69,16 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--bg-main);
+  background: #f1f5f9;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #2a2e3d;
+  background: #b8c1cf;
   border-radius: var(--radius-xs);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3a4054;
+  background: #94a3b8;
 }
 
 button {

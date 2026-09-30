@@ -5,22 +5,22 @@
 
 :root {
   --bg-canvas: #0f1117;
-  --bg-panel: #151821;
-  --bg-panel-header: #191c26;
-  --bg-input: #12141c;
-  --bg-input-focus: #171a24;
-  --bg-card: #1b1f2b;
-  --bg-card-hover: #222736;
-  --bg-tertiary: #181b24;
-  --bg-hover: #222736;
-  --border-subtle: #242938;
-  --border-medium: #333a4f;
-  --border-focus: #3b82f6;
-  --text-primary: #f8fafc;
-  --text-secondary: #cbd5e1;
-  --text-muted: #94a3b8;
-  --accent-blue: #3b82f6;
-  --accent-blue-hover: #2563eb;
+  --bg-panel: #ffffff;
+  --bg-panel-header: #f8fafc;
+  --bg-input: #f8fafc;
+  --bg-input-focus: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f1f5f9;
+  --bg-tertiary: #f8fafc;
+  --bg-hover: #f1f5f9;
+  --border-subtle: #d8dee8;
+  --border-medium: #aeb8c8;
+  --border-focus: #64748b;
+  --text-primary: #172033;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+  --accent-blue: #334155;
+  --accent-blue-hover: #1e293b;
   --accent-emerald: #10b981;
   --accent-emerald-hover: #059669;
   --accent-danger: #ef4444;
@@ -29,6 +29,7 @@
   --radius-lg: 14px;
   --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --shadow-media: 0 5px 16px rgba(15, 23, 42, 0.24), 0 1px 3px rgba(15, 23, 42, 0.14);
 }
 
 * {
@@ -41,8 +42,8 @@ body {
   background-color: var(--bg-canvas);
   color: var(--text-primary);
   font-family: var(--font-sans);
-  font-size: 15.5px;
-  line-height: 1.5;
+  font-size: 17px;
+  line-height: 1.55;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -278,8 +279,8 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .browser-item-option.is-selected {
-  background: rgba(59, 130, 246, 0.12);
-  color: var(--accent-blue);
+  background: #e2e8f0;
+  color: #1e293b;
   font-weight: 500;
 }
 
@@ -574,9 +575,9 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .minimal-pill.active {
-  background: #27272a;
-  border-color: #52525b;
-  color: #fff;
+  background: #e2e8f0;
+  border-color: #94a3b8;
+  color: #172033;
   font-weight: 500;
 }
 
@@ -631,7 +632,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 .pane-submit-btn {
   height: 38px;
   padding: 0 18px;
-  background: #2563eb;
+  background: #334155;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: var(--radius-sm);
   color: #fff;
@@ -647,7 +648,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .pane-submit-btn:hover:not(:disabled) {
-  background: #1d4ed8;
+  background: #1e293b;
 }
 
 .pane-submit-btn:disabled {
@@ -748,9 +749,9 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .minimal-small-btn.active {
-  border-color: #52525b;
-  color: #fff;
-  background: #27272a;
+  border-color: #94a3b8;
+  color: #172033;
+  background: #e2e8f0;
 }
 
 /* ==============================================================================
@@ -792,6 +793,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   border-radius: 4px;
   overflow: hidden;
   border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-media);
   flex-shrink: 0;
 }
 
@@ -938,6 +940,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
   transition: all 0.15s ease;
 }
 
@@ -984,7 +987,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 
 .stream-download-btn {
   padding: 8px 16px;
-  background: var(--accent-blue);
+  background: #334155;
   border: none;
   border-radius: var(--radius-sm);
   color: #fff;
@@ -1132,7 +1135,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   border-radius: var(--radius-md);
   padding: 12px 14px;
   margin: 10px 0;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18), 0 2px 6px rgba(15, 23, 42, 0.12);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1483,6 +1486,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   overflow: hidden;
   background: #000;
   border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-media);
   cursor: pointer;
 }
 
@@ -1535,7 +1539,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .album-download-btn:hover {
-  background: #3b82f6;
+  background: #1e293b;
 }
 
 /* Streams Section */
@@ -1639,7 +1643,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .stream-download-btn:hover:not(:disabled) {
-  background: var(--accent-blue);
+  background: var(--accent-blue-hover);
   border-color: var(--accent-blue-hover);
   color: #ffffff;
   box-shadow: 0 2px 8px rgba(59, 130, 246, 0.35);
@@ -1769,6 +1773,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   border: 1px solid var(--border-subtle);
   border-radius: 4px;
   overflow: hidden;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);
   cursor: pointer;
   transition: border-color 0.15s ease;
   content-visibility: auto;
@@ -1849,7 +1854,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .profile-download-btn:hover:not(:disabled) {
-  background: var(--accent-blue);
+  background: var(--accent-blue-hover);
   border-color: var(--accent-blue-hover);
   color: #ffffff;
 }
@@ -2502,10 +2507,10 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .btn-open-folder {
-  background: rgba(59, 130, 246, 0.15);
-  border: 1px solid rgba(59, 130, 246, 0.3);
+  background: #e2e8f0;
+  border: 1px solid #94a3b8;
   border-radius: 4px;
-  color: #60a5fa;
+  color: #1e293b;
   font-size: 11px;
   font-weight: 500;
   padding: 3px 8px;
@@ -2517,9 +2522,9 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 }
 
 .btn-open-folder:hover {
-  background: rgba(59, 130, 246, 0.25);
-  border-color: #60a5fa;
-  color: #93c5fd;
+  background: #cbd5e1;
+  border-color: #64748b;
+  color: #0f172a;
 }
 
 .desktop-live-progress-box {
@@ -2882,7 +2887,7 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   max-height: 85vh;
   display: flex;
   flex-direction: column;
-  box-shadow: var(--shadow-lg);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.24), 0 6px 18px rgba(15, 23, 42, 0.14);
   overflow: hidden;
 }
 

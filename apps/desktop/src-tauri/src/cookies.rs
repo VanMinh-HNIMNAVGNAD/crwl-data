@@ -3,6 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use log::{info, warn};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Thư mục lưu cookie file theo platform
 fn cookies_dir() -> PathBuf {
@@ -20,10 +22,34 @@ fn cookie_file_path(platform: &str) -> PathBuf {
 /// Đảm bảo thư mục cookies tồn tại
 fn ensure_cookies_dir() -> std::io::Result<()> {
     let dir = cookies_dir();
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_cookie_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    use std::io::Write;
+    let mut file = options.open(path)?;
+    file.write_all(content.as_bytes())?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn write_private_cookie_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(path, content)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,13 +391,13 @@ impl CookieService {
 
         let (netscape_content, count) = Self::convert_to_netscape(&normalized, trimmed);
 
-        std::fs::write(&file_path, netscape_content)
+        write_private_cookie_file(&file_path, &netscape_content)
             .map_err(|e| format!("Không thể ghi file cookie: {e}"))?;
 
         Self::cleanup_legacy_cookie_files(&normalized);
 
         let path_str = file_path.to_string_lossy().to_string();
-        info!("Đã lưu {count} cookie(s) cho platform '{normalized}' vào: {path_str}");
+        info!("Đã lưu {count} cookie(s) cho platform '{normalized}'");
 
         Ok(SaveCookieResult {
             success: true,
