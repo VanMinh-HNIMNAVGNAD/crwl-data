@@ -21,7 +21,7 @@
 
   --text-main: #172033;
   --text-muted: #64748b;
-  --text-dim: #94a3b8;
+  --text-dim: #64748b;
   
   --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -115,11 +115,16 @@ svg {
 .w-5 { width: 20px; height: 20px; }
 .h-5 { height: 20px; }
 .w-6 { width: 24px; height: 24px; }
+.w-8 { width: 32px; height: 32px; }
+.h-8 { height: 32px; }
 .h-6 { height: 24px; }
 
 /* Color Utilities */
-.text-emerald-400 { color: #34d399; }
-.text-slate-400 { color: #94a3b8; }
+.text-emerald-400 { color: #059669; }
+.text-slate-400 { color: #64748b; }
+.text-slate-500 { color: #475569; }
+.text-rose-400 { color: #be123c; }
+.text-rose-500 { color: #be123c; }
 .text-white { color: #ffffff; }
 
 

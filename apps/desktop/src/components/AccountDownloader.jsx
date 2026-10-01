@@ -774,7 +774,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
           {/* Container pills — chỉ hiện với video */}
           {mediaTypeFilter !== 'image' && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
-              <span style={{ fontSize: '11px', color: '#94a3b8', minWidth: 'max-content' }}>Định dạng video:</span>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)', minWidth: 'max-content' }}>Định dạng video:</span>
               {VIDEO_CONTAINER_OPTIONS.map((f) => (
                 <button
                   key={f.id}

@@ -252,7 +252,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
             </button>
             <label
               className="checkbox-opt-label"
-              style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', color: '#cbd5e1', fontSize: '12px' }}
+              style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '12px' }}
               title={alwaysAsk
                 ? `Chế độ: Hỏi thư mục mỗi lần tải\nTắt để tự động lưu vào: ${downloadDir || '~/Downloads'}` 
                 : `Chế độ: Tự động lưu vào ${downloadDir || '~/Downloads'}\nBật nếu muốn chọn thư mục trước mỗi lần tải`
@@ -270,7 +270,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
                       : `Tắt: Tự động lưu vào "${downloadDir || 'Downloads mặc định'}"`
                   )
                 }}
-                style={{ cursor: 'pointer', accentColor: '#38bdf8' }}
+                style={{ cursor: 'pointer', accentColor: 'var(--accent-primary)' }}
               />
               <span style={{ userSelect: 'none' }}>Hỏi trước khi tải</span>
             </label>
