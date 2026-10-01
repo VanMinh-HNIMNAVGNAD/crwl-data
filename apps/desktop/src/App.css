@@ -1198,12 +1198,22 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
    DOWNLOAD PROGRESS CARD & STATS PANEL
    ============================================================================== */
 
-/* Nhiều tác vụ tải song song: mỗi tác vụ một thẻ, cuộn khi quá nhiều */
+/* Nhiều tác vụ tải song song: mỗi tác vụ một thẻ, cuộn khi quá nhiều.
+   Khối này là con của .pane-results-container (flex dọc, cố định chiều cao).
+   Vì có overflow nên min-height mặc định của nó là 0: thiếu flex-shrink: 0 thì
+   khi kết quả dài hơn khung, trình duyệt co nó về 0px và thanh tiến trình biến mất.
+   Ghim ở đầu khung để cuộn xuống chọn chất lượng vẫn thấy tiến trình. */
 .download-task-list {
   display: flex;
   flex-direction: column;
-  max-height: 420px;
+  flex-shrink: 0;
+  max-height: min(420px, 45vh);
   overflow-y: auto;
+  position: sticky;
+  /* Bù padding 10px của khung cuộn để dính sát mép, nội dung không lọt qua khe */
+  top: -10px;
+  z-index: 5;
+  background: var(--bg-well);
 }
 
 .download-progress-card {

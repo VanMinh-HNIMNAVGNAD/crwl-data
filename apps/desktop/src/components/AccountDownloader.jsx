@@ -22,7 +22,7 @@ import {
   getAlwaysAskDownloadDir,
 } from '../services/api'
 import { DownloadTaskList } from './DownloadProgressCard'
-import { useDownloadTasks } from '../hooks/useDownloadTasks'
+import { useDownloadTasks, parseSpeed, formatSpeed } from '../hooks/useDownloadTasks'
 
 function safeMediaTitle(item, fallback = 'media') {
   // Một bài đăng có thể chứa nhiều ảnh. Ghép mã bài đăng + số thứ tự trong bài
@@ -560,6 +560,10 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
         const videoPercents = new Array(videoItems.length).fill(0)
         const averageVideoPercent = () =>
           (videoPercents.reduce((sum, p) => sum + p, 0) / videoItems.length) * 0.9
+        // Tốc độ (byte/giây) của TỪNG video: ô "Tốc độ tải" là tổng các video đang
+        // chạy, không phải tốc độ của riêng video vừa gửi sự kiện.
+        const videoSpeeds = new Array(videoItems.length).fill(0)
+        const totalVideoSpeed = () => formatSpeed(videoSpeeds.reduce((sum, v) => sum + v, 0))
 
         const downloadNextVideo = async () => {
           while (!isCancelled(taskId)) {
@@ -573,13 +577,23 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
             try {
               videoUnlisten = await onDownloadProgress((payload) => {
                 videoPercents[index] = Math.max(videoPercents[index], Number(payload?.percent) || 0)
+                // yt-dlp báo tốc độ "Unknown" thoáng qua khi đang tải: giữ số cũ thay
+                // vì để tổng tụt xuống. Ghép tệp / xong / lỗi thì video đó không còn tải.
+                if (payload?.speed || payload?.status !== 'downloading') {
+                  videoSpeeds[index] = parseSpeed(payload?.speed)
+                }
                 // "completed"/"error" của MỘT video không phải trạng thái của cả lượt:
                 // để nguyên sẽ làm thẻ báo "Hoàn tất" và ẩn nút Huỷ giữa chừng.
                 const finishedOne = payload?.status === 'completed' || payload?.status === 'error'
                 updateTask(taskId, {
                   ...payload,
                   percent: averageVideoPercent(),
-                  status: finishedOne ? 'downloading' : payload?.status,
+                  speed: totalVideoSpeed(),
+                  // Các video tải song song cùng ghi vào một thẻ: ETA của từng video
+                  // làm ô "còn lại" nhảy qua lại. Để trống cho useDownloadTasks ước
+                  // tính theo phần trăm tổng; video đang ghép tệp vẫn là "đang tải".
+                  eta: '',
+                  status: finishedOne || payload?.status === 'processing' ? 'downloading' : payload?.status,
                   filePath: undefined,
                   isIndeterminate: false,
                   phase: `Đang tải video [${index + 1}/${videoItems.length}]...`,
@@ -611,9 +625,11 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
               if (typeof videoUnlisten === 'function') videoUnlisten()
               completedVideos++
               videoPercents[index] = 100
+              videoSpeeds[index] = 0
               updateTask(taskId, (prev) => ({
                 ...(prev || {}),
                 percent: averageVideoPercent(),
+                speed: totalVideoSpeed(),
                 status: 'downloading',
                 phase: `Đã xử lý ${completedVideos}/${videoItems.length} video`,
               }))

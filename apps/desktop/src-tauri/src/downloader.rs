@@ -132,6 +132,17 @@ pub struct Aria2cProgress {
     pub total: String,
 }
 
+/// Một dòng `download-progress:` do `--progress-template` của yt-dlp in ra.
+#[derive(Debug, Clone, PartialEq)]
+pub struct YtdlpProgressLine {
+    /// `None` khi yt-dlp không biết tổng dung lượng nên phần trăm vô nghĩa
+    pub percent: Option<f64>,
+    pub speed: String,
+    pub eta: String,
+    pub format_id: String,
+    pub downloaded: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadResult {
     pub success: bool,
@@ -705,7 +716,7 @@ impl DownloaderService {
         cmd.arg("--trim-filenames").arg("140");
         cmd.arg("--newline");
         cmd.arg("--progress-template").arg(
-            "download-progress:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.format_id)s",
+            "download-progress:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.format_id)s|%(progress._downloaded_bytes_str)s|%(progress.total_bytes,progress.total_bytes_estimate)s",
         );
         // In ra đường dẫn cuối cùng sau khi merge/post-process để UI luôn biết file đã lưu ở đâu.
         cmd.arg("--print").arg("after_move:filepath");
@@ -978,7 +989,6 @@ impl DownloaderService {
         });
 
         let mut reader = BufReader::new(stdout).lines();
-        let percent_regex = Regex::new(r"([\d\.]+)%").map_err(|e| e.to_string())?;
 
         // yt-dlp in "Downloading N format(s): 137+140" trước khi tải, nhờ đó biết
         // chính xác sẽ có mấy lượt tải để quy đổi ra phần trăm tổng thể.
@@ -1043,38 +1053,25 @@ impl DownloaderService {
                     };
 
                     if let Some(rest) = line.strip_prefix("download-progress:") {
-                        let parts: Vec<&str> = rest.split('|').collect();
-                        let percent_str = parts.first().copied().unwrap_or("").trim();
-                        let clean = |v: &str| {
-                            let t = v.trim();
-                            if t.is_empty() || t.starts_with("Unknown") || t == "N/A" || t == "NA" {
-                                String::new()
-                            } else {
-                                t.to_string()
-                            }
-                        };
-                        let speed = clean(parts.get(1).copied().unwrap_or(""));
-                        let eta = clean(parts.get(2).copied().unwrap_or(""));
-                        let format_id = parts.get(3).copied().unwrap_or("").trim().to_string();
+                        let p = Self::parse_ytdlp_progress(rest);
 
                         // Đổi format_id nghĩa là yt-dlp đã chuyển sang lượt tải kế tiếp
-                        if !format_id.is_empty() && format_id != "NA" {
+                        if !p.format_id.is_empty() {
                             match current_format {
-                                Some(ref f) if f == &format_id => {}
+                                Some(ref f) if f == &p.format_id => {}
                                 Some(_) => {
                                     pass_index = (pass_index + 1).min(expected_passes.saturating_sub(1));
-                                    current_format = Some(format_id.clone());
+                                    current_format = Some(p.format_id.clone());
                                 }
-                                None => current_format = Some(format_id.clone()),
+                                None => current_format = Some(p.format_id.clone()),
                             }
                         }
 
-                        let pass_percent = percent_regex
-                            .captures(percent_str)
-                            .and_then(|c| c.get(1))
-                            .and_then(|m| m.as_str().parse::<f64>().ok())
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 100.0);
+                        // Máy chủ không báo dung lượng (thiếu Content-Length) thì yt-dlp vẫn
+                        // in "0.0%" suốt lượt tải nên thanh tiến trình đứng im ở 0; nay báo
+                        // UI chạy dạng "chưa rõ tiến độ".
+                        let percent_known = p.percent.is_some();
+                        let pass_percent = p.percent.unwrap_or(0.0);
 
                         let raw = Self::weighted_percent(pass_index, expected_passes, pass_percent);
                         overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
@@ -1088,22 +1085,26 @@ impl DownloaderService {
                         last_progress_emit = Some(std::time::Instant::now());
                         last_emitted_pass = pass_index;
 
-                        let phase = if expected_passes > 1 {
+                        let mut phase = if expected_passes > 1 {
                             format!("Đang tải luồng {}/{}", pass_index + 1, expected_passes)
                         } else {
                             "Đang tải dữ liệu".to_string()
                         };
+                        // Không có phần trăm thì ít nhất cho thấy dữ liệu vẫn đang về
+                        if !percent_known && !p.downloaded.is_empty() {
+                            phase = format!("{phase} (đã nhận {})", p.downloaded);
+                        }
 
                         progress_emit(DownloadProgressPayload {
                             id: task_id.clone(),
                             percent: overall_percent,
-                            speed,
-                            eta,
+                            speed: p.speed,
+                            eta: p.eta,
                             status: "downloading".to_string(),
                             phase,
                             file_path: None,
                             message: None,
-                            is_indeterminate: false,
+                            is_indeterminate: !percent_known,
                         });
                         continue;
                     }
@@ -1488,6 +1489,40 @@ impl DownloaderService {
                 lower.contains("postprocessing")
                     && (lower.contains("thumbnail") || lower.contains("mutagen"))
             })
+    }
+
+    /// Tách phần sau tiền tố `download-progress:` thành các trường:
+    /// `phần trăm|tốc độ|ETA|format_id|đã nhận|tổng byte`. yt-dlp in "Unknown",
+    /// "N/A" hoặc "NA" cho giá trị chưa đo được, tất cả được quy về chuỗi rỗng.
+    ///
+    /// Không biết tổng dung lượng thì yt-dlp KHÔNG in "N/A%" mà in "0.0%" (nó
+    /// định dạng `False` thành số), nên phải dựa vào trường tổng byte để biết
+    /// phần trăm có ý nghĩa hay không. Riêng dòng kết thúc lượt (100%) luôn đúng.
+    pub fn parse_ytdlp_progress(rest: &str) -> YtdlpProgressLine {
+        let parts: Vec<&str> = rest.split('|').collect();
+        let field = |i: usize| {
+            let t = parts.get(i).copied().unwrap_or("").trim();
+            if t.is_empty() || t.starts_with("Unknown") || t == "N/A" || t == "NA" {
+                String::new()
+            } else {
+                t.to_string()
+            }
+        };
+        let total_known = !field(5).is_empty();
+        let percent = parts
+            .first()
+            .and_then(|v| v.trim().strip_suffix('%'))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (total_known || *v >= 100.0))
+            .map(|v| v.clamp(0.0, 100.0));
+
+        YtdlpProgressLine {
+            percent,
+            speed: field(1),
+            eta: field(2),
+            format_id: field(3),
+            downloaded: field(4),
+        }
     }
 
     /// Đọc dòng `[info] ...: Downloading N format(s): 137+140` để biết yt-dlp sẽ
@@ -3131,6 +3166,42 @@ mod tests {
         assert_eq!(D::postprocess_phase("[ExtractAudio] Destination: /tmp/a.mp3"), Some("Đang tách âm thanh..."));
         assert_eq!(D::postprocess_phase("[download] Destination: /tmp/a.mp4"), None);
         assert_eq!(D::postprocess_phase("/tmp/a.mkv"), None);
+    }
+
+    #[test]
+    fn ytdlp_progress_lines_are_parsed_correctly() {
+        // Các dòng dưới đây lấy nguyên văn từ yt-dlp 2026.08.19 với template của app
+
+        // Có Content-Length: phần trăm dùng được, các trường có đệm khoảng trắng
+        let p = D::parse_ytdlp_progress("  0.3%|   4.26MiB/s|00:00|mp4|   7.00KiB|2621440");
+        assert_eq!(p.percent, Some(0.3));
+        assert_eq!(p.speed, "4.26MiB/s");
+        assert_eq!(p.eta, "00:00");
+        assert_eq!(p.format_id, "mp4");
+        assert_eq!(p.downloaded, "7.00KiB");
+
+        // Vài giây đầu: chưa đo được tốc độ / ETA
+        let p = D::parse_ytdlp_progress("  0.0%| Unknown B/s|Unknown|mp4|   1.00KiB|2621440");
+        assert_eq!(p.percent, Some(0.0));
+        assert_eq!(p.speed, "");
+        assert_eq!(p.eta, "");
+
+        // Không có Content-Length: yt-dlp in "0.0%" nhưng thật ra là chưa rõ tiến độ
+        let p = D::parse_ytdlp_progress("  0.0%|   1.02MiB/s|Unknown|mp4|   3.00KiB|NA");
+        assert_eq!(p.percent, None);
+        assert_eq!(p.speed, "1.02MiB/s");
+        assert_eq!(p.downloaded, "3.00KiB");
+
+        // Dòng kết thúc lượt: không có ETA / số byte đã nhận
+        let p = D::parse_ytdlp_progress("100.0%|1.24MiB/s|NA|mp4|NA|2621440");
+        assert_eq!(p.percent, Some(100.0));
+        assert_eq!(p.eta, "");
+        assert_eq!(p.downloaded, "");
+
+        // Phiên bản yt-dlp khác có thể in "N/A%"; format_id "NA" coi như không có
+        let p = D::parse_ytdlp_progress("  N/A%|   1.10MiB/s|Unknown|NA|   5.00MiB|NA");
+        assert_eq!(p.percent, None);
+        assert_eq!(p.format_id, "");
     }
 
     #[test]

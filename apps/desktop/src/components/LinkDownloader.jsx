@@ -903,7 +903,11 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             updateTask(taskId, {
               ...payload,
               percent: ((completed + videoPercent / 100) / totalUnits) * 90,
-              status: finishedOne ? 'downloading' : payload?.status,
+              // ETA của riêng một video không phải ETA của cả gói ZIP: để trống cho
+              // useDownloadTasks ước tính theo phần trăm tổng. Video đang ghép tệp
+              // cũng vẫn là "đang tải" xét trên cả gói.
+              eta: '',
+              status: finishedOne || payload?.status === 'processing' ? 'downloading' : payload?.status,
               filePath: undefined,
               isIndeterminate: false,
               phase: `Đang tải video [${index + 1}/${videoItems.length}]...`,

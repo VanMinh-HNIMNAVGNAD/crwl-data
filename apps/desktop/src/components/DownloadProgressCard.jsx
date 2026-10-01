@@ -1,16 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { IconDownload, IconCheck, IconClose } from './Icons'
 import { openDownloadFolder } from '../services/api'
-
-function formatSeconds(secs) {
-  if (!Number.isFinite(secs) || secs < 0) return '00:00'
-  const h = Math.floor(secs / 3600)
-  const m = Math.floor((secs % 3600) / 60)
-  const s = Math.floor(secs % 60)
-  const mm = m.toString().padStart(2, '0')
-  const ss = s.toString().padStart(2, '0')
-  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
-}
+import { formatSeconds } from '../hooks/useDownloadTasks'
 
 export function Timer({ startTime, isFinished }) {
   const [elapsed, setElapsed] = useState(0)
