@@ -86,6 +86,9 @@ class BaseExtractor:
         (bao gồm child processes của yt-dlp/gallery-dl) khi timeout.
         """
         merged_env = os.environ.copy()
+        # yt-dlp / gallery-dl là chương trình Python: buộc xuất UTF-8 để khớp với cách
+        # giải mã bên dưới (trên Windows chúng mặc định ghi theo code page của console).
+        merged_env.setdefault("PYTHONIOENCODING", "utf-8")
         if env:
             merged_env.update(env)
 
@@ -108,6 +111,11 @@ class BaseExtractor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                # Một byte không phải UTF-8 (tiêu đề, thông báo lỗi theo locale...) từng
+                # làm communicate() ném UnicodeDecodeError giữa chừng: mất toàn bộ kết
+                # quả và tiến trình con bị bỏ lại không ai đọc.
+                encoding="utf-8",
+                errors="replace",
                 cwd=cwd or self.project_root,
                 env=merged_env,
                 **popen_kwargs,

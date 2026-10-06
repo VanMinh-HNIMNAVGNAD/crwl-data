@@ -32,6 +32,10 @@ class YtDlpExtractor(BaseExtractor):
         self.binary_path = self.find_binary("yt-dlp", "YT_DLP_PATH")
 
     def is_available(self) -> bool:
+        # Cài yt-dlp SAU khi engine đã khởi động thì lần dò lúc khởi động không thấy:
+        # dò lại thay vì báo "không tìm thấy" mãi tới khi khởi động lại engine.
+        if not (self.binary_path and os.path.exists(self.binary_path)):
+            self.binary_path = self.find_binary("yt-dlp", "YT_DLP_PATH")
         return self.binary_path is not None and os.path.exists(self.binary_path)
 
     def get_base_args(self, allow_playlist: bool = False, browser: Optional[str] = None, target_url: str = "") -> Tuple[List[str], Optional[str]]:

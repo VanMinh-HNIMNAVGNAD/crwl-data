@@ -12,7 +12,7 @@ import {
 import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings } from './Icons'
 const mediaLogo = '/favicon.svg'
 
-export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools, cookieRefreshKey }) {
+export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools, cookieRefreshKey, settingsVersion }) {
   const [browsersData, setBrowsersData] = useState(null)
   const [selectedBrowser, setSelectedBrowser] = useState(getActiveBrowser() || '')
   const [downloadDir, setDownloadDir] = useState('')
@@ -78,6 +78,19 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
     // quét lại toàn bộ hệ thống, và việc tự động chọn lúc khởi động từng khiến
     // effect chạy hai lần liên tiếp.
   }, [cookieRefreshKey])
+
+  // Thư mục tải mặc định đổi ở modal Công cụ: trước đây nhãn 📁 vẫn hiển thị
+  // thư mục cũ tới khi khởi động lại ứng dụng.
+  useEffect(() => {
+    if (!settingsVersion) return
+    let active = true
+    getDefaultDownloadDirectory().then((dir) => {
+      if (active && dir) setDownloadDir(dir)
+    })
+    return () => {
+      active = false
+    }
+  }, [settingsVersion])
 
   useEffect(() => () => {
     if (toastTimer.current) clearTimeout(toastTimer.current)
@@ -292,7 +305,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
             type="button"
             className="btn-tools-trigger"
             onClick={onOpenTools}
-            title="Kiểm tra & Cập nhật các công cụ Engine (yt-dlp, gallery-dl, FFmpeg, aria2c...)"
+            title="Kiểm tra công cụ (yt-dlp, gallery-dl, FFmpeg, aria2c...), cập nhật yt-dlp / gallery-dl và cấu hình ứng dụng"
           >
             <IconSettings className="w-4 h-4 text-slate-400" />
             <span>Công cụ</span>

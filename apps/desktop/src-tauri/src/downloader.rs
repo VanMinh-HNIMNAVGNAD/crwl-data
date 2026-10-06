@@ -313,31 +313,13 @@ pub struct DownloaderService;
 impl DownloaderService {
     /// Tìm vị trí binary yt-dlp
     pub fn find_ytdlp() -> Result<PathBuf, String> {
-        // Đường dẫn tuỳ chỉnh trong settings được ưu tiên tuyệt đối
-        if let Some(custom) = SettingsManager::custom_binary_path("yt-dlp") {
-            return Ok(custom);
-        }
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        let candidates = vec![
-            home.join(".local/bin/yt-dlp"),
-            PathBuf::from("/usr/local/bin/yt-dlp"),
-            PathBuf::from("/usr/bin/yt-dlp"),
-            PathBuf::from("bin/yt-dlp"),
-            PathBuf::from("yt-dlp"),
-        ];
-
-        for c in candidates {
-            if c.exists() {
-                return Ok(c);
-            }
-        }
-
-        // Kiểm tra trong PATH
-        if let Ok(path) = which::which("yt-dlp") {
-            return Ok(path);
-        }
-
-        Ok(PathBuf::from("yt-dlp"))
+        // Dùng CHUNG cách dò với màn hình Công cụ và engine bóc tách. Trước đây mỗi nơi
+        // dò theo thứ tự riêng, nên khi máy có hai bản yt-dlp (vd. apt + pipx) nút
+        // "Cập nhật" có thể nâng cấp một bản trong khi lượt tải vẫn dùng bản kia.
+        BinaryManager::find_binary("yt-dlp").ok_or_else(|| {
+            "Không tìm thấy yt-dlp trên máy. Mở 'Công cụ' để kiểm tra, hoặc cài bằng: pipx install yt-dlp"
+                .to_string()
+        })
     }
 
     /// Lấy thư mục tải mặc định
@@ -449,7 +431,9 @@ impl DownloaderService {
         }
 
         info!("Đang mở thư mục trong File Manager Linux: {:?}", target);
-        open::that(target).map_err(|e| format!("Không thể mở thư mục: {e}"))
+        // `open::that` CHỜ trình mở (xdg-open...) thoát, mà lệnh Tauri đồng bộ chạy
+        // trên luồng chính — trình mở chậm là cả giao diện đứng hình theo.
+        open::that_detached(target).map_err(|e| format!("Không thể mở thư mục: {e}"))
     }
 
     /// Nhận diện platform từ URL để chọn đúng cookie file.
@@ -833,13 +817,19 @@ impl DownloaderService {
             } else if fid.starts_with("subtitle:") {
                 // Tải phụ đề: format = "subtitle:vi:vtt" -> lang=vi, ext=vtt
                 let parts: Vec<&str> = fid.splitn(3, ':').collect();
-                let lang = parts.get(1).unwrap_or(&"en");
-                let sub_fmt = parts.get(2).unwrap_or(&"vtt");
+                let lang = parts.get(1).copied().filter(|l| !l.trim().is_empty()).unwrap_or("en");
+                let requested = parts.get(2).copied().unwrap_or("");
+                // Danh sách phụ đề trên UI gồm cả phụ đề TỰ ĐỘNG (automatic_captions).
+                // Chỉ có --write-subs thì yt-dlp bỏ qua chúng, in "There are no subtitles
+                // for the requested languages" và thoát mã 0 mà không ghi tệp nào — app
+                // từng báo "Đã lưu phụ đề" kèm tên thư mục. Có cả hai cờ thì yt-dlp vẫn
+                // ưu tiên phụ đề thủ công khi ngôn ngữ đó có sẵn.
                 cmd.arg("--write-subs")
-                    .arg("--sub-lang")
-                    .arg(lang)
+                    .arg("--write-auto-subs")
+                    .arg("--sub-langs")
+                    .arg(regex::escape(lang.trim()))
                     .arg("--sub-format")
-                    .arg(sub_fmt)
+                    .arg(Self::subtitle_format_preference(requested))
                     .arg("--skip-download");
             } else if fid == "best" {
                 cmd.arg("-f").arg("bestvideo+bestaudio/best");
@@ -1206,13 +1196,16 @@ impl DownloaderService {
                         || line.contains("Writing video subtitles to:")
                         || line.contains("[Thumbnails] Writing thumbnail to:")
                     {
-                        if let Some(pos) = line.rfind(": ") {
-                            let path = line[pos + 2..].trim().trim_matches('"').to_string();
-                            if !path.is_empty() {
-                                Self::record_file_path(&task_id, PathBuf::from(&path)).await;
-                                downloaded_file_path = Some(path);
-                            }
+                        if let Some(path) = Self::path_after_to(&line) {
+                            Self::record_file_path(&task_id, PathBuf::from(&path)).await;
+                            downloaded_file_path = Some(path);
                         }
+                        continue;
+                    }
+
+                    if let Some(converted) = Self::converted_thumbnail_path(&line) {
+                        Self::record_file_path(&task_id, converted.clone()).await;
+                        downloaded_file_path = Some(converted.to_string_lossy().to_string());
                         continue;
                     }
 
@@ -1320,15 +1313,39 @@ impl DownloaderService {
             warn!("[{task_id}] Tệp đã tải xong nhưng không nhúng được ảnh bìa — vẫn tính là thành công");
         }
 
-        if !status.success() && !thumbnail_only_failure {
-            Self::unregister_task(&task_id).await;
+        // Tải ảnh bìa / phụ đề (--skip-download): yt-dlp thoát mã 0 cả khi KHÔNG ghi
+        // được tệp nào, nên phải kiểm tra tệp thật. Trước đây khi đó app báo "Đã lưu"
+        // kèm tên thư mục tải và ghi lịch sử là thành công.
+        let side_file_label = match opts.format_id.as_deref() {
+            Some("thumbnail") => Some("ảnh bìa"),
+            Some(f) if f.starts_with("subtitle:") => Some("phụ đề"),
+            _ => None,
+        };
+        let side_file_written = downloaded_file_path
+            .as_deref()
+            .map(|p| Path::new(p).is_file())
+            .unwrap_or(false);
+
+        let failure = if !status.success() && !thumbnail_only_failure {
             // Báo đúng nguyên nhân từ yt-dlp thay vì một câu chung chung
             let detail = Self::summarize_ytdlp_error(&collected_stderr);
-            let err_msg = if detail.is_empty() {
+            Some(if detail.is_empty() {
                 format!("Tải thất bại (yt-dlp kết thúc với mã {})", status.code().unwrap_or(-1))
             } else {
                 detail
-            };
+            })
+        } else if let (Some(label), false) = (side_file_label, side_file_written) {
+            Some(if label == "phụ đề" {
+                "Video không có phụ đề cho ngôn ngữ đã chọn — yt-dlp không ghi được tệp phụ đề nào.".to_string()
+            } else {
+                "Không tìm thấy ảnh bìa để tải cho liên kết này.".to_string()
+            })
+        } else {
+            None
+        };
+
+        if let Some(err_msg) = failure {
+            Self::unregister_task(&task_id).await;
 
             progress_emit(DownloadProgressPayload {
                 id: task_id.clone(),
@@ -1403,6 +1420,39 @@ impl DownloaderService {
             file_name: Some(file_name),
             message: "Tải xuống thành công và lưu trực tiếp vào máy tính!".to_string(),
         })
+    }
+
+    /// Thứ tự ưu tiên `--sub-format`. Định dạng đầu tiên YouTube liệt kê là json3 —
+    /// định dạng nội bộ mà trình phát không đọc được — nên chỉ giữ yêu cầu của UI khi
+    /// đó là định dạng phụ đề văn bản thông dụng.
+    fn subtitle_format_preference(requested: &str) -> String {
+        let requested = requested.trim().to_ascii_lowercase();
+        match requested.as_str() {
+            "vtt" => "vtt/srt/best".to_string(),
+            "ass" | "ssa" | "lrc" => format!("{requested}/srt/vtt/best"),
+            _ => "srt/vtt/best".to_string(),
+        }
+    }
+
+    /// Đường dẫn trong dòng "... to: <path>" của yt-dlp ("Writing video subtitles to:",
+    /// "Writing video thumbnail 41 to:"). Không dùng ": " cuối cùng vì thư mục tải có
+    /// thể chứa dấu hai chấm.
+    fn path_after_to(line: &str) -> Option<String> {
+        let (_, rest) = line.split_once(" to: ").or_else(|| line.rsplit_once(": "))?;
+        let path = rest.trim().trim_matches('"');
+        (!path.is_empty()).then(|| path.to_string())
+    }
+
+    /// `[ThumbnailsConvertor] Converting thumbnail "<path>.webp" to jpg` → `<path>.jpg`.
+    /// yt-dlp xoá tệp gốc sau khi chuyển, nên phải theo đường dẫn mới.
+    fn converted_thumbnail_path(line: &str) -> Option<PathBuf> {
+        let rest = line.strip_prefix("[ThumbnailsConvertor] Converting thumbnail \"")?;
+        let (source, ext) = rest.rsplit_once("\" to ")?;
+        let ext = ext.trim();
+        if source.is_empty() || ext.is_empty() {
+            return None;
+        }
+        Some(Path::new(source).with_extension(ext))
     }
 
     /// format_id do UI gửi lên để yêu cầu tách âm thanh (vd "mp3", "flac_best").
@@ -1745,17 +1795,7 @@ impl DownloaderService {
         }
 
         // Priority 1: Nếu trước khi tải chưa có đuôi mở rộng, nhưng HTTP response trả về Content-Type cụ thể
-        let mut final_path = target_path;
-        if final_path.extension().is_none() {
-            if let Some(ct) = content_type.as_deref() {
-                if let Some(ct_ext) = Self::extension_from_content_type(ct) {
-                    let candidate = final_path.with_extension(ct_ext);
-                    if !candidate.exists() && std::fs::rename(&final_path, &candidate).is_ok() {
-                        final_path = candidate;
-                    }
-                }
-            }
-        }
+        let final_path = Self::add_extension_from_content_type(target_path, content_type.as_deref());
 
         let file_size = final_path.metadata().map(|m| m.len() as i64).ok();
         let path_str = final_path.to_string_lossy().to_string();
@@ -1945,7 +1985,7 @@ impl DownloaderService {
                 } else {
                     let safe = Self::sanitize_file_name(raw_fname, &format!("media_{}", idx + 1));
                     // Chỉ bổ sung đuôi khi tên chưa có — không nối chồng thành "anh.jpg.heic"
-                    if Path::new(&safe).extension().is_some() {
+                    if Self::has_media_extension(&safe) {
                         safe
                     } else if !ext.is_empty() {
                         format!("{safe}.{ext}")
@@ -1978,18 +2018,7 @@ impl DownloaderService {
                     let (ok, content_type) = Self::curl_to_file_with_meta(&item.url, &referer_header, &dest_file).await;
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if ok {
-                        let mut final_dest = dest_file;
-                        if final_dest.extension().is_none() {
-                            if let Some(ct) = content_type.as_deref() {
-                                if let Some(ct_ext) = Self::extension_from_content_type(ct) {
-                                    let candidate = final_dest.with_extension(ct_ext);
-                                    if !candidate.exists() && std::fs::rename(&final_dest, &candidate).is_ok() {
-                                        final_dest = candidate;
-                                    }
-                                }
-                            }
-                        }
-                        Some(final_dest)
+                        Some(Self::add_extension_from_content_type(dest_file, content_type.as_deref()))
                     } else {
                         warn!("Không tải được tệp album: {}", item.url);
                         None
@@ -2301,14 +2330,16 @@ impl DownloaderService {
 
         let safe_name = Self::sanitize_file_name(file_name_only, "media");
         let p = Path::new(&safe_name);
-        let stem = p
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("media");
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or(default_ext);
+        // Dấu chấm trong tiêu đề ("Mr. Bean") không phải đuôi tệp: khi đó cả tên là
+        // phần thân, đánh số trùng tên thành "Mr. Bean_1" thay vì "Mr_1. Bean".
+        let (stem, ext) = if Self::has_media_extension(&safe_name) {
+            (
+                p.file_stem().and_then(|s| s.to_str()).unwrap_or("media"),
+                p.extension().and_then(|e| e.to_str()).unwrap_or(default_ext),
+            )
+        } else {
+            (safe_name.as_str(), default_ext)
+        };
 
         let initial_cand = if !ext.is_empty() {
             format!("{stem}.{ext}")
@@ -2335,6 +2366,49 @@ impl DownloaderService {
                 return cand_path;
             }
             counter += 1;
+        }
+    }
+
+    /// Tên tệp đã có đuôi media thật hay chưa.
+    ///
+    /// `Path::extension()` coi mọi thứ sau dấu chấm CUỐI là đuôi: tiêu đề
+    /// "Mr. Bean_123" có "đuôi" " Bean_123", nên ảnh từng bị lưu thiếu .jpg (không mở
+    /// được bằng nhấp đúp) và bước đặt đuôi theo Content-Type cũng bị bỏ qua.
+    pub(crate) fn has_media_extension(name: &str) -> bool {
+        const MEDIA_EXTENSIONS: &[&str] = &[
+            "jpg", "jpeg", "png", "webp", "avif", "gif", "svg", "heic", "heif", "bmp", "tif", "tiff", "ico",
+            "mp4", "webm", "m4s", "ts", "m3u8", "mpd", "mov", "m4v", "mkv", "avi", "flv", "3gp",
+            "mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "zip",
+        ];
+        Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| MEDIA_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(false)
+    }
+
+    /// Thêm đuôi vào CUỐI tên tệp (không thay thế phần sau dấu chấm như `with_extension`).
+    fn append_extension(path: &Path, ext: &str) -> PathBuf {
+        let mut raw = path.as_os_str().to_os_string();
+        raw.push(".");
+        raw.push(ext);
+        PathBuf::from(raw)
+    }
+
+    /// Tệp đã tải chưa có đuôi media → đặt đuôi theo Content-Type máy chủ trả về.
+    fn add_extension_from_content_type(path: PathBuf, content_type: Option<&str>) -> PathBuf {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if Self::has_media_extension(&name) {
+            return path;
+        }
+        let Some(ext) = content_type.and_then(Self::extension_from_content_type) else {
+            return path;
+        };
+        let candidate = Self::append_extension(&path, ext);
+        if !candidate.exists() && std::fs::rename(&path, &candidate).is_ok() {
+            candidate
+        } else {
+            path
         }
     }
 
@@ -2396,7 +2470,7 @@ impl DownloaderService {
             .map(|f| Self::sanitize_file_name(f, ""))
             .filter(|f| !f.is_empty())
             .map(|f| {
-                if Path::new(&f).extension().is_some() {
+                if Self::has_media_extension(&f) {
                     f
                 } else if !ext.is_empty() {
                     format!("{f}.{ext}")
@@ -4392,5 +4466,61 @@ mod tests {
 
         assert!(D::is_download_cancelled(&child_id).await);
         assert!(cancel_rx.try_recv().is_ok());
+    }
+
+    /// Tiêu đề có dấu chấm ("Mr. Bean") từng bị coi là đã có đuôi tệp: ảnh lưu ra
+    /// không có .jpg và bước đặt đuôi theo Content-Type cũng bị bỏ qua.
+    #[test]
+    fn titles_with_dots_still_get_a_real_media_extension() {
+        assert_eq!(D::build_target_filename("https://cdn/x/photo.jpg", Some("Mr. Bean_123"), None), "Mr. Bean_123.jpg");
+        assert_eq!(D::build_target_filename("https://cdn/x/photo.jpg", Some("anh.JPG"), None), "anh.JPG");
+        assert!(D::has_media_extension("clip.MP4"));
+        assert!(!D::has_media_extension("Mr. Bean_123"));
+        assert!(!D::has_media_extension("release v1.2"));
+
+        let dir = std::env::temp_dir().join(format!("test_dotted_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reserved = std::collections::HashSet::new();
+        let first = D::resolve_collision_free_path(&dir, "Mr. Bean_123", "", &mut reserved);
+        let second = D::resolve_collision_free_path(&dir, "Mr. Bean_123", "", &mut reserved);
+        assert_eq!(first, dir.join("Mr. Bean_123"));
+        assert_eq!(second, dir.join("Mr. Bean_123_1"));
+
+        // Chỉ biết loại tệp sau khi tải: THÊM đuôi, không thay phần sau dấu chấm
+        std::fs::write(&first, b"\xFF\xD8\xFF").unwrap();
+        let renamed = D::add_extension_from_content_type(first.clone(), Some("image/jpeg"));
+        assert_eq!(renamed, dir.join("Mr. Bean_123.jpg"));
+        assert!(renamed.exists());
+        let kept = D::add_extension_from_content_type(renamed.clone(), Some("image/png"));
+        assert_eq!(kept, renamed, "đã có đuôi media thì giữ nguyên");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subtitle_and_thumbnail_output_lines_are_parsed() {
+        // json3 (định dạng đầu tiên YouTube liệt kê) không phải phụ đề đọc được
+        assert_eq!(D::subtitle_format_preference("json3"), "srt/vtt/best");
+        assert_eq!(D::subtitle_format_preference("VTT"), "vtt/srt/best");
+        assert_eq!(D::subtitle_format_preference(""), "srt/vtt/best");
+
+        assert_eq!(
+            D::path_after_to("[info] Writing video subtitles to: /tmp/a: b [id].en.srt").as_deref(),
+            Some("/tmp/a: b [id].en.srt")
+        );
+        assert_eq!(
+            D::path_after_to("[info] Writing video thumbnail 41 to: /dl/Title [id].webp").as_deref(),
+            Some("/dl/Title [id].webp")
+        );
+        assert_eq!(
+            D::converted_thumbnail_path("[ThumbnailsConvertor] Converting thumbnail \"/dl/a.b [id].webp\" to jpg"),
+            Some(std::path::PathBuf::from("/dl/a.b [id].jpg"))
+        );
+        assert_eq!(
+            D::converted_thumbnail_path(
+                "[ThumbnailsConvertor] Not converting thumbnail \"/dl/x.jpg\"; already is in target format jpg"
+            ),
+            None
+        );
     }
 }

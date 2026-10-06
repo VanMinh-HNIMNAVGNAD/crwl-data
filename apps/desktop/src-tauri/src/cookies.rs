@@ -101,14 +101,52 @@ impl CookieService {
         }
     }
 
-    /// Chuyển đổi cookie string (Netscape, JSON hoặc Header key=val) sang chuẩn Netscape HTTP Cookie
+    /// Một dòng cookie Netscape mà tab đã bị đổi thành dấu cách (hay gặp khi copy từ
+    /// trình xem văn bản): `domain flag path secure expiry name value`.
+    fn netscape_line_from_spaces(line: &str) -> Option<String> {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let is_flag = |s: &str| s.eq_ignore_ascii_case("TRUE") || s.eq_ignore_ascii_case("FALSE");
+        if parts.len() < 6 || !is_flag(parts[1]) || !is_flag(parts[3]) || parts[4].parse::<i64>().is_err() {
+            return None;
+        }
+        let value = parts.get(6..).map(|rest| rest.join(" ")).unwrap_or_default();
+        Some(format!("{}\t{}\t{}\t{}\t{}\t{}\t{}", parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], value))
+    }
+
+    /// Chuyển đổi cookie string (Netscape, JSON hoặc Header key=val) sang chuẩn Netscape HTTP Cookie.
+    ///
+    /// Trả về số cookie đọc được = 0 khi không nhận diện được gì. Trước đây khi đó
+    /// nguyên văn chuỗi được lưu thành "1 cookie" — tệp hỏng này được ưu tiên số 1 cho
+    /// mọi lượt tải, và yt-dlp từ chối nó ("does not look like a Netscape format
+    /// cookies file") nên MỌI lượt tải của nền tảng đó đều thất bại.
     pub fn convert_to_netscape(platform: &str, raw: &str) -> (String, usize) {
         let trimmed = raw.trim();
 
         // 1. Đã là Netscape format
         if trimmed.starts_with("# Netscape HTTP Cookie File") || (trimmed.contains("\tTRUE\t") || trimmed.contains("\tFALSE\t")) {
-            let count = trimmed.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).count();
+            let count = trimmed
+                .lines()
+                .filter(|l| !l.trim().is_empty() && (!l.starts_with('#') || l.starts_with("#HttpOnly_")))
+                .filter(|l| l.split('\t').count() >= 6)
+                .count();
             return (trimmed.to_string(), count);
+        }
+
+        // 1b. Netscape nhưng tab đã thành dấu cách
+        let spaced: Vec<String> = trimmed
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .filter_map(Self::netscape_line_from_spaces)
+            .collect();
+        if !spaced.is_empty() {
+            let count = spaced.len();
+            let mut lines = vec![
+                "# Netscape HTTP Cookie File".to_string(),
+                format!("# Converted for {platform} (tab đã được khôi phục)"),
+                "".to_string(),
+            ];
+            lines.extend(spaced);
+            return (lines.join("\n"), count);
         }
 
         let default_domain = if platform.contains('.') {
@@ -122,45 +160,52 @@ impl CookieService {
             Self::platform_to_domain(platform).to_string()
         };
 
-        // 2. Định dạng JSON (từ extension Cookie-Editor hoặc EditThisCookie)
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(trimmed) {
-                let mut lines = vec![
-                    "# Netscape HTTP Cookie File".to_string(),
-                    format!("# Converted for {platform} from JSON"),
-                    "".to_string(),
-                ];
-                let mut count = 0;
-                for item in items {
-                    if let Value::Object(obj) = item {
-                        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let value = obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                        if name.is_empty() {
-                            continue;
-                        }
-                        let domain = obj.get("domain").and_then(|v| v.as_str()).unwrap_or(&default_domain);
-                        let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                        let secure = if obj.get("secure").and_then(|v| v.as_bool()).unwrap_or(false) { "TRUE" } else { "FALSE" };
-                        let item_exp = obj.get("expirationDate")
-                            .and_then(|v| {
-                                if let Some(n) = v.as_f64() {
-                                    Some(n.trunc() as i64)
-                                } else {
-                                    v.as_i64()
-                                }
-                            })
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "0".to_string());
-
-                        let is_domain = if domain.starts_with('.') { "TRUE" } else { "FALSE" };
-                        lines.push(format!("{domain}\t{is_domain}\t{path}\t{secure}\t{item_exp}\t{name}\t{value}"));
-                        count += 1;
+        // 2. Định dạng JSON (từ extension Cookie-Editor hoặc EditThisCookie). Đã là JSON
+        //    thì KHÔNG rơi xuống bước tách "key=value" — bước đó sẽ băm chuỗi JSON
+        //    thành những cookie rác.
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            let items = match serde_json::from_str::<Value>(trimmed) {
+                Ok(Value::Array(items)) => items,
+                // Một số tiện ích xuất dạng {"cookies": [...]}
+                Ok(Value::Object(mut obj)) => match obj.remove("cookies") {
+                    Some(Value::Array(items)) => items,
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            let mut lines = vec![
+                "# Netscape HTTP Cookie File".to_string(),
+                format!("# Converted for {platform} from JSON"),
+                "".to_string(),
+            ];
+            let mut count = 0;
+            for item in items {
+                if let Value::Object(obj) = item {
+                    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let value = obj.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    if !Self::is_valid_cookie_pair(name, value) {
+                        continue;
                     }
-                }
-                if count > 0 {
-                    return (lines.join("\n"), count);
+                    let domain = obj.get("domain").and_then(|v| v.as_str()).unwrap_or(&default_domain);
+                    let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                    let secure = if obj.get("secure").and_then(|v| v.as_bool()).unwrap_or(false) { "TRUE" } else { "FALSE" };
+                    let item_exp = obj.get("expirationDate")
+                        .and_then(|v| {
+                            if let Some(n) = v.as_f64() {
+                                Some(n.trunc() as i64)
+                            } else {
+                                v.as_i64()
+                            }
+                        })
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "0".to_string());
+
+                    let is_domain = if domain.starts_with('.') { "TRUE" } else { "FALSE" };
+                    lines.push(format!("{domain}\t{is_domain}\t{path}\t{secure}\t{item_exp}\t{name}\t{value}"));
+                    count += 1;
                 }
             }
+            return if count > 0 { (lines.join("\n"), count) } else { (String::new(), 0) };
         }
 
         // 3. Định dạng chuỗi Header: "name=value; name2=value2" — hoặc mỗi cookie
@@ -187,7 +232,7 @@ impl CookieService {
             if let Some((name, val)) = p.split_once('=') {
                 let n = name.trim();
                 let v = val.trim();
-                if !n.is_empty() {
+                if Self::is_valid_cookie_pair(n, v) {
                     lines.push(format!("{default_domain}\tTRUE\t/\tFALSE\t0\t{n}\t{v}"));
                     count += 1;
                 }
@@ -197,8 +242,19 @@ impl CookieService {
         if count > 0 {
             (lines.join("\n"), count)
         } else {
-            (trimmed.to_string(), 1)
+            (String::new(), 0)
         }
+    }
+
+    /// Tên cookie hợp lệ theo RFC 6265 (không khoảng trắng / ký tự phân tách) và giá
+    /// trị không chứa tab — nếu không, một câu văn có dấu "=" cũng thành cookie rác,
+    /// còn tab trong giá trị làm vỡ dòng Netscape.
+    fn is_valid_cookie_pair(name: &str, value: &str) -> bool {
+        !name.is_empty()
+            && !name
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || "()<>@,;:\\\"/[]?={}".contains(c))
+            && !value.chars().any(|c| c == '\t' || c == '\n' || c == '\r')
     }
 
     /// Chuẩn hóa tên platform hoặc domain về định danh platform chuẩn
@@ -397,6 +453,13 @@ impl CookieService {
         }
 
         let (netscape_content, count) = Self::convert_to_netscape(&normalized, trimmed);
+        if count == 0 {
+            return Err(
+                "Không nhận diện được cookie nào. Hãy dán dạng \"tên=giá_trị; tên2=giá_trị2\", \
+                 JSON xuất từ Cookie-Editor, hoặc nội dung tệp cookies.txt (Netscape)."
+                    .to_string(),
+            );
+        }
 
         write_private_cookie_file(&file_path, &netscape_content)
             .map_err(|e| format!("Không thể ghi file cookie: {e}"))?;
@@ -453,7 +516,9 @@ impl CookieService {
     pub fn delete_cookies(platform: Option<&str>) -> Result<bool, String> {
         match platform {
             Some(p) => {
-                let norm = Self::normalize_platform(p).unwrap_or_else(|| p.to_lowercase());
+                // Chỉ nhận tên nền tảng đã chuẩn hoá. Trước đây tên lạ được ghép thẳng
+                // vào đường dẫn ("../../x" → xoá tệp .txt nằm ngoài thư mục cookie).
+                let norm = Self::validate_and_normalize_platform(p)?;
                 let file_path = cookie_file_path(&norm);
                 if file_path.exists() {
                     std::fs::remove_file(&file_path)
@@ -461,10 +526,6 @@ impl CookieService {
                     info!("Đã xóa cookie cho platform: {}", norm);
                 }
                 Self::cleanup_legacy_cookie_files(&norm);
-                let raw_path = cookie_file_path(p);
-                if raw_path.exists() && raw_path != file_path {
-                    let _ = std::fs::remove_file(&raw_path);
-                }
                 Ok(true)
             }
             None => {
@@ -640,6 +701,45 @@ mod tests {
         let empty_res = CookieService::save_cookies("pixiv.net", "   ");
         assert!(empty_res.is_err());
         assert!(empty_res.unwrap_err().contains("không được để trống"));
+    }
+
+    /// Trước đây chuỗi không nhận diện được vẫn được lưu thành "1 cookie" — tệp hỏng
+    /// đó được ưu tiên cho mọi lượt tải và yt-dlp từ chối nó.
+    #[test]
+    fn unrecognized_cookie_text_is_rejected_instead_of_saved() {
+        assert_eq!(CookieService::convert_to_netscape("instagram", "chỉ là một câu văn").1, 0);
+        assert_eq!(CookieService::convert_to_netscape("instagram", "a sentence with = sign").1, 0);
+        assert_eq!(CookieService::convert_to_netscape("instagram", r#"[{"foo": 1}]"#).1, 0);
+        assert_eq!(CookieService::convert_to_netscape("instagram", "{not json").1, 0);
+
+        let res = CookieService::save_cookies("instagram", "chỉ là một câu văn");
+        assert!(res.unwrap_err().contains("Không nhận diện"));
+    }
+
+    #[test]
+    fn json_object_exports_are_supported() {
+        let raw = r#"{"cookies": [{"name": "sessionid", "value": "abc", "domain": ".instagram.com"}]}"#;
+        let (out, count) = CookieService::convert_to_netscape("instagram", raw);
+        assert_eq!(count, 1);
+        assert!(out.contains(".instagram.com\tTRUE\t/\tFALSE\t0\tsessionid\tabc"));
+    }
+
+    #[test]
+    fn netscape_lines_with_spaces_instead_of_tabs_are_repaired() {
+        let raw = ".instagram.com TRUE / TRUE 1790000000 sessionid abc123\n\
+                   .instagram.com TRUE / TRUE 1790000000 csrftoken xyz";
+        let (out, count) = CookieService::convert_to_netscape("instagram", raw);
+        assert_eq!(count, 2);
+        assert!(out.contains(".instagram.com\tTRUE\t/\tTRUE\t1790000000\tsessionid\tabc123"));
+        for line in out.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+            assert_eq!(line.split('\t').count(), 7, "Dòng cookie hỏng: {line:?}");
+        }
+    }
+
+    #[test]
+    fn deleting_cookies_rejects_path_like_platform_names() {
+        assert!(CookieService::delete_cookies(Some("../../etc/passwd")).is_err());
+        assert!(CookieService::delete_cookies(Some("unknown-site")).is_err());
     }
 
     #[test]

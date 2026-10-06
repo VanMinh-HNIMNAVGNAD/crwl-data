@@ -26,6 +26,8 @@ function App() {
   const [isToolsOpen, setIsToolsOpen] = useState(false)
   const [toastMessage, setToastMessage] = useState('')
   const [cookieRefreshKey, setCookieRefreshKey] = useState(0)
+  // Tăng mỗi khi lưu cấu hình ở modal Công cụ để thanh trên cùng đọc lại thư mục tải
+  const [settingsVersion, setSettingsVersion] = useState(0)
   const toastTimer = useRef(null)
 
   // ── Shared download options (dùng chung cho cả 3 chế độ tải) ──────────────
@@ -58,7 +60,9 @@ function App() {
   const showToast = (msg) => {
     setToastMessage(msg)
     if (toastTimer.current) clearTimeout(toastTimer.current)
-    toastTimer.current = setTimeout(() => setToastMessage(''), 3000)
+    // Thông báo lỗi (vd. kết quả cập nhật công cụ) thường dài: 3 giây không đủ để đọc.
+    const duration = Math.min(10000, 3000 + String(msg || '').length * 40)
+    toastTimer.current = setTimeout(() => setToastMessage(''), duration)
   }
 
   useEffect(() => () => {
@@ -74,8 +78,8 @@ function App() {
         onOpenHistory={() => setIsHistoryOpen(true)}
         onOpenCookies={() => setIsCookieManagerOpen(true)}
         onOpenTools={() => setIsToolsOpen(true)}
-        onShowToast={showToast}
         cookieRefreshKey={cookieRefreshKey}
+        settingsVersion={settingsVersion}
       />
 
       {/* Vùng làm việc chính: 2 cột chia đôi đối xứng bằng 1 thanh dọc | ở giữa */}
@@ -108,7 +112,12 @@ function App() {
         onClose={() => setIsCookieManagerOpen(false)}
         onCookieUpdated={handleCookieUpdated}
       />
-      <ToolsManagerModal isOpen={isToolsOpen} onClose={() => setIsToolsOpen(false)} onShowToast={showToast} />
+      <ToolsManagerModal
+        isOpen={isToolsOpen}
+        onClose={() => setIsToolsOpen(false)}
+        onShowToast={showToast}
+        onSettingsSaved={() => setSettingsVersion((v) => v + 1)}
+      />
     </div>
   )
 }

@@ -1161,7 +1161,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
                       <div className="profile-item-footer">
                         <span className="item-quality-pill">
                           {item.totalInPost > 1
-                            ? `Ảnh ${item.indexInPost}/${item.totalInPost}${item.quality ? ` • ${item.quality}` : ''}`
+                            ? `${item.type === 'video' ? 'Video' : 'Ảnh'} ${item.indexInPost}/${item.totalInPost}${item.quality ? ` • ${item.quality}` : ''}`
                             : item.quality || 'HD'}
                         </span>
                         <button

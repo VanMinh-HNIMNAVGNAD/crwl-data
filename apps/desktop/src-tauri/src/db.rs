@@ -426,20 +426,50 @@ impl Database {
     }
 
     /// Xóa lịch sử tải của thiết bị
+    ///
+    /// Xoá luôn nhật ký bóc tách (jobs / job_items / extracted_medias: các URL đã dán,
+    /// danh sách định dạng). Trước đây chúng được ghi sau MỖI lượt bóc tách nhưng
+    /// không nơi nào đọc hay xoá, nên "Xóa lịch sử" vẫn để lại toàn bộ URL đã dùng và
+    /// tệp cơ sở dữ liệu cứ phình mãi.
     pub async fn clear_download_history(&self, device_id: Option<&str>) -> bool {
         let pool = match self.get_pool().await {
             Some(p) => p,
             None => return false,
         };
 
-        let result = if let Some(dev_id) = device_id.filter(|d| !d.trim().is_empty()) {
-            sqlx::query("DELETE FROM download_history WHERE device_id = ?;")
-                .bind(dev_id)
-                .execute(&pool)
-                .await
-        } else {
-            sqlx::query("DELETE FROM download_history;").execute(&pool).await
-        };
+        let scoped_device = device_id.map(str::trim).filter(|d| !d.is_empty());
+        let result: Result<(), sqlx::Error> = async {
+            let mut tx = pool.begin().await?;
+            match scoped_device {
+                Some(dev_id) => {
+                    sqlx::query("DELETE FROM download_history WHERE device_id = ?;")
+                        .bind(dev_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(
+                        "DELETE FROM extracted_medias WHERE job_id IN (SELECT id FROM jobs WHERE device_id = ?);",
+                    )
+                    .bind(dev_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query("DELETE FROM job_items WHERE job_id IN (SELECT id FROM jobs WHERE device_id = ?);")
+                        .bind(dev_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM jobs WHERE device_id = ?;")
+                        .bind(dev_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                None => {
+                    for table in ["download_history", "extracted_medias", "job_items", "jobs"] {
+                        sqlx::query(&format!("DELETE FROM {table};")).execute(&mut *tx).await?;
+                    }
+                }
+            }
+            tx.commit().await
+        }
+        .await;
 
         match result {
             Ok(_) => true,
@@ -766,6 +796,21 @@ mod tests {
             .record_single_extraction(dev_id, "https://tiktok.com/@user/video/1", &single_data, None)
             .await;
         assert!(extraction.is_some());
+        let crawl = db
+            .record_profile_crawl(
+                dev_id,
+                "https://www.instagram.com/someone/",
+                &serde_json::json!({"platform": "instagram", "media": [{"url": "https://cdn/a.jpg", "type": "image"}]}),
+                None,
+            )
+            .await;
+        assert!(crawl.is_some());
+
+        // Nhật ký của thiết bị khác không được bị xoá theo
+        let other = db
+            .record_single_extraction("other_device", "https://youtu.be/x", &single_data, None)
+            .await;
+        assert!(other.is_some());
 
         // Test xóa lịch sử
         let cleared = db.clear_download_history(Some(dev_id)).await;
@@ -773,5 +818,23 @@ mod tests {
 
         let empty_list = db.get_recent_downloads(10, Some(dev_id)).await;
         assert_eq!(empty_list.len(), 0);
+
+        let pool = db.get_pool().await.unwrap();
+        let count = |sql: &'static str| {
+            let pool = pool.clone();
+            async move { sqlx::query_scalar::<_, i64>(sql).bind(dev_id).fetch_one(&pool).await.unwrap() }
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM jobs WHERE device_id = ?;").await, 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM extracted_medias WHERE user_id IN (SELECT id FROM users WHERE device_id = ?);").await,
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs WHERE device_id = 'other_device';")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
     }
 }

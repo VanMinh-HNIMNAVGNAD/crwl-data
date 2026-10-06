@@ -5,13 +5,30 @@
  * Thiết kế: chỉ check + báo cáo + update manual theo yêu cầu user.
  * Không tự động cập nhật khi start.
  */
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
+use std::time::Duration;
 use log::info;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::settings::SettingsManager;
+
+/// `--version` của một binary hỏng/treo không được làm treo cả màn hình Công cụ.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Một lượt cập nhật (yt-dlp -U, pip, pipx). Không có mốc này, mạng treo khiến nút
+/// "Cập nhật" quay mãi và khoá luôn mọi nút khác trong modal Công cụ.
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Chỉ một lượt cập nhật chạy tại một thời điểm: hai lượt pip/pipx song song trên
+/// cùng một môi trường có thể làm hỏng môi trường đó.
+fn update_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinaryStatus {
@@ -30,6 +47,70 @@ pub struct AllBinaryStatus {
     pub aria2c: BinaryStatus,
     pub python3: BinaryStatus,
     pub node: BinaryStatus,
+}
+
+/// Môi trường đang chứa một binary — quyết định cách nâng cấp nó cho ĐÚNG chỗ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstallKind {
+    /// venv do pipx quản lý → `pipx upgrade`
+    Pipx,
+    /// venv thường (có `pyvenv.cfg`), hoặc thư mục `Scripts` của một bản cài Python
+    /// trên Windows → pip của chính trình thông dịch đó (không `--user`)
+    Venv(PathBuf),
+    /// Script do `pip install --user` sinh ra → pip `--user` của interpreter đã cài nó
+    PipUser(PathBuf),
+    /// Thư mục hệ thống (apt/dnf, /usr/local/bin...) hoặc bản đóng gói sẵn:
+    /// app không được cài đè lên.
+    Unmanaged,
+}
+
+/// Kết quả một lệnh đã chạy xong
+struct CmdOutput {
+    success: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl CmdOutput {
+    fn combined(&self) -> String {
+        format!("{}\n{}", self.stdout, self.stderr)
+    }
+}
+
+/// Lệnh chạy ngầm: không stdin, gom stdout/stderr, bị kill khi future bị huỷ.
+fn background_command(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    // Ứng dụng GUI trên Windows: thiếu cờ này thì mỗi lần chạy `--version` hay pip
+    // lại bật lên một cửa sổ console đen.
+    #[cfg(windows)]
+    {
+        #[allow(unused_imports)]
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd
+}
+
+/// Chạy lệnh tối đa `timeout`; quá hạn thì tiến trình bị kill (kill_on_drop).
+async fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<CmdOutput, String> {
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Err(_) => Err(format!(
+            "quá {} giây chưa xong (mạng chậm hoặc bị chặn) nên đã dừng",
+            timeout.as_secs()
+        )),
+        Ok(Err(e)) => Err(format!("không chạy được lệnh: {e}")),
+        Ok(Ok(out)) => Ok(CmdOutput {
+            success: out.status.success(),
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        }),
+    }
 }
 
 pub struct BinaryManager;
@@ -130,127 +211,71 @@ impl BinaryManager {
         Self::find_binary(name).is_some()
     }
 
-    /// Lấy version của binary bằng cách chạy `{binary} --version`
-    async fn get_version(path: &PathBuf) -> Option<String> {
-        // Một binary hỏng/treo khi chạy `--version` không được làm treo cả màn hình Công cụ
-        let mut cmd = Command::new(path);
-        cmd.arg("--version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
-            .await
-            .ok()?
-            .ok()?;
-
-        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if raw.is_empty() {
-            // Một số tool in version ra stderr
-            let from_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if !from_err.is_empty() {
-                return Some(from_err.lines().next().unwrap_or("").to_string());
+    /// Rút số phiên bản từ output của `--version`.
+    ///
+    /// Trước đây UI hiển thị nguyên dòng đầu kèm tiền tố "v", ra những nhãn như
+    /// "vffmpeg version 8.0.1 Copyright (c) 2000-2025...", "vPython 3.14.4" hay
+    /// "vv22.22.1".
+    pub(crate) fn parse_version(raw: &str) -> Option<String> {
+        static VERSION_RE: OnceLock<Regex> = OnceLock::new();
+        let re = VERSION_RE.get_or_init(|| {
+            Regex::new(r"\d+(?:\.\d+)+(?:[-+~][0-9A-Za-z][0-9A-Za-z._+~-]*)?").expect("regex phiên bản hợp lệ")
+        });
+        let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+        let found = match re.find(line) {
+            Some(m) => m.as_str().to_string(),
+            None => {
+                // Bản build git của ffmpeg: "ffmpeg version N-113478-g4d9a8d5 Copyright ..."
+                let mut tokens = line.split_whitespace();
+                tokens
+                    .by_ref()
+                    .find(|t| t.eq_ignore_ascii_case("version"))
+                    .and_then(|_| tokens.next())
+                    .unwrap_or(line)
+                    .to_string()
             }
-            return None;
+        };
+        Some(found.chars().take(32).collect())
+    }
+
+    /// Lấy version của binary bằng cách chạy `{binary} --version`
+    async fn get_version(path: &Path) -> Option<String> {
+        let mut cmd = background_command(path);
+        cmd.arg("--version");
+        let out = run_with_timeout(cmd, VERSION_TIMEOUT).await.ok()?;
+        // Một số tool in version ra stderr
+        let text = if out.stdout.trim().is_empty() { &out.stderr } else { &out.stdout };
+        Self::parse_version(text)
+    }
+
+    async fn status_of(name: &str) -> BinaryStatus {
+        let path = Self::find_binary(name);
+        let version = match path.as_deref() {
+            Some(p) => Self::get_version(p).await,
+            None => None,
+        };
+        BinaryStatus {
+            name: name.to_string(),
+            is_installed: path.is_some(),
+            path: path.map(|p| p.to_string_lossy().to_string()),
+            version,
         }
-        Some(raw.lines().next().unwrap_or("").to_string())
     }
 
     /// Kiểm tra trạng thái của tất cả binaries
     pub async fn check_all() -> AllBinaryStatus {
-        let ytdlp_path = Self::find_binary("yt-dlp");
-        let gallery_path = Self::find_binary("gallery-dl");
-        let ffmpeg_path = Self::find_binary("ffmpeg");
-        let ffprobe_path = Self::find_binary("ffprobe");
-        let aria2c_path = Self::find_binary("aria2c");
-        let python_path = Self::find_binary("python3");
-        let node_path = Self::find_binary("node");
-
-        let ytdlp_version = if let Some(ref p) = ytdlp_path {
-            Self::get_version(p).await
-        } else {
-            None
-        };
-
-        let gallery_version = if let Some(ref p) = gallery_path {
-            Self::get_version(p).await
-        } else {
-            None
-        };
-
-        let ffmpeg_version = if let Some(ref p) = ffmpeg_path {
-            Self::get_version(p).await
-        } else {
-            None
-        };
-
-        let ffprobe_version = if let Some(ref p) = ffprobe_path {
-            Self::get_version(p).await
-        } else {
-            None
-        };
-
-        let aria2c_version = if let Some(ref p) = aria2c_path {
-            Self::get_version(p).await
-        } else {
-            None
-        };
-
-        let python_version = if let Some(ref p) = python_path {
-            Self::get_version(p).await
-        } else {
-            None
-        };
-
-        let node_version = if let Some(ref p) = node_path {
-            Self::get_version(p).await
-        } else {
-            None
-        };
-
-        AllBinaryStatus {
-            ytdlp: BinaryStatus {
-                name: "yt-dlp".to_string(),
-                is_installed: ytdlp_path.is_some(),
-                path: ytdlp_path.map(|p| p.to_string_lossy().to_string()),
-                version: ytdlp_version,
-            },
-            gallery_dl: BinaryStatus {
-                name: "gallery-dl".to_string(),
-                is_installed: gallery_path.is_some(),
-                path: gallery_path.map(|p| p.to_string_lossy().to_string()),
-                version: gallery_version,
-            },
-            ffmpeg: BinaryStatus {
-                name: "ffmpeg".to_string(),
-                is_installed: ffmpeg_path.is_some(),
-                path: ffmpeg_path.map(|p| p.to_string_lossy().to_string()),
-                version: ffmpeg_version,
-            },
-            ffprobe: BinaryStatus {
-                name: "ffprobe".to_string(),
-                is_installed: ffprobe_path.is_some(),
-                path: ffprobe_path.map(|p| p.to_string_lossy().to_string()),
-                version: ffprobe_version,
-            },
-            aria2c: BinaryStatus {
-                name: "aria2c".to_string(),
-                is_installed: aria2c_path.is_some(),
-                path: aria2c_path.map(|p| p.to_string_lossy().to_string()),
-                version: aria2c_version,
-            },
-            python3: BinaryStatus {
-                name: "python3".to_string(),
-                is_installed: python_path.is_some(),
-                path: python_path.map(|p| p.to_string_lossy().to_string()),
-                version: python_version,
-            },
-            node: BinaryStatus {
-                name: "node".to_string(),
-                is_installed: node_path.is_some(),
-                path: node_path.map(|p| p.to_string_lossy().to_string()),
-                version: node_version,
-            },
-        }
+        // Chạy song song: tuần tự thì 7 lần `--version` (yt-dlp, gallery-dl khởi động
+        // Python khá chậm) khiến modal Công cụ phải chờ vài giây mới có kết quả.
+        let (ytdlp, gallery_dl, ffmpeg, ffprobe, aria2c, python3, node) = tokio::join!(
+            Self::status_of("yt-dlp"),
+            Self::status_of("gallery-dl"),
+            Self::status_of("ffmpeg"),
+            Self::status_of("ffprobe"),
+            Self::status_of("aria2c"),
+            Self::status_of("python3"),
+            Self::status_of("node"),
+        );
+        AllBinaryStatus { ytdlp, gallery_dl, ffmpeg, ffprobe, aria2c, python3, node }
     }
 
     pub(crate) fn evaluate_ytdlp_update(
@@ -270,13 +295,31 @@ impl BinaryManager {
         }
 
         let err = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
+            Self::tail_lines(stderr)
         } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
+            Self::tail_lines(stdout)
         } else {
             format!("Mã thoát: {}", code.unwrap_or(-1))
         };
         Err(err)
+    }
+
+    /// Vài dòng cuối có nghĩa của output pip / yt-dlp: đủ biết lỗi gì mà không đổ
+    /// cả trang log vào toast.
+    pub(crate) fn tail_lines(text: &str) -> String {
+        let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let errors: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("ERROR") || l.starts_with("error:"))
+            .collect();
+        let source = if errors.is_empty() { lines } else { errors };
+        let joined = source[source.len().saturating_sub(3)..].join(" | ");
+        if joined.chars().count() > 500 {
+            format!("{}…", joined.chars().take(500).collect::<String>())
+        } else {
+            joined
+        }
     }
 
     /// Binary có nằm trong một venv của pipx không (~/.local/pipx/venvs/<tool>/bin/…)
@@ -288,160 +331,304 @@ impl BinaryManager {
     /// Binary có nằm trong thư mục của người dùng không (cài kiểu `pip --user`)
     pub(crate) fn is_user_local(path: &std::path::Path) -> bool {
         match dirs::home_dir() {
-            Some(home) => path.starts_with(home),
+            Some(home) => {
+                path.starts_with(&home)
+                    || std::fs::canonicalize(&home).map(|h| path.starts_with(h)).unwrap_or(false)
+            }
             None => false,
         }
     }
 
-    /// Một lượt chạy pip: trả về (thành công, stdout + stderr gộp)
-    async fn run_pip(python: &PathBuf, args: &[&str]) -> (bool, String) {
-        match Command::new(python)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-        {
-            Ok(out) => {
-                let combined = format!(
-                    "{}\n{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                (out.status.success(), combined)
+    /// pipx còn giữ venv cho gói này không (pipx trên Windows CHÉP .exe ra
+    /// ~/.local/bin thay vì tạo symlink, nên không suy ra được từ đường dẫn).
+    fn pipx_venv_exists(pkg: &str) -> bool {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(custom) = std::env::var("PIPX_HOME") {
+            roots.push(PathBuf::from(custom));
+        }
+        if let Some(home) = dirs::home_dir() {
+            roots.push(home.join(".local").join("share").join("pipx"));
+            roots.push(home.join(".local").join("pipx"));
+            roots.push(home.join("pipx"));
+        }
+        if let Some(local) = dirs::data_local_dir() {
+            roots.push(local.join("pipx").join("pipx"));
+        }
+        roots.iter().any(|root| root.join("venvs").join(pkg).is_dir())
+    }
+
+    /// `<venv>/bin/<tool>` (hoặc `<venv>\Scripts\<tool>.exe`) → python của venv đó.
+    fn venv_python_of(real_bin: &Path) -> Option<PathBuf> {
+        let venv = real_bin.parent()?.parent()?;
+        if !venv.join("pyvenv.cfg").is_file() {
+            return None;
+        }
+        [
+            venv.join("bin").join("python"),
+            venv.join("bin").join("python3"),
+            venv.join("Scripts").join("python.exe"),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+    }
+
+    /// `<python>\Scripts\<tool>.exe` trên Windows → `<python>\python.exe` đã cài nó.
+    /// (Bản cài `pip --user` nằm ở %APPDATA%\Python\...\Scripts, không có python.exe kề bên.)
+    fn owning_interpreter_of(real_bin: &Path) -> Option<PathBuf> {
+        let scripts = real_bin.parent()?;
+        if !scripts.file_name()?.to_string_lossy().eq_ignore_ascii_case("scripts") {
+            return None;
+        }
+        let python = scripts.parent()?.join("python.exe");
+        python.is_file().then_some(python)
+    }
+
+    /// Interpreter trong dòng shebang của một script do pip sinh ra.
+    ///
+    /// Trả None với bản đóng gói sẵn (ELF, zipapp có shebang...): loại đó chỉ tự
+    /// cập nhật được (`yt-dlp -U`), cài pip đè lên sẽ thay mất nó.
+    pub(crate) fn script_interpreter(path: &Path) -> Option<PathBuf> {
+        use std::io::Read;
+        let mut head = [0u8; 512];
+        let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+        let head = &head[..n];
+        let line_end = head.iter().position(|&b| b == b'\n')?;
+        let first_line = std::str::from_utf8(&head[..line_end]).ok()?.trim();
+        let shebang = first_line.strip_prefix("#!")?.trim();
+        // zipapp (bản phát hành chính thức của yt-dlp): ngay sau shebang là dữ liệu ZIP
+        if head[line_end + 1..].starts_with(b"PK\x03\x04") {
+            return None;
+        }
+        let mut parts = shebang.split_whitespace();
+        let program = parts.next()?;
+        let interpreter = if Path::new(program).file_name().map(|n| n == "env").unwrap_or(false) {
+            // "#!/usr/bin/env python3" (có thể kèm cờ như "-S")
+            let name = parts.find(|p| !p.starts_with('-'))?;
+            which::which(name).ok()?
+        } else {
+            PathBuf::from(program)
+        };
+        let file_name = interpreter.file_name()?.to_string_lossy().to_lowercase();
+        file_name.starts_with("python").then_some(interpreter)
+    }
+
+    /// Xác định môi trường đang chứa `bin` để nâng cấp đúng chỗ.
+    pub(crate) fn classify_install(bin: &Path, pkg: &str) -> InstallKind {
+        // ~/.local/bin/<tool> của pipx là SYMLINK trỏ vào venv. Phải xét đường dẫn
+        // THẬT: trước đây chỉ xét đường dẫn symlink nên không nhận ra pipx, rồi
+        // `pip install --user --break-system-packages` cài một bản thứ hai vào Python
+        // hệ thống, trong khi bản pipx đang được dùng vẫn cũ nguyên.
+        let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+        if Self::is_pipx_managed(&real) || Self::is_pipx_managed(bin) {
+            return InstallKind::Pipx;
+        }
+        if let Some(python) = Self::venv_python_of(&real) {
+            return InstallKind::Venv(python);
+        }
+        if !Self::is_user_local(&real) {
+            return InstallKind::Unmanaged;
+        }
+        if cfg!(windows) {
+            if let Some(python) = Self::owning_interpreter_of(&real) {
+                return InstallKind::Venv(python);
             }
-            Err(e) => (false, format!("Không chạy được pip: {e}")),
+            if Self::pipx_venv_exists(pkg) {
+                return InstallKind::Pipx;
+            }
+            return Self::find_python().map(InstallKind::PipUser).unwrap_or(InstallKind::Unmanaged);
+        }
+        Self::script_interpreter(&real)
+            .map(InstallKind::PipUser)
+            .unwrap_or(InstallKind::Unmanaged)
+    }
+
+    fn install_hint(pkg: &str) -> String {
+        if cfg!(windows) && pkg == "yt-dlp" {
+            "Cài bằng: winget install yt-dlp.yt-dlp".to_string()
+        } else {
+            format!("Cài bằng: pipx install {pkg}")
         }
     }
 
-    /// Cài/nâng cấp một gói pip vào ĐÚNG môi trường đang chứa binary.
+    /// Hướng dẫn khi app không được phép tự cài đè (binary của hệ thống / đóng gói sẵn).
+    fn unmanaged_hint(pkg: &str, bin: &Path, detail: &str) -> String {
+        let lower = detail.to_lowercase();
+        if lower.contains("unable to write") || lower.contains("permission denied") || lower.contains("administrator") {
+            return if cfg!(windows) {
+                format!("Hãy chạy \"{} -U\" bằng quyền Administrator.", bin.display())
+            } else {
+                format!("Hãy chạy: sudo {} -U", bin.display())
+            };
+        }
+        if lower.contains("unable to obtain")
+            || lower.contains("http error")
+            || lower.contains("timed out")
+            || lower.contains("giây chưa xong")
+            || lower.contains("network")
+        {
+            return "Kiểm tra kết nối mạng / proxy rồi thử lại.".to_string();
+        }
+        if cfg!(windows) {
+            format!(
+                "{pkg} tại {} không do pip/pipx của bạn quản lý nên app không tự cài đè. \
+                 Hãy cập nhật bằng công cụ đã dùng để cài nó.",
+                bin.display()
+            )
+        } else {
+            format!(
+                "{pkg} tại {} do hệ điều hành quản lý (apt/dnf...) hoặc là bản đóng gói sẵn, nên app \
+                 không tự cài đè để tránh làm hỏng hệ thống. Hãy chạy: sudo apt install --only-upgrade {pkg} \
+                 — hoặc cài bản riêng cho bạn: pipx install {pkg}",
+                bin.display()
+            )
+        }
+    }
+
+    async fn run_pip(python: &Path, args: &[&str]) -> Result<CmdOutput, String> {
+        let mut cmd = background_command(python);
+        cmd.args(["-m", "pip"])
+            .args(args)
+            .args(["--disable-pip-version-check", "--no-input"]);
+        run_with_timeout(cmd, UPDATE_TIMEOUT).await.map_err(|e| format!("pip {e}"))
+    }
+
+    /// Diễn giải kết quả `pip install -U <pkg>`.
+    pub(crate) fn pip_outcome(pkg: &str, success: bool, output: &str, how: &str) -> Result<String, String> {
+        if success {
+            // "Requirement already satisfied" cũng xuất hiện cho các gói PHỤ THUỘC khi
+            // pip vừa nâng cấp xong — trước đây vì thế mà báo nhầm "đã là bản mới nhất".
+            // Chỉ dòng "Successfully installed <pkg>-<phiên bản>" mới chắc chắn.
+            let wanted = format!("{}-", pkg.to_lowercase().replace('_', "-"));
+            let upgraded = output.lines().any(|line| {
+                let l = line.trim().to_lowercase().replace('_', "-");
+                l.starts_with("successfully installed") && l.split_whitespace().any(|w| w.starts_with(&wanted))
+            });
+            return Ok(if upgraded {
+                format!("Đã cập nhật {pkg} qua pip{how}.")
+            } else {
+                format!("{pkg} đã là phiên bản mới nhất.")
+            });
+        }
+        if output.contains("No module named pip") {
+            return Err(format!(
+                "Python đang chạy {pkg} chưa có pip. Hãy cài pip (vd. sudo apt install python3-pip) rồi thử lại."
+            ));
+        }
+        Err(format!("Cập nhật {pkg} qua pip thất bại: {}", Self::tail_lines(output)))
+    }
+
+    async fn pipx_upgrade(pkg: &str) -> Result<String, String> {
+        let Some(pipx) = Self::find_binary("pipx") else {
+            return Err(format!(
+                "{pkg} được cài bằng pipx nhưng không tìm thấy lệnh pipx. Chạy thủ công: pipx upgrade {pkg}"
+            ));
+        };
+        let mut cmd = background_command(&pipx);
+        cmd.args(["upgrade", pkg]);
+        let out = run_with_timeout(cmd, UPDATE_TIMEOUT)
+            .await
+            .map_err(|e| format!("pipx upgrade {pkg} {e}"))?;
+        let combined = out.combined();
+        if combined.contains("already at latest version") {
+            return Ok(format!("{pkg} đã là phiên bản mới nhất."));
+        }
+        if out.success {
+            return Ok(format!("Đã cập nhật {pkg} qua pipx."));
+        }
+        Err(format!("pipx upgrade {pkg} thất bại: {}", Self::tail_lines(&combined)))
+    }
+
+    /// Nâng cấp gói trong ĐÚNG môi trường đang chứa binary.
     ///
-    /// Trước đây chỉ có duy nhất `pip install -U <pkg> --break-system-packages`:
-    /// thiếu `--user` nên với binary cài kiểu `pip --user` (ví dụ `~/.local/bin/yt-dlp`)
-    /// lệnh sẽ nhắm vào site-packages hệ thống — hoặc lỗi quyền, hoặc cài ra một
-    /// prefix khác hẳn với binary đang thực sự được dùng, và `--break-system-packages`
-    /// còn có nguy cơ đụng vào gói do distro quản lý.
-    pub(crate) async fn pip_upgrade(pkg: &str, existing_binary: Option<&PathBuf>) -> Result<String, String> {
-        // 1. pipx quản lý thì nâng cấp bằng pipx, tuyệt đối không đụng pip
-        if let Some(bin) = existing_binary {
-            if Self::is_pipx_managed(bin) {
-                if let Some(pipx) = Self::find_binary("pipx") {
-                    let out = Command::new(&pipx)
-                        .args(["upgrade", pkg])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .output()
-                        .await
-                        .map_err(|e| format!("Không chạy được pipx: {e}"))?;
-                    let combined = format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(&out.stdout),
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                    if out.status.success() || combined.contains("already at latest version") {
-                        return Ok(format!("Đã cập nhật {pkg} qua pipx."));
-                    }
-                    return Err(format!("pipx upgrade {pkg} thất bại: {}", combined.trim()));
-                }
-                return Err(format!(
-                    "{pkg} được cài bằng pipx nhưng không tìm thấy lệnh pipx. Chạy thủ công: pipx upgrade {pkg}"
-                ));
+    /// Trước đây luôn chạy `pip install -U <pkg>` của python3 hệ thống và leo thang
+    /// lên `--break-system-packages`: binary của pipx/venv hay của apt không được
+    /// nâng cấp, thay vào đó một bản thứ hai bị cài lạc vào site-packages của người dùng.
+    async fn upgrade_in_place(pkg: &str, kind: &InstallKind) -> Result<String, String> {
+        match kind {
+            InstallKind::Pipx => Self::pipx_upgrade(pkg).await,
+            InstallKind::Venv(python) => {
+                let out = Self::run_pip(python, &["install", "-U", pkg]).await?;
+                Self::pip_outcome(pkg, out.success, &out.combined(), "")
             }
+            InstallKind::PipUser(python) => {
+                let out = Self::run_pip(python, &["install", "-U", "--user", pkg]).await?;
+                if !out.success && out.combined().contains("externally-managed-environment") {
+                    // PEP 668: distro khoá Python hệ thống. Binary này vốn do `pip --user`
+                    // cài, nên chỉ nâng cấp đúng trong site của người dùng — luôn kèm
+                    // --user, không bao giờ đụng gói của hệ thống.
+                    let retry = Self::run_pip(
+                        python,
+                        &["install", "-U", "--user", "--break-system-packages", pkg],
+                    )
+                    .await?;
+                    return Self::pip_outcome(pkg, retry.success, &retry.combined(), " (--user)");
+                }
+                Self::pip_outcome(pkg, out.success, &out.combined(), " (--user)")
+            }
+            InstallKind::Unmanaged => Err(format!("{pkg} không do pip/pipx của người dùng quản lý")),
         }
+    }
 
-        let python = Self::find_binary("python3").ok_or_else(|| "python3 chưa được cài đặt".to_string())?;
-
-        // 2. Cài vào đúng phạm vi của binary hiện có: ~/… → --user
-        let prefer_user = existing_binary.map(|b| Self::is_user_local(b)).unwrap_or(true);
-
-        let mut attempts: Vec<Vec<&str>> = Vec::new();
-        if prefer_user {
-            attempts.push(vec!["-m", "pip", "install", "-U", "--user", pkg]);
+    /// Gắn phiên bản thực tế sau khi cập nhật vào thông báo.
+    async fn with_version(message: String, bin: &Path) -> String {
+        match Self::get_version(bin).await {
+            Some(v) => format!("{message} Phiên bản hiện tại: {v}"),
+            None => message,
         }
-        attempts.push(vec!["-m", "pip", "install", "-U", pkg]);
-
-        let mut last = String::new();
-        for args in &attempts {
-            let (ok, out) = Self::run_pip(&python, args).await;
-            if out.contains("Requirement already satisfied") || out.contains("already satisfied") {
-                return Ok(format!("{pkg} đã là phiên bản mới nhất!"));
-            }
-            if ok {
-                let how = if args.contains(&"--user") { " (--user)" } else { "" };
-                return Ok(format!("Đã cập nhật {pkg} thành công qua pip{how}!"));
-            }
-            // venv đang hoạt động thì không dùng được --user → thử lại không cờ
-            if out.contains("Can not perform a '--user' install") {
-                last = out;
-                continue;
-            }
-            // PEP 668: Python do distro quản lý. Chỉ khi ĐÃ thất bại mới dùng
-            // --break-system-packages, và luôn kèm --user để không đụng gói hệ thống.
-            if out.contains("externally-managed-environment") {
-                let mut esc: Vec<&str> = args.clone();
-                esc.push("--break-system-packages");
-                if !esc.contains(&"--user") {
-                    esc.push("--user");
-                }
-                let (ok2, out2) = Self::run_pip(&python, &esc).await;
-                if out2.contains("already satisfied") {
-                    return Ok(format!("{pkg} đã là phiên bản mới nhất!"));
-                }
-                if ok2 {
-                    return Ok(format!(
-                        "Đã cập nhật {pkg} qua pip (--user --break-system-packages)."
-                    ));
-                }
-                last = out2;
-                continue;
-            }
-            last = out;
-        }
-
-        Err(format!("Cập nhật {pkg} thất bại: {}", last.trim()))
     }
 
     /// Cập nhật yt-dlp lên version mới nhất
     pub async fn update_ytdlp() -> Result<String, String> {
+        let _guard = update_lock().lock().await;
         let ytdlp_path = Self::find_binary("yt-dlp")
-            .ok_or_else(|| "yt-dlp chưa được cài đặt".to_string())?;
+            .ok_or_else(|| format!("yt-dlp chưa được cài đặt. {}", Self::install_hint("yt-dlp")))?;
+        let kind = Self::classify_install(&ytdlp_path, "yt-dlp");
+        info!("Đang cập nhật yt-dlp tại {:?} ({:?})", ytdlp_path, kind);
 
-        info!("Đang cập nhật yt-dlp tại: {:?}", ytdlp_path);
-
-        let output = Command::new(&ytdlp_path)
-            .arg("-U")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
-
-        let ytdlp_err = match output {
-            Ok(res) => {
-                let stdout = String::from_utf8_lossy(&res.stdout);
-                let stderr = String::from_utf8_lossy(&res.stderr);
-                match Self::evaluate_ytdlp_update(&stdout, &stderr, res.status.success(), res.status.code()) {
-                    Ok(msg) => return Ok(msg),
-                    Err(e) => e,
-                }
-            }
-            Err(e) => format!("Không thể chạy yt-dlp: {e}"),
+        let mut cmd = background_command(&ytdlp_path);
+        cmd.arg("-U");
+        let self_update_err = match run_with_timeout(cmd, UPDATE_TIMEOUT).await {
+            Ok(out) => match Self::evaluate_ytdlp_update(&out.stdout, &out.stderr, out.success, out.code) {
+                Ok(msg) => return Ok(Self::with_version(msg, &ytdlp_path).await),
+                Err(e) => e,
+            },
+            Err(e) => format!("yt-dlp -U {e}"),
         };
 
-        // yt-dlp -U không xong (thường vì cài qua pip/pipx/distro) → nâng cấp
-        // đúng môi trường đang chứa binary đó.
-        match Self::pip_upgrade("yt-dlp", Some(&ytdlp_path)).await {
-            Ok(msg) => Ok(msg),
+        // `yt-dlp -U` chỉ tự cập nhật được bản đóng gói sẵn; bản cài qua pip/pipx/venv
+        // báo "Use that to update". Khi đó nâng cấp đúng môi trường đang chứa nó —
+        // còn bản do hệ điều hành quản lý thì chỉ hướng dẫn, không cài đè.
+        if kind == InstallKind::Unmanaged {
+            return Err(format!(
+                "Không cập nhật được yt-dlp: {self_update_err}. {}",
+                Self::unmanaged_hint("yt-dlp", &ytdlp_path, &self_update_err)
+            ));
+        }
+        match Self::upgrade_in_place("yt-dlp", &kind).await {
+            Ok(msg) => Ok(Self::with_version(msg, &ytdlp_path).await),
             Err(pip_err) => Err(format!(
-                "Lỗi cập nhật yt-dlp: {ytdlp_err} (Thử qua trình quản lý gói: {pip_err})"
+                "Không cập nhật được yt-dlp: {pip_err} (yt-dlp -U: {self_update_err})"
             )),
         }
     }
 
     /// Cập nhật gallery-dl lên version mới nhất, vào đúng môi trường đang dùng
     pub async fn update_gallery_dl() -> Result<String, String> {
-        let existing = Self::find_binary("gallery-dl");
-        info!("Đang cập nhật gallery-dl (binary: {:?})...", existing);
-        Self::pip_upgrade("gallery-dl", existing.as_ref()).await
+        let _guard = update_lock().lock().await;
+        let gallery_path = Self::find_binary("gallery-dl")
+            .ok_or_else(|| format!("gallery-dl chưa được cài đặt. {}", Self::install_hint("gallery-dl")))?;
+        let kind = Self::classify_install(&gallery_path, "gallery-dl");
+        info!("Đang cập nhật gallery-dl tại {:?} ({:?})", gallery_path, kind);
+
+        // gallery-dl bản pip chỉ có `--update-check` (kiểm tra), không tự cập nhật được.
+        if kind == InstallKind::Unmanaged {
+            return Err(format!(
+                "Không cập nhật được gallery-dl. {}",
+                Self::unmanaged_hint("gallery-dl", &gallery_path, "")
+            ));
+        }
+        let msg = Self::upgrade_in_place("gallery-dl", &kind).await?;
+        Ok(Self::with_version(msg, &gallery_path).await)
     }
 }
 
@@ -494,6 +681,155 @@ mod tests {
         assert_eq!(res.unwrap_err(), "ERROR: yt-dlp was installed with a package manager");
     }
 
+    #[test]
+    fn versions_are_extracted_from_version_banners() {
+        let cases = [
+            ("ffmpeg version 8.0.1-3ubuntu2 Copyright (c) 2000-2025 the FFmpeg developers", "8.0.1-3ubuntu2"),
+            ("Python 3.14.4", "3.14.4"),
+            ("v22.22.1", "22.22.1"),
+            ("2026.08.19", "2026.08.19"),
+            ("1.32.12-dev", "1.32.12-dev"),
+            ("aria2 version 1.37.0\nCopyright (C) 2006, 2019 Tatsuhiro Tsujikawa", "1.37.0"),
+            ("\n  ffprobe version 7.1 Copyright", "7.1"),
+            ("ffmpeg version N-113478-g4d9a8d5ee9-20240301 Copyright", "N-113478-g4d9a8d5ee9-20240301"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(BinaryManager::parse_version(raw).as_deref(), Some(expected), "banner: {raw:?}");
+        }
+        assert_eq!(BinaryManager::parse_version("   \n  "), None);
+    }
 
+    /// pip in "Requirement already satisfied" cho các gói phụ thuộc kể cả khi vừa
+    /// nâng cấp gói chính — không được báo nhầm là "đã là bản mới nhất".
+    #[test]
+    fn pip_outcome_distinguishes_upgrade_from_already_latest() {
+        let upgraded = "Collecting gallery-dl\nRequirement already satisfied: requests>=2.11.0 in /x\n\
+                        Installing collected packages: gallery-dl\nSuccessfully installed gallery-dl-1.32.13";
+        assert_eq!(
+            BinaryManager::pip_outcome("gallery-dl", true, upgraded, " (--user)").unwrap(),
+            "Đã cập nhật gallery-dl qua pip (--user)."
+        );
+        let underscore = "Successfully installed gallery_dl-1.32.13";
+        assert!(BinaryManager::pip_outcome("gallery-dl", true, underscore, "").unwrap().starts_with("Đã cập nhật"));
 
+        let latest = "Requirement already satisfied: yt-dlp in /x (2026.9.1)\nRequirement already satisfied: requests in /x";
+        assert_eq!(
+            BinaryManager::pip_outcome("yt-dlp", true, latest, "").unwrap(),
+            "yt-dlp đã là phiên bản mới nhất."
+        );
+
+        let only_dependency = "Successfully installed requests-2.33.0";
+        assert_eq!(
+            BinaryManager::pip_outcome("yt-dlp", true, only_dependency, "").unwrap(),
+            "yt-dlp đã là phiên bản mới nhất."
+        );
+
+        let no_pip = BinaryManager::pip_outcome("yt-dlp", false, "/usr/bin/python3: No module named pip", "");
+        assert!(no_pip.unwrap_err().contains("chưa có pip"));
+    }
+
+    #[test]
+    fn long_tool_output_is_trimmed_to_the_relevant_lines() {
+        let noisy = format!("{}ERROR: Unable to write to /usr/local/bin/yt-dlp; Try running as administrator\n", "noise line\n".repeat(200));
+        assert_eq!(
+            BinaryManager::tail_lines(&noisy),
+            "ERROR: Unable to write to /usr/local/bin/yt-dlp; Try running as administrator"
+        );
+        let plain = "a\nb\n\nc\nd\n";
+        assert_eq!(BinaryManager::tail_lines(plain), "b | c | d");
+        assert!(BinaryManager::tail_lines(&"x".repeat(2000)).chars().count() <= 501);
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("crwl_binmgr_{tag}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn script_interpreter_only_accepts_pip_generated_python_scripts() {
+        let dir = scratch_dir("shebang");
+
+        let pip_script = dir.join("pip_script");
+        std::fs::write(&pip_script, "#!/usr/bin/python3\nimport sys\nfrom yt_dlp import main\n").unwrap();
+        assert_eq!(BinaryManager::script_interpreter(&pip_script), Some(PathBuf::from("/usr/bin/python3")));
+
+        // zipapp chính thức của yt-dlp: shebang + dữ liệu ZIP → không phải script pip
+        let zipapp = dir.join("zipapp");
+        let mut bytes = b"#!/usr/bin/env python3\n".to_vec();
+        bytes.extend_from_slice(b"PK\x03\x04\x14\x00rest-of-zip");
+        std::fs::write(&zipapp, bytes).unwrap();
+        assert_eq!(BinaryManager::script_interpreter(&zipapp), None);
+
+        let elf = dir.join("elf");
+        std::fs::write(&elf, b"\x7fELF\x02\x01\x01\x00binary").unwrap();
+        assert_eq!(BinaryManager::script_interpreter(&elf), None);
+
+        let shell = dir.join("shell");
+        std::fs::write(&shell, "#!/bin/sh\necho hi\n").unwrap();
+        assert_eq!(BinaryManager::script_interpreter(&shell), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn venv_and_system_binaries_are_classified_without_touching_pip() {
+        let dir = scratch_dir("classify");
+
+        let venv = dir.join("myvenv");
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        std::fs::write(venv.join("bin").join("python"), "").unwrap();
+        let tool = venv.join("bin").join("gallery-dl");
+        std::fs::write(&tool, "#!/x/myvenv/bin/python\n").unwrap();
+        assert_eq!(
+            BinaryManager::classify_install(&tool, "gallery-dl"),
+            InstallKind::Venv(venv.join("bin").join("python"))
+        );
+
+        // Windows: <python>\Scripts\yt-dlp.exe thuộc về chính <python>\python.exe
+        let py_home = dir.join("Python312");
+        std::fs::create_dir_all(py_home.join("Scripts")).unwrap();
+        std::fs::write(py_home.join("python.exe"), "").unwrap();
+        std::fs::write(py_home.join("Scripts").join("yt-dlp.exe"), "MZ").unwrap();
+        assert_eq!(
+            BinaryManager::owning_interpreter_of(&py_home.join("Scripts").join("yt-dlp.exe")),
+            Some(py_home.join("python.exe"))
+        );
+        assert_eq!(BinaryManager::owning_interpreter_of(&venv.join("bin").join("gallery-dl")), None);
+
+        // Ngoài thư mục người dùng, không thuộc venv → do hệ thống quản lý
+        let system_tool = dir.join("yt-dlp");
+        std::fs::write(&system_tool, "#!/usr/bin/python3\n").unwrap();
+        if !BinaryManager::is_user_local(&system_tool) {
+            assert_eq!(BinaryManager::classify_install(&system_tool, "yt-dlp"), InstallKind::Unmanaged);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lỗi thật trên máy người dùng: ~/.local/bin/gallery-dl là SYMLINK vào venv của
+    /// pipx. Chỉ xét chuỗi đường dẫn symlink thì không thấy "/pipx/venvs/", và app
+    /// đã cài lạc gallery-dl vào Python hệ thống bằng --break-system-packages.
+    #[cfg(unix)]
+    #[test]
+    fn pipx_symlinked_binaries_are_upgraded_with_pipx() {
+        let dir = scratch_dir("pipx");
+        let venv_bin = dir.join("share").join("pipx").join("venvs").join("gallery-dl").join("bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        std::fs::write(venv_bin.parent().unwrap().join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        std::fs::write(venv_bin.join("python"), "").unwrap();
+        let real = venv_bin.join("gallery-dl");
+        std::fs::write(&real, "#!/venv/bin/python\n").unwrap();
+
+        let exposed_dir = dir.join("bin");
+        std::fs::create_dir_all(&exposed_dir).unwrap();
+        let exposed = exposed_dir.join("gallery-dl");
+        std::os::unix::fs::symlink(&real, &exposed).unwrap();
+
+        assert!(!BinaryManager::is_pipx_managed(&exposed), "đường dẫn symlink không chứa dấu hiệu pipx");
+        assert_eq!(BinaryManager::classify_install(&exposed, "gallery-dl"), InstallKind::Pipx);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

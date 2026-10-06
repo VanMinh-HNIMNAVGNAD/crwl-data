@@ -289,9 +289,20 @@ pub async fn get_sidecar_status(state: State<'_, AppState>) -> Result<SidecarSta
 #[tauri::command]
 pub async fn restart_sidecar(state: State<'_, AppState>) -> Result<String, String> {
     state.sidecar.reset_and_start().await;
+    // Lỗi import / cú pháp khiến Python chết ngay sau khi khởi động: chờ một nhịp
+    // ngắn rồi mới kết luận, thay vì báo "Đã khởi động lại" trong khi engine đã chết.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     match state.sidecar.status().await {
         WorkerStatus::Failed(reason) => Err(format!("Không khởi động lại được Python worker: {reason}")),
         WorkerStatus::Stopped => Err("Python worker vẫn đang ở trạng thái dừng.".to_string()),
+        _ if state.sidecar.consecutive_crashes().await > 0 => Err(format!(
+            "Python worker dừng ngay sau khi khởi động: {}",
+            state
+                .sidecar
+                .last_error()
+                .await
+                .unwrap_or_else(|| "không rõ nguyên nhân".to_string())
+        )),
         _ => Ok("Đã khởi động lại Python worker.".to_string()),
     }
 }
@@ -312,6 +323,7 @@ pub async fn save_app_settings(
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<bool, String> {
+    let settings = SettingsManager::validate(settings)?;
     let before = SettingsManager::load();
     SettingsManager::save(&settings)?;
     let sidecar_env_changed = before.ytdlp_path != settings.ytdlp_path

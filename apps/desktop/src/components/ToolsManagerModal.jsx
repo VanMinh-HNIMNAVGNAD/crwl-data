@@ -10,16 +10,31 @@ import {
   saveAppSettings,
   askForDownloadDirectory,
 } from '../services/api'
-import { IconClose, IconRefresh, IconCheck, IconSettings } from './Icons'
+import { IconClose, IconRefresh, IconCheck, IconSettings, IconInfo, IconDownload } from './Icons'
 
-// Tên gói để gợi ý lệnh cài khi công cụ thiếu
-const SYSTEM_PACKAGE_HINTS = {
-  ffmpeg: 'ffmpeg',
-  ffprobe: 'ffmpeg',
-  aria2c: 'aria2',
-  node: 'nodejs',
-  python3: 'python3',
-}
+const IS_WINDOWS = typeof navigator !== 'undefined' && /windows/i.test(navigator.userAgent || '')
+
+// Lệnh cài gợi ý khi công cụ thiếu. Trước đây luôn là "sudo apt install ...",
+// sai hoàn toàn trên bản Windows.
+const INSTALL_HINTS = IS_WINDOWS
+  ? {
+      ytdlp: 'winget install yt-dlp.yt-dlp',
+      gallery_dl: 'pip install gallery-dl',
+      ffmpeg: 'winget install Gyan.FFmpeg',
+      ffprobe: 'winget install Gyan.FFmpeg',
+      aria2c: 'winget install aria2.aria2',
+      node: 'winget install OpenJS.NodeJS.LTS',
+      python3: 'winget install Python.Python.3.12',
+    }
+  : {
+      ytdlp: 'pipx install yt-dlp',
+      gallery_dl: 'pipx install gallery-dl',
+      ffmpeg: 'sudo apt install ffmpeg',
+      ffprobe: 'sudo apt install ffmpeg',
+      aria2c: 'sudo apt install aria2',
+      node: 'sudo apt install nodejs',
+      python3: 'sudo apt install python3',
+    }
 
 const SIDECAR_STATE_LABELS = {
   uninitialized: 'chưa khởi tạo',
@@ -29,12 +44,24 @@ const SIDECAR_STATE_LABELS = {
   stopped: 'đã dừng',
 }
 
-export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
+const errorText = (err, fallback) => (typeof err === 'string' ? err : err?.message || fallback)
+
+const loadStatus = () =>
+  Promise.all([
+    getBinaryStatus(),
+    getSidecarStatus().catch(() => null),
+    getAppSettings().catch(() => null),
+  ])
+
+export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSettingsSaved }) {
   const [toolsData, setToolsData] = useState(null)
+  const [statusError, setStatusError] = useState(false)
   const [sidecar, setSidecar] = useState(null)
   const [settings, setSettings] = useState(null)
   const [savingSettings, setSavingSettings] = useState(false)
-  const [loading, setLoading] = useState(false)
+  // Lần mở đầu tiên đang quét ngay; mỗi lần đóng lại đặt về true để lần mở sau
+  // hiện trạng thái "đang quét" thay vì lặng lẽ hiển thị dữ liệu cũ.
+  const [loading, setLoading] = useState(true)
   const [updatingTool, setUpdatingTool] = useState(null)
   // Giữ callback mới nhất trong ref: đưa thẳng vào deps sẽ khiến effect chạy lại
   // mỗi lần App render (onShowToast được tạo mới mỗi lần).
@@ -46,17 +73,15 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
   const fetchStatus = async () => {
     setLoading(true)
     try {
-      const [data, sc, cfg] = await Promise.all([
-        getBinaryStatus(),
-        getSidecarStatus().catch(() => null),
-        getAppSettings().catch(() => null),
-      ])
+      const [data, sc, cfg] = await loadStatus()
       if (data) setToolsData(data)
+      setStatusError(false)
       setSidecar(sc)
       if (cfg) setSettings(cfg)
     } catch (err) {
       console.warn('Lỗi khi tải trạng thái công cụ:', err)
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải trạng thái công cụ')
+      setStatusError(true)
+      onShowToast?.(errorText(err, 'Lỗi khi tải trạng thái công cụ'))
     } finally {
       setLoading(false)
     }
@@ -65,28 +90,26 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
   useEffect(() => {
     if (!isOpen) return
     let active = true
-    Promise.all([
-      getBinaryStatus(),
-      getSidecarStatus().catch(() => null),
-      getAppSettings().catch(() => null),
-    ])
+    loadStatus()
       .then(([data, sc, cfg]) => {
         if (!active) return
         if (data) setToolsData(data)
+        setStatusError(false)
         setSidecar(sc)
         if (cfg) setSettings(cfg)
       })
       .catch((err) => {
-        if (active) {
-          console.warn('Lỗi khi tải trạng thái công cụ:', err)
-          showToastRef.current?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải trạng thái công cụ')
-        }
+        if (!active) return
+        console.warn('Lỗi khi tải trạng thái công cụ:', err)
+        setStatusError(true)
+        showToastRef.current?.(errorText(err, 'Lỗi khi tải trạng thái công cụ'))
       })
       .finally(() => {
         if (active) setLoading(false)
       })
     return () => {
       active = false
+      setLoading(true)
     }
   }, [isOpen])
 
@@ -102,33 +125,30 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
 
   if (!isOpen) return null
 
-  const handleUpdateYtdlp = async () => {
-    setUpdatingTool('ytdlp')
-    onShowToast?.('Đang cập nhật yt-dlp lên phiên bản mới nhất...')
+  // Chưa có kết quả quét lần nào: đừng vẽ mọi công cụ thành "Chưa cài đặt".
+  const isChecking = !toolsData && !statusError
+
+  // Cập nhật yt-dlp / gallery-dl. Luôn quét lại sau đó (kể cả khi lỗi) để phiên
+  // bản hiển thị khớp với binary thật đang được dùng.
+  const runUpdate = async (toolId, startMsg, action, fallbackError) => {
+    setUpdatingTool(toolId)
+    onShowToast?.(startMsg)
     try {
-      const res = await updateYtdlp()
-      onShowToast?.(res || 'Đã cập nhật yt-dlp thành công!')
-      await fetchStatus()
+      const res = await action()
+      onShowToast?.(res || 'Đã cập nhật xong.')
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi cập nhật yt-dlp')
+      onShowToast?.(errorText(err, fallbackError))
     } finally {
       setUpdatingTool(null)
+      await fetchStatus()
     }
   }
 
-  const handleUpdateGalleryDl = async () => {
-    setUpdatingTool('gallery_dl')
-    onShowToast?.('Đang cập nhật gallery-dl qua pip...')
-    try {
-      const res = await updateGalleryDl()
-      onShowToast?.(res || 'Đã cập nhật gallery-dl thành công!')
-      await fetchStatus()
-    } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi cập nhật gallery-dl')
-    } finally {
-      setUpdatingTool(null)
-    }
-  }
+  const handleUpdateYtdlp = () =>
+    runUpdate('ytdlp', 'Đang cập nhật yt-dlp lên phiên bản mới nhất...', updateYtdlp, 'Lỗi khi cập nhật yt-dlp')
+
+  const handleUpdateGalleryDl = () =>
+    runUpdate('gallery_dl', 'Đang cập nhật gallery-dl...', updateGalleryDl, 'Lỗi khi cập nhật gallery-dl')
 
   // Python worker chết 3 lần liên tiếp sẽ chuyển sang FAILED và KHÔNG bao giờ tự
   // hồi phục. Nút này là lối thoát duy nhất ngoài việc thoát hẳn ứng dụng.
@@ -139,16 +159,13 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
       const msg = await restartSidecar()
       onShowToast?.(msg || 'Đã khởi động lại Python worker.')
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khởi động lại Python worker')
+      onShowToast?.(errorText(err, 'Lỗi khởi động lại Python worker'))
     } finally {
       setUpdatingTool(null)
       await fetchStatus()
     }
   }
 
-  // Đây là các gói của hệ điều hành, app KHÔNG tự cập nhật được. Trước đây nút
-  // này báo "đã là phiên bản mới nhất" dù chẳng kiểm tra gì — nay chỉ nêu đúng
-  // những gì thực sự đọc được, và chỉ cách cài khi thiếu.
   const patchSetting = (key, value) => setSettings((prev) => ({ ...(prev || {}), [key]: value }))
 
   const handlePickDownloadDir = async () => {
@@ -157,7 +174,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
       const dir = await askForDownloadDirectory()
       if (dir) patchSetting('downloadDir', dir)
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi chọn thư mục')
+      onShowToast?.(errorText(err, 'Lỗi chọn thư mục'))
     }
   }
 
@@ -178,80 +195,41 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
           ? 'Đã lưu cấu hình và khởi động lại engine bóc tách để áp dụng đường dẫn công cụ / proxy mới.'
           : 'Đã lưu cấu hình.'
       )
+      // Thanh trên cùng đang hiển thị thư mục tải mặc định — báo để nó đọc lại.
+      onSettingsSaved?.()
       await fetchStatus()
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi lưu cấu hình')
+      onShowToast?.(errorText(err, 'Lỗi khi lưu cấu hình'))
     } finally {
       setSavingSettings(false)
     }
   }
 
+  const showInstallHint = (tool) => {
+    const hint = INSTALL_HINTS[tool.id]
+    onShowToast?.(hint ? `${tool.name} chưa được cài. Cài bằng: ${hint}` : `${tool.name} chưa được cài đặt`)
+  }
+
+  // Đây là các gói của hệ điều hành, app không tự cập nhật — chỉ nêu đúng những gì
+  // thực sự đọc được, và chỉ cách cài khi thiếu.
   const handleCheckSystemTool = (tool) => {
     if (!tool.data?.is_installed) {
-      const pkg = SYSTEM_PACKAGE_HINTS[tool.id]
-      onShowToast?.(
-        pkg
-          ? `${tool.name} chưa được cài. Cài bằng: sudo apt install ${pkg}`
-          : `${tool.name} chưa được cài đặt trên hệ điều hành`
-      )
+      showInstallHint(tool)
       return
     }
-    const ver = tool.data?.version ? `v${tool.data.version}` : 'không đọc được phiên bản'
+    const ver = tool.data?.version ? `phiên bản ${tool.data.version}` : 'không đọc được phiên bản'
     const path = tool.data?.path || 'không rõ đường dẫn'
-    onShowToast?.(`${tool.name}: ${ver} — ${path} (gói hệ thống, cập nhật qua trình quản lý gói của Linux)`)
+    const how = IS_WINDOWS ? 'cập nhật bằng trình cài đặt / winget' : 'cập nhật qua trình quản lý gói của hệ điều hành'
+    onShowToast?.(`${tool.name}: ${ver} — ${path} (${how})`)
   }
 
   const toolsList = [
-    {
-      id: 'ytdlp',
-      name: 'yt-dlp',
-      role: 'Engine Video & Audio',
-      data: toolsData?.ytdlp,
-      actionLabel: 'Cập nhật',
-      onAction: handleUpdateYtdlp,
-      needsInstallToAct: true,
-    },
-    {
-      id: 'gallery_dl',
-      name: 'gallery-dl',
-      role: 'Engine Album & Ảnh',
-      data: toolsData?.gallery_dl,
-      actionLabel: 'Cập nhật',
-      onAction: handleUpdateGalleryDl,
-      needsInstallToAct: true,
-    },
-    {
-      id: 'ffmpeg',
-      name: 'FFmpeg',
-      role: 'Bộ ghép luồng & Audio',
-      data: toolsData?.ffmpeg,
-      actionLabel: 'Chi tiết',
-      onAction: () => handleCheckSystemTool({ id: 'ffmpeg', name: 'FFmpeg', data: toolsData?.ffmpeg }),
-    },
-    {
-      id: 'ffprobe',
-      name: 'FFprobe',
-      role: 'Phân tích Media Stream',
-      data: toolsData?.ffprobe,
-      actionLabel: 'Chi tiết',
-      onAction: () => handleCheckSystemTool({ id: 'ffprobe', name: 'FFprobe', data: toolsData?.ffprobe }),
-    },
-    {
-      id: 'aria2c',
-      name: 'aria2c',
-      role: 'Bộ tăng tốc tải đa luồng',
-      data: toolsData?.aria2c,
-      actionLabel: 'Chi tiết',
-      onAction: () => handleCheckSystemTool({ id: 'aria2c', name: 'aria2c', data: toolsData?.aria2c }),
-    },
-    {
-      id: 'node',
-      name: 'Node.js',
-      role: 'Runtime JavaScript n-sig',
-      data: toolsData?.node,
-      actionLabel: 'Chi tiết',
-      onAction: () => handleCheckSystemTool({ id: 'node', name: 'Node.js', data: toolsData?.node }),
-    },
+    { id: 'ytdlp', name: 'yt-dlp', role: 'Engine Video & Audio', data: toolsData?.ytdlp, updatable: true, onUpdate: handleUpdateYtdlp },
+    { id: 'gallery_dl', name: 'gallery-dl', role: 'Engine Album & Ảnh', data: toolsData?.gallery_dl, updatable: true, onUpdate: handleUpdateGalleryDl },
+    { id: 'ffmpeg', name: 'FFmpeg', role: 'Bộ ghép luồng & Audio', data: toolsData?.ffmpeg },
+    { id: 'ffprobe', name: 'FFprobe', role: 'Phân tích Media Stream', data: toolsData?.ffprobe },
+    { id: 'aria2c', name: 'aria2c', role: 'Bộ tăng tốc tải đa luồng', data: toolsData?.aria2c },
+    { id: 'node', name: 'Node.js', role: 'Runtime JavaScript n-sig', data: toolsData?.node },
     {
       id: 'python3',
       name: 'Python 3',
@@ -259,10 +237,23 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
         ? `Lõi Sidecar Worker — ${SIDECAR_STATE_LABELS[sidecar.state] || sidecar.state}`
         : 'Lõi Sidecar Worker',
       data: toolsData?.python3,
-      actionLabel: 'Khởi động lại',
-      onAction: handleRestartSidecar,
+      restartable: true,
     },
   ]
+
+  // Nút hành động của từng dòng: cập nhật / khởi động lại / hướng dẫn cài / chi tiết
+  const actionOf = (tool, isInstalled) => {
+    if (tool.restartable) {
+      return { label: 'Khởi động lại', icon: IconRefresh, onClick: handleRestartSidecar }
+    }
+    if (tool.updatable && isInstalled) {
+      return { label: 'Cập nhật', icon: IconDownload, onClick: tool.onUpdate }
+    }
+    if (!isInstalled) {
+      return { label: 'Cách cài', icon: IconInfo, onClick: () => showInstallHint(tool) }
+    }
+    return { label: 'Chi tiết', icon: IconInfo, onClick: () => handleCheckSystemTool(tool) }
+  }
 
   return createPortal(
     <div
@@ -287,7 +278,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
               className="btn-refresh-small"
               onClick={fetchStatus}
               disabled={loading}
-              title="Quét lại phiên bản & đường dẫn công cụ (F5)"
+              title="Quét lại phiên bản & đường dẫn công cụ"
             >
               <IconRefresh className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
             </button>
@@ -297,7 +288,6 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
           </div>
         </div>
 
-        {/* Modal Body (Đã bỏ toàn bộ mô tả nhỏ bên dưới theo yêu cầu) */}
         <div className="tools-modal-body">
           {sidecar && !sidecar.healthy && sidecar.state !== 'uninitialized' && (
             <div className="tools-sidecar-alert">
@@ -313,43 +303,58 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast }) {
             {toolsList.map((tool) => {
               const isInstalled = Boolean(tool.data?.is_installed)
               const version = tool.data?.version
-              const isUpdating = updatingTool === tool.id
+              const isBusy = updatingTool === tool.id
+              const action = actionOf(tool, isInstalled)
+              const ActionIcon = action.icon
+              const cardState = isChecking ? '' : isInstalled ? 'is-active' : 'is-missing'
 
               return (
-                <div key={tool.id} className={`tool-item-card ${isInstalled ? 'is-active' : 'is-missing'}`}>
+                <div key={tool.id} className={`tool-item-card ${cardState}`}>
                   <div className="tool-info-left">
                     <div className="tool-name-line">
                       <strong className="tool-name">{tool.name}</strong>
                       <span className="tool-role-tag">{tool.role}</span>
-                      <span className={`tool-status-badge ${isInstalled ? 'badge-installed' : 'badge-not-installed'}`}>
-                        {isInstalled ? (
-                          <>
-                            <IconCheck className="w-3 h-3 inline mr-0.5 text-emerald-400" />
-                            <span>{version ? `v${version}` : 'Đã cài'}</span>
-                          </>
-                        ) : (
-                          'Chưa cài đặt'
-                        )}
-                      </span>
+                      {isChecking ? (
+                        <span className="tool-status-badge badge-checking">Đang kiểm tra...</span>
+                      ) : !toolsData ? (
+                        <span className="tool-status-badge badge-checking">Không rõ</span>
+                      ) : (
+                        <span className={`tool-status-badge ${isInstalled ? 'badge-installed' : 'badge-not-installed'}`}>
+                          {isInstalled ? (
+                            <>
+                              <IconCheck className="w-3 h-3 inline mr-0.5 text-emerald-400" />
+                              <span>{version ? `v${version}` : 'Đã cài'}</span>
+                            </>
+                          ) : (
+                            'Chưa cài đặt'
+                          )}
+                        </span>
+                      )}
                     </div>
+                    {/* Đường dẫn THẬT đang được dùng — chính binary mà nút Cập nhật sẽ nâng cấp */}
+                    {tool.data?.path && (
+                      <span className="tool-path-code" title={tool.data.path}>
+                        {tool.data.path}
+                      </span>
+                    )}
                   </div>
 
                   <div className="tool-actions-right">
                     <button
                       type="button"
                       className="btn-update-tool"
-                      onClick={tool.onAction}
-                      disabled={Boolean(updatingTool) || (!isInstalled && tool.needsInstallToAct)}
+                      onClick={action.onClick}
+                      disabled={Boolean(updatingTool) || (!toolsData && !tool.restartable)}
                     >
-                      {isUpdating ? (
+                      {isBusy ? (
                         <>
                           <span className="minimal-spinner" />
                           <span>Đang xử lý...</span>
                         </>
                       ) : (
                         <>
-                          <IconRefresh className="w-3 h-3" />
-                          <span>{tool.actionLabel}</span>
+                          <ActionIcon className="w-3 h-3" />
+                          <span>{action.label}</span>
                         </>
                       )}
                     </button>

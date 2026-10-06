@@ -75,6 +75,9 @@ class GalleryDlExtractor(BaseExtractor):
         self.binary_path = self.find_binary("gallery-dl", "GALLERY_DL_PATH")
 
     def is_available(self) -> bool:
+        # Dò lại nếu gallery-dl được cài (hoặc đổi chỗ) sau khi engine đã khởi động
+        if not (self.binary_path and os.path.exists(self.binary_path)):
+            self.binary_path = self.find_binary("gallery-dl", "GALLERY_DL_PATH")
         return self.binary_path is not None and os.path.exists(self.binary_path)
 
     def get_base_args(self, target_url: str = "", browser: Optional[str] = None) -> Tuple[List[str], Optional[str]]:

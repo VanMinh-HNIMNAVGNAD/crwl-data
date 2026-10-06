@@ -6,8 +6,9 @@ import { IconHistory, IconRefresh, IconTrash, IconClose, IconAlertCircle } from 
 function formatBytes(bytes) {
   if (!bytes || isNaN(bytes) || Number(bytes) === 0) return '-'
   const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  // Kẹp chỉ số: tệp >= 1 TB từng hiện "1.2 undefined"
+  const i = Math.min(sizes.length - 1, Math.max(0, Math.floor(Math.log(bytes) / Math.log(k))))
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`
 }
 

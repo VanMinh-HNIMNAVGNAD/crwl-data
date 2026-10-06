@@ -544,19 +544,42 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     if (!singleMedia) return
     const targetDir = await pickTargetDir('Đã hủy lưu thumbnail do chưa chọn thư mục')
     if (targetDir === null) return
-    try {
-      onShowToast?.('Đang tải ảnh thumbnail...')
-      const res = await downloadThumbnail({
-        url: singleMedia.originalUrl,
-        title: singleMedia.title,
-        destDir: targetDir,
-      })
-      if (res?.file_name) {
-        onShowToast?.(`Đã lưu thumbnail: ${res.file_name}`)
+    onShowToast?.('Đang tải ảnh thumbnail...')
+
+    let firstError = null
+    if (singleMedia.originalUrl) {
+      try {
+        const res = await downloadThumbnail({
+          url: singleMedia.originalUrl,
+          title: singleMedia.title,
+          destDir: targetDir,
+        })
+        onShowToast?.(`Đã lưu thumbnail: ${res?.file_name || 'ảnh bìa'}`)
+        return
+      } catch (err) {
+        firstError = err
       }
-    } catch (err) {
-      onShowToast?.(errorText(err, 'Lỗi khi tải thumbnail'))
     }
+
+    // yt-dlp không đọc được trang gốc (bài ảnh Instagram, story, kết quả của
+    // gallery-dl...) trong khi app đang hiển thị sẵn ảnh bìa: tải thẳng ảnh đó.
+    const shownThumb = safeThumbSrc(singleMedia.highResThumbnail, singleMedia.thumbnail)
+    if (shownThumb) {
+      try {
+        const res = await downloadDirectFile({
+          url: shownThumb,
+          filename: `${sanitizeFilenamePart(singleMedia.title || 'thumbnail', 'thumbnail')}_thumbnail`,
+          referer: singleMedia.originalUrl,
+          destDir: targetDir,
+          platform: singleMedia.platform,
+        })
+        onShowToast?.(`Đã lưu thumbnail: ${res?.file_name || 'ảnh bìa'}`)
+        return
+      } catch (err) {
+        firstError = firstError || err
+      }
+    }
+    onShowToast?.(errorText(firstError, 'Không tìm thấy ảnh bìa để tải'))
   }
 
   // Tải phụ đề
@@ -667,35 +690,15 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     }
   }
 
-  const handleDownloadAlbum = async (asZip = false) => {
-    const itemsToDownload = albumImages.filter((img) => selectedImages[img.id])
-    if (itemsToDownload.length === 0) {
-      onShowToast?.('Vui lòng chọn ít nhất 1 ảnh để tải')
-      return
-    }
-
-    let customAlbumName = `${singleMedia?.title || 'Album'}_Media`
-    if (asZip) {
-      const promptResult = window.prompt(
-        'Tên file quá dài có thể gây lỗi nén ZIP. Nhập tên file ZIP bạn muốn (để trống sẽ dùng tên mặc định):',
-        customAlbumName
-      )
-      if (promptResult === null) {
-        // Người dùng ấn Cancel
-        return
-      }
-      if (promptResult.trim() !== '') {
-        customAlbumName = promptResult.trim()
-      }
-    }
-
+  // Tải trực tiếp các tệp ảnh/video của MỘT bài đăng vào thư mục riêng (hoặc nén ZIP)
+  const downloadMediaFiles = async ({ media, items: itemsToDownload, asZip, albumName: customAlbumName, sourceKey }) => {
     const targetDir = await pickTargetDir('Đã hủy do chưa chọn thư mục lưu')
     if (targetDir === null) return
 
     const taskId = createTaskId()
     startTask(taskId, {
       title: `${asZip ? 'Nén ZIP' : 'Tải'}: ${itemsToDownload.length} tệp`,
-      sourceKey: 'album',
+      sourceKey,
       progress: {
         percent: 0,
         speed: '',
@@ -716,9 +719,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       const itemsPayload = generateBatchMediaFilenames(
         itemsToDownload.map((img) => ({
           ...img,
-          referer: singleMedia?.originalUrl,
+          referer: media?.originalUrl,
         })),
-        singleMedia?.originalUrl
+        media?.originalUrl
       )
       const res = await downloadAlbumBatch({
         items: itemsPayload,
@@ -726,7 +729,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         destDir: targetDir,
         asZip: asZip,
         taskId,
-        platform: singleMedia?.platform,
+        platform: media?.platform,
       })
       if (res && res.success === false) {
         // Tải xong nhưng nén ZIP hỏng — báo đúng thay vì "Hoàn tất".
@@ -759,6 +762,67 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     } finally {
       if (typeof unlisten === 'function') unlisten()
     }
+  }
+
+  const handleDownloadAlbum = async (asZip = false) => {
+    const itemsToDownload = albumImages.filter((img) => selectedImages[img.id])
+    if (itemsToDownload.length === 0) {
+      onShowToast?.('Vui lòng chọn ít nhất 1 ảnh để tải')
+      return
+    }
+
+    let customAlbumName = `${singleMedia?.title || 'Album'}_Media`
+    if (asZip) {
+      const promptResult = window.prompt(
+        'Tên file quá dài có thể gây lỗi nén ZIP. Nhập tên file ZIP bạn muốn (để trống sẽ dùng tên mặc định):',
+        customAlbumName
+      )
+      if (promptResult === null) {
+        // Người dùng ấn Cancel
+        return
+      }
+      if (promptResult.trim() !== '') {
+        customAlbumName = promptResult.trim()
+      }
+    }
+
+    await downloadMediaFiles({
+      media: singleMedia,
+      items: itemsToDownload,
+      asZip,
+      albumName: customAlbumName,
+      sourceKey: 'album',
+    })
+  }
+
+  // Khoá "đang bận" của nút "Tải về" ở từng mục trong danh sách nhiều link —
+  // phải khớp đúng khoá mà nhánh tải tương ứng bên dưới dùng.
+  const batchItemSourceKey = (media) => {
+    if (media.streams?.length) return streamSourceKey(media, media.streams[0])
+    if (media.images?.some((img) => img?.url)) return `post:${media.id || media.originalUrl || ''}`
+    return streamSourceKey(media, { quality: 'Tự động' })
+  }
+
+  // "Tải về" của một mục trong danh sách nhiều link. Bài chỉ có ảnh (không có
+  // stream video) trước đây vẫn bị đưa qua yt-dlp — luôn thất bại với "No video
+  // formats found". Nay tải thẳng các tệp ảnh/video của bài vào một thư mục.
+  const handleDownloadBatchItem = (media) => {
+    if (media.streams?.length) {
+      handleDownloadStream(media.streams[0], media)
+      return
+    }
+    const files = (media.images || []).filter((img) => img?.url)
+    if (files.length > 0) {
+      downloadMediaFiles({
+        media,
+        items: files,
+        asZip: false,
+        albumName: `${media.title || 'Album'}_Media`,
+        sourceKey: batchItemSourceKey(media),
+      })
+      return
+    }
+    handleDownloadStream({ quality: 'Tự động' }, media)
   }
 
   const selectedBatchCount = useMemo(
@@ -1023,10 +1087,15 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     clearFinishedTasks()
   }
 
-  const handleCopy = (text) => {
+  const handleCopy = async (text) => {
     if (!text) return
-    navigator.clipboard.writeText(text)
-    onShowToast?.('Đã sao chép liên kết vào bộ nhớ tạm')
+    try {
+      await navigator.clipboard.writeText(text)
+      onShowToast?.('Đã sao chép liên kết vào bộ nhớ tạm')
+    } catch {
+      // Trước đây luôn báo "Đã sao chép" kể cả khi webview từ chối ghi clipboard
+      onShowToast?.('Không sao chép được — hãy bôi đen liên kết và nhấn Ctrl+C')
+    }
   }
 
   return (
@@ -1685,8 +1754,10 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
               </div>
             )}
 
-            {/* Danh sách định dạng Video / Âm thanh */}
-            {filteredStreams.length > 0 && (
+            {/* Danh sách định dạng Video / Âm thanh. Hiện theo danh sách GỐC chứ không
+                theo danh sách đã lọc: trước đây chọn tab không có định dạng nào (vd.
+                "Chỉ video" với video Facebook) làm biến mất luôn thanh tab, không quay lại được. */}
+            {singleMedia.streams?.length > 0 && (
               <div className="streams-section">
                 {/* Bộ lọc format stream */}
                 <div className="streams-filter-bar">
@@ -1722,6 +1793,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
                 {/* Danh sách các stream */}
                 <div className="streams-list">
+                  {filteredStreams.length === 0 && (
+                    <p className="empty-subtle-hint">Không có định dạng nào thuộc nhóm này.</p>
+                  )}
                   {filteredStreams.map((stream, sIdx) => {
                     const isAudio = stream.streamType === 'audio'
                     const streamId = stream.formatId || stream.quality || sIdx
@@ -1863,12 +1937,13 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                     className="minimal-small-btn btn-success"
                     onClick={(e) => {
                       e.stopPropagation()
-                      const topStream = m.streams?.[0] || { quality: 'Tự động' }
-                      handleDownloadStream(topStream, m)
+                      handleDownloadBatchItem(m)
                     }}
+                    disabled={isSourceBusy(batchItemSourceKey(m))}
+                    title={m.streams?.length ? 'Tải định dạng tốt nhất' : 'Tải toàn bộ ảnh/video của bài vào một thư mục'}
                   >
                     <IconDownload className="w-3.5 h-3.5" />
-                    <span>Tải về</span>
+                    <span>{isSourceBusy(batchItemSourceKey(m)) ? 'Đang tải...' : 'Tải về'}</span>
                   </button>
                 </div>
               ))}

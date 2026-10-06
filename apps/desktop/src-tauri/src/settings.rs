@@ -21,6 +21,59 @@ fn ensure_config_dir() -> std::io::Result<()> {
     Ok(())
 }
 
+/// `~/x` → `<home>/x`. Hộp nhập ở màn hình Công cụ là ô chữ tự do, và PathBuf
+/// không tự hiểu dấu `~` nên đường dẫn kiểu đó chưa bao giờ dùng được.
+fn expand_home(raw: &str) -> Option<PathBuf> {
+    if raw == "~" {
+        return dirs::home_dir();
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        return dirs::home_dir().map(|home| home.join(rest));
+    }
+    Some(PathBuf::from(raw))
+}
+
+/// Đường dẫn công cụ do người dùng nhập phải là một tệp chạy được.
+fn validate_executable(label: &str, raw: &str) -> Result<String, String> {
+    let path = expand_home(raw)
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| format!("Đường dẫn {label} phải là đường dẫn tuyệt đối: {raw}"))?;
+    if !path.is_file() {
+        return Err(format!("Không tìm thấy tệp {label} tại: {raw}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).map(|m| m.permissions().mode()).unwrap_or(0);
+        if mode & 0o111 == 0 {
+            return Err(format!("Tệp {label} không có quyền thực thi: {raw} (chạy: chmod +x \"{raw}\")"));
+        }
+    }
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Proxy hợp lệ cho cả yt-dlp, gallery-dl (requests), curl và Chromium.
+/// Thiếu giao thức thì mặc định http:// như cách yt-dlp/curl tự hiểu.
+pub(crate) fn normalize_proxy(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = url::Url::parse(&with_scheme).map_err(|_| format!("Proxy không hợp lệ: {trimmed}"))?;
+    if !matches!(parsed.scheme(), "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h") {
+        return Err(format!(
+            "Proxy không hỗ trợ giao thức '{}' — dùng http, https, socks4 hoặc socks5",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().map(str::is_empty).unwrap_or(true) {
+        return Err(format!("Proxy thiếu địa chỉ máy chủ: {trimmed}"));
+    }
+    Ok(with_scheme)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +167,45 @@ impl SettingsManager {
             .filter(|p| !p.is_empty())
     }
 
+    /// Chuẩn hoá & kiểm tra cấu hình trước khi lưu.
+    ///
+    /// Trước đây mọi giá trị đều được lưu và báo "Đã lưu", kể cả thư mục không tồn
+    /// tại, đường dẫn công cụ gõ nhầm hay proxy sai — rồi chúng bị bỏ qua trong im
+    /// lặng: tệp vẫn tải về ~/Downloads, engine vẫn dùng yt-dlp cũ, còn proxy hỏng
+    /// làm mọi lượt bóc tách/tải thất bại mà không rõ lý do.
+    pub fn validate(settings: AppSettings) -> Result<AppSettings, String> {
+        let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+        let download_dir = match clean(settings.download_dir) {
+            Some(raw) => {
+                let dir = expand_home(&raw)
+                    .filter(|p| p.is_absolute())
+                    .ok_or_else(|| format!("Thư mục tải mặc định phải là đường dẫn tuyệt đối: {raw}"))?;
+                if !dir.is_dir() {
+                    return Err(format!("Thư mục tải mặc định không tồn tại: {raw}"));
+                }
+                Some(dir.to_string_lossy().to_string())
+            }
+            None => None,
+        };
+
+        let ytdlp_path = clean(settings.ytdlp_path)
+            .map(|raw| validate_executable("yt-dlp", &raw))
+            .transpose()?;
+        let gallery_dl_path = clean(settings.gallery_dl_path)
+            .map(|raw| validate_executable("gallery-dl", &raw))
+            .transpose()?;
+        let proxy = clean(settings.proxy).map(|raw| normalize_proxy(&raw)).transpose()?;
+
+        Ok(AppSettings {
+            download_dir,
+            ytdlp_path,
+            gallery_dl_path,
+            proxy,
+            schema_version: settings.schema_version,
+        })
+    }
+
     /// Đọc settings từ file. Trả về default nếu file chưa tồn tại.
     pub fn load() -> AppSettings {
         let path = settings_path();
@@ -181,5 +273,86 @@ impl SettingsManager {
         } else {
             info!("[Settings] Đã tạo .env mẫu tại {:?}", env_path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_is_normalized_and_validated() {
+        assert_eq!(normalize_proxy("127.0.0.1:8080").unwrap(), "http://127.0.0.1:8080");
+        assert_eq!(normalize_proxy(" socks5://localhost:1080 ").unwrap(), "socks5://localhost:1080");
+        assert_eq!(normalize_proxy("http://user:pass@proxy.lan:3128").unwrap(), "http://user:pass@proxy.lan:3128");
+        assert!(normalize_proxy("ftp://example.com:21").is_err());
+        assert!(normalize_proxy("http://").is_err());
+        assert!(normalize_proxy("not a proxy").is_err());
+    }
+
+    #[test]
+    fn invalid_values_are_rejected_instead_of_silently_ignored() {
+        let tmp = std::env::temp_dir();
+        let base = AppSettings::default();
+
+        let missing = tmp.join(format!("crwl_missing_{}", uuid::Uuid::new_v4()));
+        let err = SettingsManager::validate(AppSettings {
+            download_dir: Some(missing.to_string_lossy().to_string()),
+            ..base.clone()
+        })
+        .unwrap_err();
+        assert!(err.contains("không tồn tại"), "{err}");
+
+        assert!(SettingsManager::validate(AppSettings {
+            download_dir: Some("relative/dir".into()),
+            ..base.clone()
+        })
+        .is_err());
+
+        let err = SettingsManager::validate(AppSettings {
+            ytdlp_path: Some("/definitely/not/here/yt-dlp".into()),
+            ..base.clone()
+        })
+        .unwrap_err();
+        assert!(err.contains("yt-dlp"), "{err}");
+
+        // Ô để trống (chỉ có khoảng trắng) phải thành None, không phải chuỗi rỗng
+        let ok = SettingsManager::validate(AppSettings {
+            download_dir: Some(format!("  {}  ", tmp.display())),
+            proxy: Some("   ".into()),
+            ..base
+        })
+        .unwrap();
+        assert_eq!(ok.download_dir.as_deref(), Some(tmp.to_string_lossy().as_ref()));
+        assert_eq!(ok.proxy, None);
+    }
+
+    #[test]
+    fn tilde_paths_are_expanded() {
+        let home = dirs::home_dir().expect("cần HOME để chạy test này");
+        let ok = SettingsManager::validate(AppSettings {
+            download_dir: Some("~".into()),
+            ..AppSettings::default()
+        })
+        .unwrap();
+        assert_eq!(ok.download_dir.as_deref(), Some(home.to_string_lossy().as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_paths_must_be_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = std::env::temp_dir().join(format!("crwl_tool_{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let settings = AppSettings {
+            gallery_dl_path: Some(tool.to_string_lossy().to_string()),
+            ..AppSettings::default()
+        };
+        assert!(SettingsManager::validate(settings.clone()).unwrap_err().contains("quyền thực thi"));
+
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(SettingsManager::validate(settings).is_ok());
+        let _ = std::fs::remove_file(&tool);
     }
 }

@@ -71,6 +71,10 @@ STREAM_JS_VAR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Chỉ dò stream trong nội dung dạng trang/văn bản, và chỉ đọc tối đa chừng này byte
+_PAGE_CONTENT_TYPES = ("html", "xml", "javascript", "json", "text/plain")
+_MAX_PAGE_BYTES = 5 * 1024 * 1024
+
 # Iframe embed keywords
 EMBED_KEYWORDS = [
     "embed", "player", "stream", "video", "vidsrc", "jwplayer",
@@ -179,7 +183,14 @@ class MovieExtractor(BaseExtractor):
         try:
             req = urllib.request.Request(page_url, headers=headers)
             with urllib.request.urlopen(req, timeout=cap_timeout(timeout)) as resp:
-                html = resp.read().decode("utf-8", errors="ignore")
+                # Link thẳng tới tệp video trên host có chữ "stream"/"film"... cũng được
+                # xếp vào nhóm phim. `resp.read()` không giới hạn từng đọc TOÀN BỘ tệp
+                # (có thể vài GB) vào RAM chỉ để dò HTML. Tệp media thì để yt-dlp xử lý.
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                if content_type and not any(t in content_type for t in _PAGE_CONTENT_TYPES):
+                    self.log(f"Bỏ qua dò HTML: liên kết trả về '{content_type}', không phải trang web")
+                    return None
+                html = resp.read(_MAX_PAGE_BYTES).decode("utf-8", errors="ignore")
         except Exception as e:
             self.warn(f"Scrape movie page error: {e}")
             return None

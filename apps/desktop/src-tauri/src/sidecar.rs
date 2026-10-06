@@ -164,10 +164,13 @@ impl SidecarManager {
         if let Some(dir) = dirs::config_dir() {
             cmd.env("CRWL_CONFIG_DIR", dir.join("crwl"));
         }
-        if let Some(p) = crate::settings::SettingsManager::custom_binary_path("yt-dlp") {
+        // Đúng binary mà màn hình Công cụ hiển thị và cập nhật (đường dẫn tự chọn được
+        // ưu tiên). Python từng tự dò PATH theo thứ tự riêng nên có thể chạy một bản
+        // yt-dlp khác hẳn bản vừa được cập nhật.
+        if let Some(p) = crate::binary_manager::BinaryManager::find_binary("yt-dlp") {
             cmd.env("YT_DLP_PATH", p);
         }
-        if let Some(p) = crate::settings::SettingsManager::custom_binary_path("gallery-dl") {
+        if let Some(p) = crate::binary_manager::BinaryManager::find_binary("gallery-dl") {
             cmd.env("GALLERY_DL_PATH", p);
         }
         // yt-dlp, gallery-dl (requests), urllib, curl và curl_cffi đều đọc proxy từ môi trường
@@ -328,19 +331,20 @@ impl SidecarManager {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    let err_msg = format!("Không thể khởi động Python worker #{worker_id}: {e}");
+                    let hint = if e.kind() == std::io::ErrorKind::NotFound {
+                        format!(" — không tìm thấy trình thông dịch '{python_bin}'. Hãy cài Python 3 rồi bấm 'Khởi động lại'.")
+                    } else {
+                        String::new()
+                    };
+                    let err_msg = format!("Không thể khởi động Python worker #{worker_id}: {e}{hint}");
                     error!("[Sidecar] {err_msg}");
+                    // Không chạy được trình thông dịch là lỗi cố định, thử lại không giúp gì.
+                    // Trước đây trạng thái kẹt ở "Starting" (được coi là khoẻ): nút "Khởi
+                    // động lại" báo thành công và cảnh báo trong modal Công cụ biến mất.
                     let mut lc = this.lifecycle.lock().await;
                     lc.consecutive_crashes += 1;
                     lc.last_error = Some(err_msg.clone());
-                    if lc.consecutive_crashes >= MAX_CONSECUTIVE_RESTARTS {
-                        let fail_msg = format!(
-                            "Không thể spawn Python worker {} lần liên tiếp. Chuyển sang trạng thái FAILED: {err_msg}",
-                            lc.consecutive_crashes
-                        );
-                        error!("[Sidecar] {fail_msg}");
-                        lc.status = WorkerStatus::Failed(fail_msg);
-                    }
+                    lc.status = WorkerStatus::Failed(err_msg);
                     return;
                 }
             };
