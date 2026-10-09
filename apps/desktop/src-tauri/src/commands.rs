@@ -6,7 +6,7 @@ use crate::binary_manager::{AllBinaryStatus, BinaryManager};
 use crate::cookies::{CookieService, CookieStatusResult, SaveCookieResult};
 use crate::db::{Database, DownloadHistoryRecord};
 use crate::downloader::{DirectFileItem, DownloadOptions, DownloadResult, DownloaderService};
-use crate::settings::{AppSettings, SettingsManager};
+use crate::settings::{validate_retention_days, AppSettings, SettingsManager};
 use crate::sidecar::{SidecarManager, WorkerStatus};
 use crate::system::{BrowserInfo, SystemService};
 
@@ -133,6 +133,39 @@ pub async fn clear_download_history(
     device_id: Option<String>,
 ) -> Result<bool, String> {
     Ok(state.db.clear_download_history(device_id.as_deref()).await)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRetentionResult {
+    /// Số ngày giữ lịch sử đang áp dụng; None = đã tắt tự động xoá
+    pub days: Option<u32>,
+    /// Số mục lịch sử quá hạn đã bị xoá ngay khi áp dụng
+    pub removed: u64,
+}
+
+/// Số mục lịch sử sẽ bị xoá ngay nếu bật "tự xoá sau `days` ngày" — để giao diện
+/// hỏi xác nhận trước một thao tác không hoàn tác được.
+#[tauri::command]
+pub async fn preview_history_purge(state: State<'_, AppState>, days: u32) -> Result<i64, String> {
+    let days = validate_retention_days(days)?;
+    // Chưa kết nối được DB thì cũng chưa có lịch sử nào để xoá
+    Ok(state.db.count_history_older_than(days).await.unwrap_or(0))
+}
+
+/// Bật (days = Some) / tắt (None) tự động xoá lịch sử tải. Khi bật, các mục đã
+/// quá hạn bị xoá ngay; sau đó app tự dọn lúc khởi động và định kỳ (xem lib.rs).
+#[tauri::command]
+pub async fn set_history_retention(
+    state: State<'_, AppState>,
+    days: Option<u32>,
+) -> Result<HistoryRetentionResult, String> {
+    SettingsManager::set_history_retention_days(days)?;
+    let removed = match days {
+        Some(d) => state.db.purge_history_older_than(d).await.unwrap_or(0),
+        None => 0,
+    };
+    Ok(HistoryRetentionResult { days, removed })
 }
 
 #[tauri::command]
@@ -323,8 +356,13 @@ pub async fn save_app_settings(
     state: State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<bool, String> {
-    let settings = SettingsManager::validate(settings)?;
     let before = SettingsManager::load();
+    // Form "Công cụ" không quản lý mục tự xoá lịch sử (đặt ở modal Lịch sử): giữ
+    // nguyên giá trị đang lưu, nếu không mỗi lần bấm "Lưu cấu hình" sẽ tắt nó.
+    let settings = SettingsManager::validate(AppSettings {
+        history_retention_days: before.history_retention_days,
+        ..settings
+    })?;
     SettingsManager::save(&settings)?;
     let sidecar_env_changed = before.ytdlp_path != settings.ytdlp_path
         || before.gallery_dl_path != settings.gallery_dl_path

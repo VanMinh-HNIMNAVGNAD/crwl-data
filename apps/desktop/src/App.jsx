@@ -1,11 +1,16 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useCallback } from 'react'
 import SystemHeader from './components/SystemHeader'
 import LinkDownloader from './components/LinkDownloader'
 import AccountDownloader from './components/AccountDownloader'
 import DownloadHistoryModal from './components/DownloadHistoryModal'
 import CookieManager from './components/CookieManager'
 import ToolsManagerModal from './components/ToolsManagerModal'
+import ToastStack from './components/ToastStack'
+import { normalizeToast } from './utils/toasts'
 import './App.css'
+
+// Hiện tối đa chừng này thông báo cùng lúc; cái cũ nhất bị đẩy ra trước
+const MAX_TOASTS = 3
 
 // ─── Shared download options — persist qua localStorage ───────────────────────
 function getLS(key, fallback) {
@@ -24,11 +29,11 @@ function App() {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false)
   const [isCookieManagerOpen, setIsCookieManagerOpen] = useState(false)
   const [isToolsOpen, setIsToolsOpen] = useState(false)
-  const [toastMessage, setToastMessage] = useState('')
+  const [toasts, setToasts] = useState([])
+  const toastSeq = useRef(0)
   const [cookieRefreshKey, setCookieRefreshKey] = useState(0)
   // Tăng mỗi khi lưu cấu hình ở modal Công cụ để thanh trên cùng đọc lại thư mục tải
   const [settingsVersion, setSettingsVersion] = useState(0)
-  const toastTimer = useRef(null)
 
   // ── Shared download options (dùng chung cho cả 3 chế độ tải) ──────────────
   const [videoContainer, setVideoContainer] = useState(() => getLS('dl_video_container', 'auto'))
@@ -57,16 +62,25 @@ function App() {
   }
   // ──────────────────────────────────────────────────────────────────────────
 
-  const showToast = (msg) => {
-    setToastMessage(msg)
-    if (toastTimer.current) clearTimeout(toastTimer.current)
-    // Thông báo lỗi (vd. kết quả cập nhật công cụ) thường dài: 3 giây không đủ để đọc.
-    const duration = Math.min(10000, 3000 + String(msg || '').length * 40)
-    toastTimer.current = setTimeout(() => setToastMessage(''), duration)
-  }
+  // Trước đây chỉ có MỘT toast dạng chuỗi: thông báo sau đè mất thông báo trước
+  // (tải song song nhiều tệp thì chỉ thấy cái cuối) và lỗi hiện nguyên văn log.
+  // Nay mỗi thông báo có loại (thành công / lỗi / cảnh báo / thông tin), tự ẩn
+  // theo độ dài và xếp chồng tối đa MAX_TOASTS cái.
+  const showToast = useCallback((input) => {
+    const toast = normalizeToast(input)
+    if (!toast) return
+    setToasts((prev) => {
+      // Cùng nội dung đang hiện: làm mới thời gian thay vì xếp thêm một bản sao
+      if (prev.some((t) => t.key === toast.key)) {
+        return prev.map((t) => (t.key === toast.key ? { ...toast, id: t.id, version: t.version + 1 } : t))
+      }
+      toastSeq.current += 1
+      return [...prev, { ...toast, id: toastSeq.current, version: 0 }].slice(-MAX_TOASTS)
+    })
+  }, [])
 
-  useEffect(() => () => {
-    if (toastTimer.current) clearTimeout(toastTimer.current)
+  const dismissToast = useCallback((id) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
 
   const handleCookieUpdated = () => setCookieRefreshKey((k) => k + 1)
@@ -98,15 +112,15 @@ function App() {
         </section>
       </main>
 
-      {/* Floating Toast Notification */}
-      {toastMessage && (
-        <div className="desktop-floating-toast">
-          <span>{toastMessage}</span>
-        </div>
-      )}
+      {/* Thông báo nổi */}
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
 
       {/* Modals */}
-      <DownloadHistoryModal isOpen={isHistoryOpen} onClose={() => setIsHistoryOpen(false)} />
+      <DownloadHistoryModal
+        isOpen={isHistoryOpen}
+        onClose={() => setIsHistoryOpen(false)}
+        onShowToast={showToast}
+      />
       <CookieManager
         isOpen={isCookieManagerOpen}
         onClose={() => setIsCookieManagerOpen(false)}

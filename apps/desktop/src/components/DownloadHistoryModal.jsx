@@ -1,7 +1,20 @@
 import { useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
-import { getDownloadHistory, clearDownloadHistory } from '../services/api'
+import {
+  getDownloadHistory,
+  clearDownloadHistory,
+  getAppSettings,
+  previewHistoryPurge,
+  setHistoryRetention,
+} from '../services/api'
 import { IconHistory, IconRefresh, IconTrash, IconClose, IconAlertCircle } from './Icons'
+import { errorToast } from '../utils/toasts'
+
+// Backend ghi tên tệp giữ chỗ cho lượt tải lỗi / bị huỷ (chưa có tệp thật)
+const PLACEHOLDER_FILE_NAMES = new Set(['failed_download', 'cancelled_download'])
+
+const DEFAULT_RETENTION_DAYS = 30
+const MAX_RETENTION_DAYS = 3650
 
 function formatBytes(bytes) {
   if (!bytes || isNaN(bytes) || Number(bytes) === 0) return '-'
@@ -29,13 +42,20 @@ function formatDate(isoStr) {
   }
 }
 
-export default function DownloadHistoryModal({ isOpen, onClose }) {
+export default function DownloadHistoryModal({ isOpen, onClose, onShowToast }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isClearing, setIsClearing] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const [clearError, setClearError] = useState(null)
+  // Tự động xoá lịch sử: undefined = chưa đọc cấu hình, null = tắt, số = số ngày giữ
+  const [savedRetention, setSavedRetention] = useState(undefined)
+  const [daysDraft, setDaysDraft] = useState(String(DEFAULT_RETENTION_DAYS))
+  // Đang chờ xác nhận vì bật/đổi số ngày sẽ xoá ngay `count` mục cũ
+  const [pendingRetention, setPendingRetention] = useState(null)
+  const [isSavingRetention, setIsSavingRetention] = useState(false)
+  const [retentionError, setRetentionError] = useState('')
 
   const loadHistory = async () => {
     setIsLoading(true)
@@ -73,6 +93,81 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
     }
   }
 
+  // Lưu cấu hình (đã được xác nhận nếu có xoá) rồi tải lại danh sách nếu vừa xoá mục cũ
+  const applyRetention = async (days) => {
+    setIsSavingRetention(true)
+    setRetentionError('')
+    try {
+      const res = await setHistoryRetention(days)
+      setSavedRetention(res?.days ?? null)
+      setPendingRetention(null)
+      const removed = Number(res?.removed) || 0
+      onShowToast?.(
+        days
+          ? {
+              type: 'success',
+              title: `Sẽ tự động xoá lịch sử cũ hơn ${days} ngày`,
+              message: removed > 0 ? `Đã xoá ${removed} mục quá hạn.` : 'Ứng dụng kiểm tra khi khởi động và mỗi 6 giờ.',
+            }
+          : { type: 'info', title: 'Đã tắt tự động xoá lịch sử' }
+      )
+      if (removed > 0) await loadHistory()
+    } catch (err) {
+      setPendingRetention(null)
+      setDaysDraft(String(savedRetention || DEFAULT_RETENTION_DAYS))
+      onShowToast?.(errorToast(err, { title: 'Chưa lưu được cài đặt tự xoá' }))
+    } finally {
+      setIsSavingRetention(false)
+    }
+  }
+
+  // Bật / đổi số ngày: nếu có mục sẽ bị xoá ngay thì hỏi lại trước (không hoàn tác được)
+  const requestRetention = async (rawDays) => {
+    const days = Number(rawDays)
+    if (!Number.isInteger(days) || days < 1 || days > MAX_RETENTION_DAYS) {
+      setRetentionError(`Nhập số ngày từ 1 đến ${MAX_RETENTION_DAYS}`)
+      return
+    }
+    setRetentionError('')
+    if (days === savedRetention) return
+    setIsSavingRetention(true)
+    let count = 0
+    try {
+      count = Number(await previewHistoryPurge(days)) || 0
+    } catch (err) {
+      console.warn('Không đếm được lịch sử cũ:', err)
+    } finally {
+      setIsSavingRetention(false)
+    }
+    if (count > 0) {
+      setConfirmClear(false)
+      setPendingRetention({ days, count })
+    } else {
+      await applyRetention(days)
+    }
+  }
+
+  const handleToggleRetention = (checked) => {
+    if (checked) {
+      requestRetention(daysDraft || DEFAULT_RETENTION_DAYS)
+    } else {
+      applyRetention(null)
+    }
+  }
+
+  // Ô số ngày chỉ áp dụng khi rời ô / nhấn Enter: lưu theo từng phím gõ thì gõ
+  // "100" sẽ đi qua "1" và xoá sạch lịch sử cũ hơn 1 ngày.
+  const commitDaysDraft = () => {
+    if (savedRetention == null || pendingRetention) return
+    if (Number(daysDraft) === savedRetention) return
+    requestRetention(daysDraft)
+  }
+
+  const cancelPendingRetention = () => {
+    setPendingRetention(null)
+    setDaysDraft(String(savedRetention || DEFAULT_RETENTION_DAYS))
+  }
+
   useEffect(() => {
     if (!isOpen) return undefined
     let active = true
@@ -90,6 +185,17 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
         setError(err.message || 'Lỗi khi tải lịch sử')
         setIsLoading(false)
       })
+    getAppSettings()
+      .then((cfg) => {
+        if (!active) return
+        const days = cfg?.historyRetentionDays ?? null
+        setSavedRetention(days)
+        if (days) setDaysDraft(String(days))
+      })
+      .catch((err) => {
+        console.warn('Không đọc được cấu hình tự xoá lịch sử:', err)
+        if (active) setSavedRetention(null)
+      })
     // Dọn về trạng thái chờ khi đóng modal, để lần mở sau hiện spinner thay vì
     // danh sách cũ. Làm trong cleanup nên effect không setState đồng bộ.
     return () => {
@@ -98,6 +204,9 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
       setError(null)
       setClearError(null)
       setIsLoading(true)
+      setSavedRetention(undefined)
+      setPendingRetention(null)
+      setRetentionError('')
     }
   }, [isOpen])
 
@@ -107,7 +216,10 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
 
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') {
-        if (confirmClear) {
+        if (pendingRetention) {
+          setPendingRetention(null)
+          setDaysDraft(String(savedRetention || DEFAULT_RETENTION_DAYS))
+        } else if (confirmClear) {
           setConfirmClear(false)
         } else {
           onClose()
@@ -117,7 +229,7 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [isOpen, onClose, confirmClear])
+  }, [isOpen, onClose, confirmClear, pendingRetention, savedRetention])
 
   // Khóa cuộn trang nền khi mở modal
   useEffect(() => {
@@ -223,6 +335,35 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
           </div>
         )}
 
+        {pendingRetention && (
+          <div className="history-confirm-banner">
+            <div className="history-confirm-message">
+              <IconAlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+              <span>
+                Có {pendingRetention.count} mục lịch sử cũ hơn {pendingRetention.days} ngày sẽ bị xoá ngay. Tiếp tục?
+              </span>
+            </div>
+            <div className="history-confirm-actions">
+              <button
+                type="button"
+                className="btn-secondary-action"
+                onClick={cancelPendingRetention}
+                disabled={isSavingRetention}
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                className="btn-danger-action"
+                onClick={() => applyRetention(pendingRetention.days)}
+                disabled={isSavingRetention}
+              >
+                {isSavingRetention ? 'Đang xóa...' : 'Xóa & bật tự động'}
+              </button>
+            </div>
+          </div>
+        )}
+
         {clearError && (
           <div className="history-confirm-banner history-clear-error">
             <div className="history-confirm-message">
@@ -276,12 +417,15 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
                 <tbody>
                   {items.map((item, idx) => {
                     const isSuccess = item.status === 'success'
+                    // Lượt lỗi / huỷ không có tệp: hiện tiêu đề nội dung thay vì "failed_download"
+                    const hasRealFile = item.file_name && !PLACEHOLDER_FILE_NAMES.has(item.file_name)
+                    const displayName = hasRealFile ? item.file_name : item.media_title || 'Không rõ tên'
                     return (
                       <tr key={item.id || idx}>
                         <td className="cell-muted cell-mono">{idx + 1}</td>
-                        <td className="cell-filename" title={item.media_title || item.file_name}>
-                          <div className="file-name-text">{item.file_name}</div>
-                          {item.media_title && item.media_title !== item.file_name && (
+                        <td className="cell-filename" title={item.media_title || displayName}>
+                          <div className="file-name-text">{displayName}</div>
+                          {item.media_title && item.media_title !== displayName && (
                             <div className="file-title-sub">{item.media_title}</div>
                           )}
                         </td>
@@ -294,7 +438,7 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
                           {formatBytes(Number(item.file_size_bytes))}
                         </td>
                         <td>
-                          <span className={`tag-status ${item.status || 'unknown'}`}>
+                          <span className={`tag-status ${['success', 'failed', 'cancelled'].includes(item.status) ? item.status : 'unknown'}`}>
                             {isSuccess ? 'Hoàn tất' : item.status === 'cancelled' ? 'Đã hủy' : 'Lỗi'}
                           </span>
                         </td>
@@ -312,11 +456,44 @@ export default function DownloadHistoryModal({ isOpen, onClose }) {
 
         {/* Footer modal */}
         <div className="history-modal-footer">
-          <div className="footer-hint-row">
-            <span className="kbd-shortcut-chip">ESC</span>
-            <span className="footer-hint">hoặc nhấp chuột ra ngoài để đóng</span>
+          <div
+            className="history-retention-control"
+            title="Ứng dụng tự xoá các mục cũ hơn số ngày này khi khởi động và mỗi 6 giờ (gồm cả danh sách liên kết đã phân tích)."
+          >
+            <label className="history-retention-toggle">
+              <input
+                type="checkbox"
+                checked={Boolean(pendingRetention) || savedRetention != null}
+                onChange={(e) => handleToggleRetention(e.target.checked)}
+                disabled={savedRetention === undefined || isSavingRetention || Boolean(pendingRetention)}
+              />
+              <span>Tự động xoá lịch sử cũ hơn</span>
+            </label>
+            <input
+              type="number"
+              className="history-retention-days"
+              min={1}
+              max={MAX_RETENTION_DAYS}
+              value={daysDraft}
+              onChange={(e) => {
+                setDaysDraft(e.target.value)
+                setRetentionError('')
+              }}
+              onBlur={commitDaysDraft}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  commitDaysDraft()
+                }
+              }}
+              disabled={savedRetention === undefined || isSavingRetention || Boolean(pendingRetention)}
+              aria-label="Số ngày giữ lịch sử"
+            />
+            <span>ngày</span>
+            {isSavingRetention && <span className="minimal-spinner" aria-label="Đang lưu" />}
+            {retentionError && <span className="history-retention-error">{retentionError}</span>}
           </div>
-          <button type="button" className="btn-footer-close" onClick={onClose}>
+          <button type="button" className="btn-footer-close" onClick={onClose} title="Đóng (ESC)">
             Đóng
           </button>
         </div>

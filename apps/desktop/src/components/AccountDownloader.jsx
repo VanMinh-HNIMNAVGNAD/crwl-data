@@ -23,6 +23,20 @@ import {
 } from '../services/api'
 import { DownloadTaskList } from './DownloadProgressCard'
 import { useDownloadTasks, parseSpeed, formatSpeed } from '../hooks/useDownloadTasks'
+import { describeError, errorText } from '../utils/messages'
+import { errorToast, openFolderAction, savedToast } from '../utils/toasts'
+
+// Số tệp lỗi trong câu tổng kết của backend: "Đã tải 3 tệp ..., 2 tệp thất bại."
+const failedCountOf = (message) => Number(/(\d+) tệp thất bại/.exec(message || '')?.[1] || 0)
+
+// Danh sách lỗi từng tệp, đặt sau nút "Chi tiết" thay vì nhồi vào câu thông báo
+const formatFailures = (failures) =>
+  failures
+    .map(({ label, err }) => {
+      const info = describeError(err)
+      return `• ${label}: ${info.title}${info.detail ? `\n  ${info.detail}` : ''}`
+    })
+    .join('\n')
 
 function safeMediaTitle(item, fallback = 'media') {
   // Một bài đăng có thể chứa nhiều ảnh. Ghép mã bài đăng + số thứ tự trong bài
@@ -83,6 +97,8 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
   const [selectedBatchIds, setSelectedBatchIds] = useState({})
   const [isCancellingCrawl, setIsCancellingCrawl] = useState(false)
   const crawlTaskRef = useRef(null)
+  // Bấm Huỷ thì lượt quét kết thúc bằng lỗi "Đã huỷ...": không được báo như lỗi thật
+  const crawlCancelledRef = useRef(false)
   // Mỗi lượt tải một thẻ tiến trình riêng — tải song song không còn ghi đè nhau
   const {
     tasks: downloadTasks,
@@ -116,12 +132,13 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
   const handlePaste = async () => {
     try {
       const text = await navigator.clipboard.readText()
-      if (text) {
+      if (text?.trim()) {
         setAccountInput(text.trim())
-        onShowToast?.('Đã dán tài khoản từ bộ nhớ tạm')
+      } else {
+        onShowToast?.({ type: 'info', title: 'Bộ nhớ tạm đang trống' })
       }
     } catch {
-      onShowToast?.('Vui lòng dùng phím tắt Ctrl+V để dán')
+      onShowToast?.({ type: 'info', title: 'Hãy dùng Ctrl+V để dán', message: 'Ứng dụng chưa được phép đọc bộ nhớ tạm.' })
     }
   }
 
@@ -129,17 +146,22 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
     e?.preventDefault()
     const target = accountInput.trim()
     if (!target) {
-      onShowToast?.('Vui lòng nhập tên người dùng (@username) hoặc liên kết!')
+      onShowToast?.({ type: 'warning', title: 'Vui lòng nhập @username hoặc liên kết tài khoản' })
       return
     }
 
     if ((target.startsWith('@') || (!target.includes('.') && !target.includes('/'))) && (!activePlatform || activePlatform === 'auto')) {
-      onShowToast?.('Vui lòng bấm chọn một nền tảng (Facebook, Instagram, X...) phía dưới để quét username!')
+      onShowToast?.({
+        type: 'warning',
+        title: 'Hãy chọn nền tảng cho username',
+        message: 'Bấm chọn Facebook, Instagram, X... ở hàng "Nền tảng" bên dưới rồi quét lại.',
+      })
       return
     }
 
     setIsCrawling(true)
     setIsCancellingCrawl(false)
+    crawlCancelledRef.current = false
     setElapsedCrawl(0)
     setStatusText('Đang kết nối tài khoản...')
     const crawlTaskId = createTaskId()
@@ -179,15 +201,29 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
         taskId: crawlTaskId,
       })
 
-      if (resultData && resultData.media && resultData.media.length > 0) {
+      if (crawlCancelledRef.current) {
+        onShowToast?.({ type: 'info', title: 'Đã dừng quét tài khoản' })
+      } else if (resultData && resultData.media && resultData.media.length > 0) {
         setProfileResult(resultData)
         setSelectedBatchIds({})
-        onShowToast?.(`Đã quét được ${resultData.media.length} tệp từ @${resultData.name || 'tài khoản'}!`)
+        onShowToast?.({
+          type: 'success',
+          title: `Đã quét được ${resultData.media.length} tệp`,
+          message: resultData.name ? `Từ tài khoản ${resultData.name}` : '',
+        })
       } else {
-        onShowToast?.('Không tìm thấy tệp phương tiện công khai nào từ tài khoản này.')
+        onShowToast?.({
+          type: 'warning',
+          title: 'Không tìm thấy tệp công khai nào',
+          message: 'Tài khoản có thể đang để riêng tư hoặc cần cookie đăng nhập (🍪).',
+        })
       }
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi khi quét tài khoản!')
+      onShowToast?.(
+        crawlCancelledRef.current
+          ? { type: 'info', title: 'Đã dừng quét tài khoản' }
+          : errorToast(err, { title: 'Không quét được tài khoản' })
+      )
     } finally {
       clearInterval(elapsedTimer)
       crawlTaskRef.current = null
@@ -201,8 +237,8 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
   const handleCancelCrawl = async () => {
     const taskId = crawlTaskRef.current
     if (!taskId) return
+    crawlCancelledRef.current = true
     setIsCancellingCrawl(true)
-    onShowToast?.('Đang dừng tiến trình quét...')
     await cancelExtraction(taskId)
   }
 
@@ -212,17 +248,16 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
     try {
       const dir = await askForDownloadDirectory()
       if (!dir) {
-        onShowToast?.(cancelMsg)
+        onShowToast?.({ type: 'info', title: cancelMsg })
         return null
       }
       return dir
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi chọn thư mục lưu')
+      onShowToast?.(errorToast(err, { title: 'Không chọn được thư mục lưu' }))
       return null
     }
   }
 
-  const errorText = (err, fallback) => (typeof err === 'string' ? err : err?.message || fallback)
   const isCancelError = (taskId, msg) =>
     isCancelled(taskId) || msg.includes('cancelled') || msg.includes('hủy') || msg.includes('huỷ') || msg.includes('abort')
 
@@ -236,9 +271,10 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
       message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
     })
 
-  // Kết thúc một tác vụ bằng lỗi — phân biệt "đã huỷ" với lỗi thật
-  const reportTaskError = (taskId, err, fallback) => {
-    const errMsg = errorText(err, fallback)
+  // Kết thúc một tác vụ bằng lỗi — phân biệt "đã huỷ" với lỗi thật. Thẻ tiến trình
+  // giữ nguyên văn lỗi (xem được qua "Chi tiết"), toast chỉ hiện câu ngắn gọn.
+  const reportTaskError = (taskId, err, failedTitle = 'Tải thất bại') => {
+    const errMsg = errorText(err, failedTitle)
     if (isCancelError(taskId, errMsg)) {
       markTaskCancelled(taskId)
       return
@@ -248,10 +284,10 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
       speed: '',
       eta: '',
       status: 'error',
-      phase: 'Tải thất bại',
+      phase: failedTitle,
       message: errMsg,
     }))
-    onShowToast?.(errMsg)
+    onShowToast?.(errorToast(errMsg, { title: failedTitle }))
   }
 
   // Hủy một tác vụ tải và xoá sạch tệp dở dang của nó
@@ -261,7 +297,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
     try {
       await cancelDownload(taskId)
       markTaskCancelled(taskId)
-      onShowToast?.('Đã hủy tải và dọn dẹp tệp dở dang')
+      onShowToast?.({ type: 'info', title: 'Đã huỷ tải', message: 'Các tệp tải dở đã được xoá.' })
     } catch (err) {
       console.error('Cancel download error:', err)
     }
@@ -269,7 +305,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
 
   // Tải 1 tệp trong profile
   const handleDownloadProfileItem = async (item) => {
-    const targetDir = await pickTargetDir('Đã hủy tải do chưa chọn thư mục lưu')
+    const targetDir = await pickTargetDir('Đã huỷ tải vì chưa chọn thư mục lưu')
     if (targetDir === null) return
 
     const taskId = createTaskId()
@@ -289,8 +325,6 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
 
     let unlisten = null
     try {
-      onShowToast?.(`Bắt đầu tải: ${item.title?.slice(0, 30) || (isImage ? 'ảnh' : 'video')}...`)
-
       try {
         unlisten = await onDownloadProgress((payload) => updateTask(taskId, payload), taskId)
       } catch (e) {
@@ -335,10 +369,10 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
           filePath: res.file_path,
           fileName: res.file_name,
         })
-        onShowToast?.(`Đã lưu tại: ${res.file_path || res.file_name || 'tệp'}`)
+        onShowToast?.(savedToast(res.file_path, { title: isImage ? 'Đã lưu ảnh' : 'Đã tải xong video', name: res.file_name }))
       }
     } catch (err) {
-      reportTaskError(taskId, err, 'Lỗi khi tải tệp')
+      reportTaskError(taskId, err, isImage ? 'Tải ảnh thất bại' : 'Tải video thất bại')
     } finally {
       if (typeof unlisten === 'function') unlisten()
     }
@@ -363,7 +397,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
   const handleDownloadProfileBatch = async (asZip = false) => {
     const itemsToDownload = profileMediaList.filter((it) => selectedBatchIds[it.id])
     if (itemsToDownload.length === 0) {
-      onShowToast?.('Vui lòng chọn ít nhất 1 tệp để tải')
+      onShowToast?.({ type: 'warning', title: 'Hãy chọn ít nhất 1 tệp để tải' })
       return
     }
 
@@ -383,7 +417,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
       }
     }
 
-    const targetDir = await pickTargetDir('Đã hủy do chưa chọn thư mục lưu')
+    const targetDir = await pickTargetDir('Đã huỷ vì chưa chọn thư mục lưu')
     if (targetDir === null) return
 
     const videoItems = itemsToDownload.filter((it) => it.type === 'video')
@@ -447,7 +481,10 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
             filePath: albumRes.file_path,
             message: albumRes.message,
           })
-          onShowToast?.(albumRes.message || 'Nén ZIP thất bại')
+          onShowToast?.({
+            ...errorToast(albumRes.message, { title: 'Nén ZIP thất bại' }),
+            action: openFolderAction(albumRes.file_path),
+          })
           return
         }
 
@@ -461,11 +498,18 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
           fileName: albumRes?.file_name,
           message: albumRes?.message,
         })
+        const total = itemsToDownload.length
+        const failedImages = failedCountOf(albumRes?.message)
         onShowToast?.(
-          albumRes?.message ||
-            (albumRes?.file_path
-              ? `Đã lưu ZIP tại: ${albumRes.file_path}`
-              : `Đã tải thành công (${itemsToDownload.length} tệp)!`)
+          savedToast(albumRes?.file_path, {
+            type: failedImages > 0 ? 'warning' : 'success',
+            title: failedImages > 0 ? `Đã nén ZIP ${total - failedImages}/${total} tệp` : 'Đã nén ZIP xong',
+            name: albumRes?.file_name,
+            message:
+              failedImages > 0
+                ? `${failedImages} tệp không tải được — liên kết có thể đã hết hạn, hãy quét lại tài khoản.`
+                : undefined,
+          })
         )
         return
       }
@@ -504,16 +548,15 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
             platform: profileResult?.platform || imageItems[0]?.platform,
           })
           if (albumRes?.file_path) albumFolder = albumRes.file_path
-          const failedImages = Number(albumRes?.message?.match(/(\d+) tệp thất bại/)?.[1] || 0)
+          const failedImages = failedCountOf(albumRes?.message)
           if (failedImages > 0) {
             failedCount += failedImages
-            failures.push(albumRes.message)
+            failures.push({ label: `${failedImages} ảnh`, err: 'Liên kết ảnh có thể đã hết hạn hoặc bị chặn.' })
           }
         } catch (err) {
-          const msg = errorText(err, 'Không tải được ảnh')
-          if (isCancelError(taskId, msg) || !moreStepsFollow) throw err
+          if (isCancelError(taskId, errorText(err, '')) || !moreStepsFollow) throw err
           failedCount += imageItems.length
-          failures.push(msg)
+          failures.push({ label: `${imageItems.length} ảnh`, err })
         } finally {
           if (typeof unlisten === 'function') {
             unlisten()
@@ -616,10 +659,9 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
               if (!res?.success) throw new Error(res?.message || `Không tải được video thứ ${index + 1}`)
               videoResults[index] = res
             } catch (error) {
-              const msg = errorText(error, `Không tải được video thứ ${index + 1}`)
-              if (!isCancelError(taskId, msg)) {
+              if (!isCancelError(taskId, errorText(error, ''))) {
                 failedCount++
-                failures.push(`${item.title || `Video ${index + 1}`}: ${msg}`)
+                failures.push({ label: item.title || `Video ${index + 1}`, err: error })
               }
             } finally {
               if (typeof videoUnlisten === 'function') videoUnlisten()
@@ -651,7 +693,8 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
       if (isCancelled(taskId)) return
 
       const okCount = itemsToDownload.length - failedCount
-      const failSummary = failedCount > 0 ? `${failedCount} tệp lỗi — ${failures[0]}` : ''
+      const failureDetail = failedCount > 0 ? formatFailures(failures) : ''
+      const firstFailure = failures.length > 0 ? describeError(failures[0].err).title : ''
 
       // Bước 3: Nếu là chế độ ZIP -> nén toàn bộ thư mục (đã chứa cả ảnh và video) thành file ZIP
       if (asZip) {
@@ -676,7 +719,9 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
           })
         } catch (err) {
           if (failures.length > 0 && !isCancelError(taskId, errorText(err, ''))) {
-            throw new Error(`Không tải được tệp nào để nén ZIP. ${failures[0]}`, { cause: err })
+            throw new Error(`Không tải được tệp nào để nén ZIP. (Chi tiết: ${errorText(failures[0].err)})`, {
+              cause: err,
+            })
           }
           throw err
         }
@@ -693,11 +738,14 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
             filePath: zipRes.file_path,
             message: zipRes.message,
           })
-          onShowToast?.(zipRes.message || 'Nén ZIP thất bại')
+          onShowToast?.({
+            ...errorToast(zipRes.message, { title: 'Nén ZIP thất bại' }),
+            action: openFolderAction(zipRes.file_path),
+          })
           return
         }
 
-        const summary = failSummary ? `Đã nén ZIP, ${failSummary}` : zipRes?.message
+        const summary = failedCount > 0 ? `Đã nén ZIP · ${failedCount} tệp lỗi` : zipRes?.message
         updateTask(taskId, {
           percent: 100,
           speed: '',
@@ -707,36 +755,54 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
           filePath: zipRes?.file_path,
           fileName: zipRes?.file_name,
           message: summary,
+          detail: failureDetail,
         })
-        onShowToast?.(
-          summary ||
-            (zipRes?.file_path
-              ? `Đã lưu ZIP tại: ${zipRes.file_path}`
-              : `Đã nén thành công (${itemsToDownload.length} tệp)!`)
-        )
+        onShowToast?.({
+          ...savedToast(zipRes?.file_path, {
+            type: failedCount > 0 ? 'warning' : 'success',
+            title: failedCount > 0 ? summary : 'Đã nén ZIP xong',
+            name: zipRes?.file_name,
+            message: failedCount > 0 ? `${firstFailure}. Bấm "Chi tiết" để xem từng tệp lỗi.` : undefined,
+          }),
+          detail: failureDetail,
+        })
         return
       }
 
       // Chế độ download bình thường không ZIP
       if (okCount <= 0) {
-        throw new Error(failures[0] || 'Không tải được tệp nào')
+        throw new Error(
+          failures.length > 0
+            ? `Không tải được tệp nào. (Chi tiết: ${errorText(failures[0].err)})`
+            : 'Không tải được tệp nào'
+        )
       }
-      const summary = failSummary
-        ? `Đã tải ${okCount}/${itemsToDownload.length} tệp, ${failSummary}`
-        : `Đã tải thành công (${itemsToDownload.length} tệp)!`
+      const total = itemsToDownload.length
+      const summary = failedCount > 0 ? `Đã tải ${okCount}/${total} tệp · ${failedCount} tệp lỗi` : `Đã tải xong ${total} tệp`
+      const savedPath = albumFolder || lastVideoRes?.file_path || targetDir
       updateTask(taskId, {
         percent: 100,
         speed: '',
         eta: '',
         status: 'completed',
         phase: 'Hoàn tất',
-        filePath: albumFolder || lastVideoRes?.file_path || targetDir,
+        filePath: savedPath,
         fileName: albumRes?.file_name || lastVideoRes?.file_name,
         message: summary,
+        detail: failureDetail,
       })
-      onShowToast?.(summary)
+      onShowToast?.({
+        ...savedToast(savedPath, {
+          type: failedCount > 0 ? 'warning' : 'success',
+          title: summary,
+          // Video tải thẳng vào thư mục tải (không có thư mục album): tên tệp cuối
+          // cùng không đại diện cho cả lượt nên không hiện
+          message: failedCount > 0 ? `${firstFailure}. Bấm "Chi tiết" để xem từng tệp lỗi.` : albumFolder ? undefined : '',
+        }),
+        detail: failureDetail,
+      })
     } catch (err) {
-      reportTaskError(taskId, err, 'Lỗi khi tải danh sách')
+      reportTaskError(taskId, err, asZip ? 'Nén ZIP thất bại' : 'Tải danh sách thất bại')
     } finally {
       if (typeof unlisten === 'function') unlisten()
     }
@@ -1001,7 +1067,12 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
       <div className="pane-results-container">
         {/* Tiến trình của mọi lượt tải trong khung này — nằm ngoài khối kết quả để
             đóng kết quả không làm mất nút Huỷ của lượt tải đang chạy */}
-        <DownloadTaskList tasks={downloadTasks} onCancel={handleCancelDownload} onDismiss={dismissTask} />
+        <DownloadTaskList
+          tasks={downloadTasks}
+          onCancel={handleCancelDownload}
+          onDismiss={dismissTask}
+          onShowToast={onShowToast}
+        />
 
         {profileResult && (
           <div className="result-content-wrap">

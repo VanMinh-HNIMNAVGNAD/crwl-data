@@ -398,6 +398,29 @@ export async function clearDownloadHistory() {
   }
 }
 
+/**
+ * Số mục lịch sử sẽ bị xoá ngay nếu bật "tự động xoá sau `days` ngày".
+ */
+export async function previewHistoryPurge(days) {
+  try {
+    return await invoke('preview_history_purge', { days: Number(days) })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi đếm lịch sử cũ', { cause: err })
+  }
+}
+
+/**
+ * Bật (`days` = số ngày) hoặc tắt (`null`) tự động xoá lịch sử tải.
+ * @returns `{ days, removed }` — `removed` là số mục quá hạn đã bị xoá ngay.
+ */
+export async function setHistoryRetention(days) {
+  try {
+    return await invoke('set_history_retention', { days: days == null ? null : Number(days) })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi lưu thời hạn lịch sử', { cause: err })
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 7. Cookie Manager — Native (thay thế toàn bộ /api/media/cookies)
 // ─────────────────────────────────────────────────────────────────────────────

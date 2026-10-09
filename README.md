@@ -103,11 +103,15 @@ flowchart TD
 ## ✨ Tính Năng Nổi Bật
 
 - [x] **Link Downloader (Đơn & Đa liên kết):** Dán link video/ảnh bất kỳ, tự động nhận diện nền tảng, cho phép chọn chất lượng (4K, 1080p, 720p, chỉ Audio MP3, Thumbnail, Subtitle).
+  - Dán nhiều link (hoặc cả một đoạn tin nhắn chứa link) vào ô **1 Liên kết** sẽ tự chuyển sang **Nhiều link**, mỗi link một dòng.
+  - Khung **Nhiều link** tự giãn theo số dòng và đánh số thứ tự ở lề trái (số không chèn vào nội dung nên không làm hỏng link); dòng trùng / không phải link / vượt quá 10 link được tô màu, nút **Dọn dẹp** bỏ chúng đi (Ctrl+Z để hoàn tác). Sau khi phân tích, lề trái hiện ✓ / ✕ kèm lý do cho từng link. `Ctrl+Enter` để phân tích.
 - [x] **Account / Profile Crawler:** Cào toàn bộ video hoặc bài viết từ trang cá nhân (@username), tải danh sách hoặc nén gói ZIP tiện lợi.
 - [x] **Cookie Manager Thông Minh:** Tự động đọc cookie sạch từ các trình duyệt đã cài đặt (Chrome, Brave, Firefox, Edge, Chromium) hoặc nhập file `cookies.txt` để tải nội dung riêng tư / giới hạn độ tuổi.
 - [x] **Quản Lý Bộ Công Cụ (Tools Manager):** Kiểm tra phiên bản và **cập nhật `yt-dlp` chỉ bằng 1 cú click** ngay trong giao diện ứng dụng.
 - [x] **Quản Lý Tiến Trình Thời Gian Thực:** Mỗi lượt tải có thẻ riêng hiển thị phần trăm, tốc độ, thời gian đã chạy và thời gian còn lại; hủy tải (xoá sạch tệp dở dang) và mở thư mục lưu file ngay trên thẻ.
+- [x] **Thông Báo Dễ Hiểu:** Lỗi được rút gọn thành một câu tiếng Việt kèm cách xử lý (vd. *"Nội dung YouTube cần đăng nhập — mở Cookie 🍪..."*) thay vì in nguyên log của yt-dlp; log gốc vẫn xem / sao chép được qua nút **Chi tiết**. Thông báo thành công chỉ hiện tên tệp kèm nút **Mở thư mục**.
 - [x] **Lịch Sử Tải:** Lưu 50 lượt tải gần nhất (thành công / lỗi / đã hủy) trong SQLite cục bộ, kèm nền tảng, dung lượng, thời gian và nút xoá toàn bộ lịch sử.
+  - **Tự động xoá lịch sử cũ hơn N ngày** (bật ở chân hộp thoại Lịch sử, N từ 1 đến 3650): app dọn khi khởi động và mỗi 6 giờ, xoá cả danh sách liên kết đã phân tích cùng thời hạn. Khi bật / đổi số ngày mà có mục sẽ bị xoá ngay, app hỏi xác nhận trước. Cấu hình lưu ở `historyRetentionDays` trong `~/.config/crwl/settings.json`.
 
 ---
 
@@ -304,6 +308,7 @@ Quá trình build tự động thực hiện:
 | `pnpm build:tauri` | Đóng gói bộ cài Desktop (.deb, .AppImage, .exe) |
 | `pnpm test:core` | Chạy bộ kiểm thử tự động của engine Python |
 | `pnpm lint` | Kiểm tra cú pháp và định dạng mã nguồn ESLint |
+| `pnpm test:ui` | Unit test phần giao diện không cần trình duyệt (tách / đánh số link, rút gọn thông báo lỗi) |
 | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | Chạy unit test của tầng Rust |
 
 ---

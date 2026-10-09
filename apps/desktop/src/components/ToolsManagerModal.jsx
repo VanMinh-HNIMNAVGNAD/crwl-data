@@ -11,6 +11,7 @@ import {
   askForDownloadDirectory,
 } from '../services/api'
 import { IconClose, IconRefresh, IconCheck, IconSettings, IconInfo, IconDownload } from './Icons'
+import { errorToast } from '../utils/toasts'
 
 const IS_WINDOWS = typeof navigator !== 'undefined' && /windows/i.test(navigator.userAgent || '')
 
@@ -43,8 +44,6 @@ const SIDECAR_STATE_LABELS = {
   failed: 'ĐÃ DỪNG VÌ LỖI',
   stopped: 'đã dừng',
 }
-
-const errorText = (err, fallback) => (typeof err === 'string' ? err : err?.message || fallback)
 
 const loadStatus = () =>
   Promise.all([
@@ -81,7 +80,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
     } catch (err) {
       console.warn('Lỗi khi tải trạng thái công cụ:', err)
       setStatusError(true)
-      onShowToast?.(errorText(err, 'Lỗi khi tải trạng thái công cụ'))
+      onShowToast?.(errorToast(err, { title: 'Không đọc được trạng thái công cụ' }))
     } finally {
       setLoading(false)
     }
@@ -102,7 +101,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
         if (!active) return
         console.warn('Lỗi khi tải trạng thái công cụ:', err)
         setStatusError(true)
-        showToastRef.current?.(errorText(err, 'Lỗi khi tải trạng thái công cụ'))
+        showToastRef.current?.(errorToast(err, { title: 'Không đọc được trạng thái công cụ' }))
       })
       .finally(() => {
         if (active) setLoading(false)
@@ -132,12 +131,13 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
   // bản hiển thị khớp với binary thật đang được dùng.
   const runUpdate = async (toolId, startMsg, action, fallbackError) => {
     setUpdatingTool(toolId)
-    onShowToast?.(startMsg)
+    onShowToast?.({ type: 'info', title: startMsg })
     try {
       const res = await action()
-      onShowToast?.(res || 'Đã cập nhật xong.')
+      // Backend trả câu tiếng Việt: "Đã cập nhật ..." hoặc "... đã là phiên bản mới nhất"
+      onShowToast?.({ type: 'success', title: res || 'Đã cập nhật xong' })
     } catch (err) {
-      onShowToast?.(errorText(err, fallbackError))
+      onShowToast?.(errorToast(err, { title: fallbackError, message: 'Kiểm tra kết nối mạng rồi thử lại.' }))
     } finally {
       setUpdatingTool(null)
       await fetchStatus()
@@ -145,21 +145,26 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
   }
 
   const handleUpdateYtdlp = () =>
-    runUpdate('ytdlp', 'Đang cập nhật yt-dlp lên phiên bản mới nhất...', updateYtdlp, 'Lỗi khi cập nhật yt-dlp')
+    runUpdate('ytdlp', 'Đang cập nhật yt-dlp lên phiên bản mới nhất...', updateYtdlp, 'Không cập nhật được yt-dlp')
 
   const handleUpdateGalleryDl = () =>
-    runUpdate('gallery_dl', 'Đang cập nhật gallery-dl...', updateGalleryDl, 'Lỗi khi cập nhật gallery-dl')
+    runUpdate('gallery_dl', 'Đang cập nhật gallery-dl...', updateGalleryDl, 'Không cập nhật được gallery-dl')
 
   // Python worker chết 3 lần liên tiếp sẽ chuyển sang FAILED và KHÔNG bao giờ tự
   // hồi phục. Nút này là lối thoát duy nhất ngoài việc thoát hẳn ứng dụng.
   const handleRestartSidecar = async () => {
     setUpdatingTool('python3')
-    onShowToast?.('Đang khởi động lại engine bóc tách (Python worker)...')
+    onShowToast?.({ type: 'info', title: 'Đang khởi động lại bộ phân tích liên kết...' })
     try {
-      const msg = await restartSidecar()
-      onShowToast?.(msg || 'Đã khởi động lại Python worker.')
+      await restartSidecar()
+      onShowToast?.({ type: 'success', title: 'Đã khởi động lại bộ phân tích liên kết' })
     } catch (err) {
-      onShowToast?.(errorText(err, 'Lỗi khởi động lại Python worker'))
+      onShowToast?.(
+        errorToast(err, {
+          title: 'Không khởi động lại được bộ phân tích',
+          message: 'Kiểm tra Python 3 đã được cài đặt, rồi thử lại.',
+        })
+      )
     } finally {
       setUpdatingTool(null)
       await fetchStatus()
@@ -174,7 +179,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
       const dir = await askForDownloadDirectory()
       if (dir) patchSetting('downloadDir', dir)
     } catch (err) {
-      onShowToast?.(errorText(err, 'Lỗi chọn thư mục'))
+      onShowToast?.(errorToast(err, { title: 'Không chọn được thư mục' }))
     }
   }
 
@@ -190,16 +195,19 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
         proxy: blank(settings?.proxy),
         schemaVersion: settings?.schemaVersion ?? 1,
       })
-      onShowToast?.(
-        engineRestarted
-          ? 'Đã lưu cấu hình và khởi động lại engine bóc tách để áp dụng đường dẫn công cụ / proxy mới.'
-          : 'Đã lưu cấu hình.'
-      )
+      onShowToast?.({
+        type: 'success',
+        title: 'Đã lưu cấu hình',
+        message: engineRestarted
+          ? 'Bộ phân tích liên kết đã khởi động lại để dùng đường dẫn công cụ / proxy mới.'
+          : '',
+      })
       // Thanh trên cùng đang hiển thị thư mục tải mặc định — báo để nó đọc lại.
       onSettingsSaved?.()
       await fetchStatus()
     } catch (err) {
-      onShowToast?.(errorText(err, 'Lỗi khi lưu cấu hình'))
+      // Lỗi kiểm tra cấu hình (thư mục không tồn tại, proxy sai...) vốn là câu tiếng Việt rõ ràng
+      onShowToast?.(errorToast(err, { title: 'Chưa lưu được cấu hình' }))
     } finally {
       setSavingSettings(false)
     }
@@ -207,7 +215,11 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
 
   const showInstallHint = (tool) => {
     const hint = INSTALL_HINTS[tool.id]
-    onShowToast?.(hint ? `${tool.name} chưa được cài. Cài bằng: ${hint}` : `${tool.name} chưa được cài đặt`)
+    onShowToast?.({
+      type: 'info',
+      title: `${tool.name} chưa được cài`,
+      message: hint ? `Cài bằng lệnh: ${hint}` : '',
+    })
   }
 
   // Đây là các gói của hệ điều hành, app không tự cập nhật — chỉ nêu đúng những gì
@@ -219,8 +231,8 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
     }
     const ver = tool.data?.version ? `phiên bản ${tool.data.version}` : 'không đọc được phiên bản'
     const path = tool.data?.path || 'không rõ đường dẫn'
-    const how = IS_WINDOWS ? 'cập nhật bằng trình cài đặt / winget' : 'cập nhật qua trình quản lý gói của hệ điều hành'
-    onShowToast?.(`${tool.name}: ${ver} — ${path} (${how})`)
+    const how = IS_WINDOWS ? 'Cập nhật bằng trình cài đặt / winget.' : 'Cập nhật qua trình quản lý gói của hệ điều hành.'
+    onShowToast?.({ type: 'info', title: `${tool.name}: ${ver}`, message: `${path} — ${how}` })
   }
 
   const toolsList = [

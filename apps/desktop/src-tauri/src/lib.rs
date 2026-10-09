@@ -8,12 +8,16 @@ mod sidecar;
 mod system;
 
 use std::sync::Arc;
+use std::time::Duration;
 use commands::AppState;
 use db::Database;
 use log::LevelFilter;
 use sidecar::SidecarManager;
 use settings::SettingsManager;
 use tauri::Manager;
+
+/// Chu kỳ dọn lịch sử quá hạn khi app để chạy nhiều ngày liền.
+const HISTORY_PURGE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -32,6 +36,14 @@ pub fn run() {
             let db_clone = Arc::clone(&db);
             tauri::async_runtime::spawn(async move {
                 db_clone.init().await;
+                // "Tự động xoá lịch sử sau N ngày": dọn ngay khi mở app, rồi định kỳ.
+                // Đọc lại cấu hình mỗi vòng để bật/tắt/đổi số ngày có hiệu lực ngay.
+                loop {
+                    if let Some(days) = SettingsManager::history_retention_days() {
+                        db_clone.purge_history_older_than(days).await;
+                    }
+                    tokio::time::sleep(HISTORY_PURGE_INTERVAL).await;
+                }
             });
 
             // Tìm đường dẫn Python CLI
@@ -73,6 +85,8 @@ pub fn run() {
             // ── History (SQLite) ──────────────────────────────────────────────
             commands::get_download_history,
             commands::clear_download_history,
+            commands::preview_history_purge,
+            commands::set_history_retention,
             // ── System ────────────────────────────────────────────────────
             commands::get_browsers_list,
             // ── Cookie Manager (native file) ──────────────────────────────

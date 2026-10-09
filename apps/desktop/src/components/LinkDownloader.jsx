@@ -28,7 +28,34 @@ import {
   getAlwaysAskDownloadDir,
 } from '../services/api'
 import { DownloadTaskList } from './DownloadProgressCard'
+import LinkListEditor from './LinkListEditor'
 import { useDownloadTasks } from '../hooks/useDownloadTasks'
+import {
+  MAX_BATCH_LINKS,
+  analyzeLinkLines,
+  cleanLinkText,
+  extractLinks,
+  isLikelyLink,
+  linkKey,
+  mergeLinks,
+  newLinksOnly,
+  normalizeLink,
+} from '../utils/links'
+import { describeError, errorText, shortenMiddle } from '../utils/messages'
+import { errorToast, openFolderAction, savedToast } from '../utils/toasts'
+import { insertTextAtCursor } from '../utils/textInput'
+
+// Số tệp lỗi trong câu tổng kết của backend: "Đã tải 3 tệp ..., 2 tệp thất bại."
+const failedCountOf = (message) => Number(/(\d+) tệp thất bại/.exec(message || '')?.[1] || 0)
+
+// Danh sách lỗi từng mục, đặt sau nút "Chi tiết" thay vì nhồi vào câu thông báo
+const formatFailures = (failures) =>
+  failures
+    .map(({ label, err }) => {
+      const info = describeError(err)
+      return `• ${label}: ${info.title}${info.detail ? `\n  ${info.detail}` : ''}`
+    })
+    .join('\n')
 
 /**
  * Loại bỏ ký tự không hợp lệ và nguy hiểm trên Linux, ngăn chặn path traversal.
@@ -122,6 +149,13 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const [mode, setMode] = useState('single') // 'single' | 'batch'
   const [url, setUrl] = useState('')
   const [batchText, setBatchText] = useState('')
+  // Kết quả phân tích của từng link trong khung "Nhiều link" (✓ / ✕ ở lề trái),
+  // khoá theo linkKey để vẫn khớp khi người dùng chèn/xoá dòng khác.
+  const [linkStatus, setLinkStatus] = useState({})
+  const batchInputRef = useRef(null)
+  // Vừa tự chuyển từ "1 Liên kết" sang "Nhiều link": đặt con trỏ cuối danh sách để
+  // lần dán (Ctrl+V) tiếp theo nối tiếp vào cuối thay vì chèn lên đầu.
+  const focusBatchEndRef = useRef(false)
   const [isLoading, setIsLoading] = useState(false)
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, statusText: '' })
 
@@ -247,28 +281,100 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       : trimmedUrl
 
 
-  const parsedBatchLinks = useMemo(() => {
-    return batchText
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l.startsWith('http://') || l.startsWith('https://') || (l.includes('.') && !l.includes(' ')))
-      .slice(0, 10)
-  }, [batchText])
+  // Trước đây danh sách bị cắt ngầm ở 10 link, dòng không hợp lệ / trùng nhau bị
+  // bỏ qua mà người dùng không hề biết. Nay mỗi dòng được phân loại và đánh số.
+  const batchAnalysis = useMemo(() => analyzeLinkLines(batchText, MAX_BATCH_LINKS), [batchText])
+  const parsedBatchLinks = batchAnalysis.links
+  const batchCounts = batchAnalysis.counts
+
+  const notifyLinksAdded = ({ added, skipped, switched = false }) => {
+    const skippedNote = skipped > 0 ? `Bỏ qua ${skipped} link đã có trong danh sách.` : ''
+    if (switched) {
+      onShowToast?.({
+        type: 'info',
+        title: 'Đã chuyển sang chế độ Nhiều link',
+        message: [`Đã thêm ${added} liên kết, mỗi link một dòng.`, skippedNote].filter(Boolean).join(' '),
+      })
+    } else if (added === 0 && skipped > 0) {
+      onShowToast?.({ type: 'info', title: 'Liên kết đã có trong danh sách' })
+    } else if (added > 1 || skipped > 0) {
+      onShowToast?.({ type: 'info', title: `Đã thêm ${added} liên kết`, message: skippedNote })
+    }
+  }
+
+  // Thêm link vào khung "Nhiều link" (tự bỏ link trùng); `fromSingle` = chuyển chế độ
+  const addLinksToBatch = (links, { fromSingle = false } = {}) => {
+    const { text, added, skipped } = mergeLinks(batchText, links)
+    setBatchText(text)
+    if (fromSingle) {
+      setMode('batch')
+      focusBatchEndRef.current = true
+    }
+    notifyLinksAdded({ added, skipped, switched: fromSingle })
+  }
+
+  useEffect(() => {
+    if (mode !== 'batch' || !focusBatchEndRef.current) return
+    focusBatchEndRef.current = false
+    const textarea = batchInputRef.current
+    if (!textarea) return
+    textarea.focus()
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length)
+  }, [mode, batchText])
 
   const handlePaste = async (targetMode) => {
+    let text
     try {
-      const text = await navigator.clipboard.readText()
-      if (text) {
-        if (targetMode === 'single') {
-          setUrl(text.trim())
-          setAsyncResolved(null)
-        } else {
-          setBatchText((prev) => (prev ? `${prev}\n${text.trim()}` : text.trim()))
-        }
-        onShowToast?.('Đã dán liên kết từ bộ nhớ tạm')
-      }
+      text = await navigator.clipboard.readText()
     } catch {
-      onShowToast?.('Vui lòng dùng phím tắt Ctrl+V để dán')
+      onShowToast?.({ type: 'info', title: 'Hãy dùng Ctrl+V để dán', message: 'Ứng dụng chưa được phép đọc bộ nhớ tạm.' })
+      return
+    }
+    if (!text?.trim()) {
+      onShowToast?.({ type: 'info', title: 'Bộ nhớ tạm đang trống' })
+      return
+    }
+    const links = extractLinks(text)
+    if (targetMode === 'single' && links.length <= 1) {
+      setUrl(links[0] || text.trim())
+      setAsyncResolved(null)
+      return
+    }
+    if (links.length === 0) {
+      onShowToast?.({ type: 'warning', title: 'Không tìm thấy liên kết nào trong bộ nhớ tạm' })
+      return
+    }
+    addLinksToBatch(links, { fromSingle: targetMode === 'single' })
+  }
+
+  // Dán vào ô "1 Liên kết": nhiều link → tự chuyển sang khung "Nhiều link";
+  // cả đoạn tin nhắn chứa một link → chỉ giữ lại link.
+  const handleSingleInputPaste = (e) => {
+    const pasted = e.clipboardData?.getData('text/plain') ?? ''
+    const found = extractLinks(pasted)
+    if (found.length === 0) return
+
+    const input = e.currentTarget
+    const replacesAll = input.selectionStart === 0 && input.selectionEnd === input.value.length
+    const current = replacesAll ? '' : url.trim()
+    const existing = isLikelyLink(current) ? [current] : []
+    const { links } = newLinksOnly('', [...existing, ...found])
+
+    if (links.length > 1) {
+      e.preventDefault()
+      addLinksToBatch(links, { fromSingle: true })
+      return
+    }
+    if (existing.length > 0) {
+      // Dán lại đúng link đang có: không nối thành "https://a...https://a..."
+      e.preventDefault()
+      onShowToast?.({ type: 'info', title: 'Liên kết này đã có trong ô nhập' })
+      return
+    }
+    if (pasted.trim() !== found[0] || current) {
+      e.preventDefault()
+      setUrl(found[0])
+      setAsyncResolved(null)
     }
   }
 
@@ -276,7 +382,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     e?.preventDefault()
     const targetUrl = (resolvedUrl || url).trim()
     if (!targetUrl) {
-      onShowToast?.('Vui lòng nhập đường dẫn liên kết!')
+      onShowToast?.({ type: 'warning', title: 'Vui lòng nhập liên kết cần tải' })
       return
     }
 
@@ -297,14 +403,18 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         setSelectedImages({})
         setUserSelectedSubLang('')
         resetTrimmer()
-        onShowToast?.(`Đã trích xuất: ${data.title?.slice(0, 30) || 'Thành công'}...`)
+        onShowToast?.({
+          type: 'success',
+          title: 'Đã phân tích xong',
+          message: shortenMiddle(data.title || 'Chọn định dạng bên dưới để tải về', 72),
+        })
       }
     } catch (err) {
       if (!cancelRef.current) {
-        const errorMsg = typeof err === 'string' ? err : err?.message || 'Lỗi khi trích xuất liên kết'
-        onShowToast?.(errorMsg)
+        onShowToast?.(errorToast(err, { title: 'Không phân tích được liên kết' }))
       }
     } finally {
+      if (cancelRef.current) onShowToast?.({ type: 'info', title: 'Đã huỷ phân tích liên kết' })
       activeExtractTaskRef.current = null
       setIsLoading(false)
       setIsCancelling(false)
@@ -313,49 +423,64 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
   const handleBatchExtract = async (e) => {
     e?.preventDefault()
-    if (parsedBatchLinks.length === 0) {
-      onShowToast?.('Vui lòng nhập ít nhất 1 liên kết!')
+    const links = parsedBatchLinks
+    if (links.length === 0) {
+      onShowToast?.({
+        type: 'warning',
+        title: 'Chưa có liên kết hợp lệ nào',
+        message: 'Dán mỗi liên kết một dòng, ví dụ https://...',
+      })
       return
     }
 
     cancelRef.current = false
     setIsCancelling(false)
     setIsLoading(true)
-    setBatchProgress({ current: 0, total: parsedBatchLinks.length, statusText: 'Đang bắt đầu...' })
+    setLinkStatus({})
+    setBatchProgress({ current: 0, total: links.length, statusText: 'Đang bắt đầu...' })
 
     const results = []
-    const failedLinks = []
+    const failures = []
+    const markLink = (key, status) => setLinkStatus((prev) => ({ ...prev, [key]: status }))
 
-    for (let i = 0; i < parsedBatchLinks.length; i++) {
-      // Kiểm tra nếu đã hủy
-      if (cancelRef.current) {
-        setBatchProgress((prev) => ({ ...prev, statusText: `Đã hủy (${results.length} thành công)` }))
-        break
-      }
-
-      const link = parsedBatchLinks[i]
-      const shortLink = link.length > 50 ? link.slice(0, 47) + '...' : link
+    for (let i = 0; i < links.length && !cancelRef.current; i++) {
+      const link = links[i]
+      const key = linkKey(link)
       setBatchProgress({
         current: i + 1,
-        total: parsedBatchLinks.length,
-        statusText: `[${i + 1}/${parsedBatchLinks.length}] Đang giải mã: ${shortLink}`,
+        total: links.length,
+        statusText: `Đang phân tích link ${i + 1}/${links.length}...`,
       })
+      markLink(key, { state: 'running' })
 
       const linkTaskId = createTaskId()
       activeExtractTaskRef.current = linkTaskId
       try {
-        const item = await extractMedia(link, null, linkTaskId)
-        if (item && !cancelRef.current) results.push(item)
+        // Link thiếu "https://" chỉ được bổ sung khi gửi đi, nội dung khung nhập giữ nguyên
+        const item = await extractMedia(normalizeLink(link), null, linkTaskId)
+        if (cancelRef.current) break
+        // Không có dữ liệu cũng là lỗi — trước đây link đó lặng lẽ biến mất khỏi kết quả
+        if (!item) throw new Error('Không tìm thấy dữ liệu phương tiện từ liên kết này')
+        results.push(item)
+        markLink(key, { state: 'ok', note: item.title || '' })
       } catch (err) {
-        const errMsg = typeof err === 'string' ? err : err?.message || ''
-        const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('55 giây')
-        console.warn(`[Batch] Lỗi ${isTimeout ? 'timeout' : 'bóc tách'} ${link}:`, errMsg)
-        failedLinks.push({ link, reason: isTimeout ? 'Timeout' : errMsg.slice(0, 60) })
+        if (cancelRef.current) break
+        const info = describeError(err, { title: 'Không phân tích được' })
+        console.warn(`[Batch] Không phân tích được ${link}:`, errorText(err))
+        failures.push({ label: `Link #${i + 1} (${link})`, err })
+        markLink(key, { state: 'error', note: info.title })
       } finally {
         activeExtractTaskRef.current = null
       }
     }
 
+    const cancelled = cancelRef.current
+    if (cancelled) {
+      // Link đang chạy dở lúc bấm Huỷ không còn "đang phân tích" nữa
+      setLinkStatus((prev) =>
+        Object.fromEntries(Object.entries(prev).filter(([, status]) => status.state !== 'running'))
+      )
+    }
     setIsLoading(false)
     setIsCancelling(false)
     setBatchProgress({ current: 0, total: 0, statusText: '' })
@@ -364,10 +489,27 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       setBatchMedias(results)
       setSelectedBatchIds({})
       setSingleMedia(null)
-      const failMsg = failedLinks.length > 0 ? ` (${failedLinks.length} lỗi/timeout)` : ''
-      onShowToast?.(`Giải mã thành công ${results.length}/${parsedBatchLinks.length} liên kết!${failMsg}`)
+    }
+
+    if (cancelled) {
+      onShowToast?.({
+        type: 'info',
+        title: 'Đã huỷ phân tích',
+        message: results.length > 0 ? `Giữ lại ${results.length} kết quả đã phân tích xong.` : '',
+      })
+    } else if (failures.length === 0) {
+      onShowToast?.({ type: 'success', title: `Đã phân tích xong ${results.length}/${links.length} liên kết` })
     } else {
-      onShowToast?.('Không thể giải mã các liên kết đã nhập. Vui lòng kiểm tra lại liên kết.')
+      const first = describeError(failures[0].err)
+      onShowToast?.({
+        type: results.length > 0 ? 'warning' : 'error',
+        title:
+          results.length > 0
+            ? `Đã phân tích ${results.length}/${links.length} liên kết`
+            : 'Không phân tích được liên kết nào',
+        message: `${failures.length} link lỗi (đánh dấu ✕ ở lề trái) — ${first.title}.`,
+        detail: formatFailures(failures),
+      })
     }
   }
 
@@ -377,11 +519,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     cancelRef.current = true
     setIsCancelling(true)
     const taskId = activeExtractTaskRef.current
-    if (taskId) {
-      onShowToast?.('Đang dừng tiến trình bóc tách...')
-      await cancelExtraction(taskId)
-    }
-    onShowToast?.('Đã hủy giải mã.')
+    // Kết quả huỷ được báo ở chính lượt phân tích khi nó dừng hẳn (lượt nhiều link
+    // còn báo kèm số link đã xong) — tránh hai thông báo chồng nhau.
+    if (taskId) await cancelExtraction(taskId)
   }
 
   // Chế độ "Hỏi trước khi tải": undefined = dùng thư mục mặc định, null = người dùng bỏ chọn
@@ -390,12 +530,12 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     try {
       const dir = await askForDownloadDirectory()
       if (!dir) {
-        onShowToast?.(cancelMsg)
+        onShowToast?.({ type: 'info', title: cancelMsg })
         return null
       }
       return dir
     } catch (err) {
-      onShowToast?.(typeof err === 'string' ? err : err?.message || 'Lỗi chọn thư mục lưu')
+      onShowToast?.(errorToast(err, { title: 'Không chọn được thư mục lưu' }))
       return null
     }
   }
@@ -414,19 +554,19 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         phase: 'Đã hủy tải xuống',
         message: 'Đã hủy tải xuống và xoá sạch tệp dở dang',
       })
-      onShowToast?.('Đã hủy tải và dọn dẹp tệp dở dang')
+      onShowToast?.({ type: 'info', title: 'Đã huỷ tải', message: 'Các tệp tải dở đã được xoá.' })
     } catch (err) {
       console.error('Cancel download error:', err)
     }
   }
 
-  const errorText = (err, fallback) => (typeof err === 'string' ? err : err?.message || fallback)
   const isCancelError = (taskId, msg) =>
     isCancelled(taskId) || msg.includes('cancelled') || msg.includes('hủy') || msg.includes('huỷ') || msg.includes('abort')
 
-  // Kết thúc một tác vụ bằng lỗi — phân biệt "đã huỷ" với lỗi thật
-  const reportTaskError = (taskId, err, fallback) => {
-    const errMsg = errorText(err, fallback)
+  // Kết thúc một tác vụ bằng lỗi — phân biệt "đã huỷ" với lỗi thật. Thẻ tiến trình
+  // giữ nguyên văn lỗi (xem được qua "Chi tiết"), toast chỉ hiện câu ngắn gọn.
+  const reportTaskError = (taskId, err, failedTitle = 'Tải thất bại') => {
+    const errMsg = errorText(err, failedTitle)
     if (isCancelError(taskId, errMsg)) {
       updateTask(taskId, {
         percent: 0,
@@ -443,10 +583,10 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       speed: '',
       eta: '',
       status: 'error',
-      phase: 'Tải thất bại',
+      phase: failedTitle,
       message: errMsg,
     }))
-    onShowToast?.(errMsg)
+    onShowToast?.(errorToast(errMsg, { title: failedTitle }))
   }
 
   const streamSourceKey = (media, stream) =>
@@ -456,11 +596,11 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const handleDownloadStream = async (stream, media = singleMedia) => {
     if (!media) return
     if (!media.originalUrl && !stream?.url) {
-      onShowToast?.('Liên kết này không có nguồn tải hợp lệ để tải về.')
+      onShowToast?.({ type: 'error', title: 'Không có nguồn tải', message: 'Liên kết này không chứa tệp tải về được.' })
       return
     }
 
-    const targetDir = await pickTargetDir('Đã hủy tải do chưa chọn thư mục lưu')
+    const targetDir = await pickTargetDir('Đã huỷ tải vì chưa chọn thư mục lưu')
     if (targetDir === null) return
 
     const taskId = createTaskId()
@@ -476,7 +616,6 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       const isMute = stream.streamType === 'mute'
       // Cắt đoạn / SponsorBlock / tách chương chỉ áp dụng cho kết quả tải đơn đang mở
       const isSingle = media === singleMedia
-      onShowToast?.(`Đang tải: ${stream.quality || 'tệp'}`)
 
       try {
         // Chỉ nhận sự kiện của đúng tác vụ này
@@ -544,10 +683,10 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
           filePath: res.file_path,
           fileName: res.file_name,
         })
-        onShowToast?.(`Đã tải xong: ${res.file_path || res.file_name || 'tệp'}`)
+        onShowToast?.(savedToast(res.file_path, { name: res.file_name }))
       }
     } catch (err) {
-      reportTaskError(taskId, err, 'Lỗi khi tải stream')
+      reportTaskError(taskId, err, stream?.streamType === 'audio' ? 'Tải âm thanh thất bại' : 'Tải video thất bại')
     } finally {
       // Gỡ listener trong mọi trường hợp — trước đây khi tải lỗi listener bị rò rỉ,
       // tích lũy dần và làm thanh tiến trình nhảy loạn ở các lần tải sau.
@@ -558,9 +697,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
   // Tải thumbnail
   const handleDownloadThumbnail = async () => {
     if (!singleMedia) return
-    const targetDir = await pickTargetDir('Đã hủy lưu thumbnail do chưa chọn thư mục')
+    const targetDir = await pickTargetDir('Đã huỷ lưu ảnh bìa vì chưa chọn thư mục')
     if (targetDir === null) return
-    onShowToast?.('Đang tải ảnh thumbnail...')
+    onShowToast?.({ type: 'info', title: 'Đang tải ảnh bìa...' })
 
     let firstError = null
     if (singleMedia.originalUrl) {
@@ -570,7 +709,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
           title: singleMedia.title,
           destDir: targetDir,
         })
-        onShowToast?.(`Đã lưu thumbnail: ${res?.file_name || 'ảnh bìa'}`)
+        onShowToast?.(savedToast(res?.file_path, { title: 'Đã lưu ảnh bìa', name: res?.file_name }))
         return
       } catch (err) {
         firstError = err
@@ -589,22 +728,26 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
           destDir: targetDir,
           platform: singleMedia.platform,
         })
-        onShowToast?.(`Đã lưu thumbnail: ${res?.file_name || 'ảnh bìa'}`)
+        onShowToast?.(savedToast(res?.file_path, { title: 'Đã lưu ảnh bìa', name: res?.file_name }))
         return
       } catch (err) {
         firstError = firstError || err
       }
     }
-    onShowToast?.(errorText(firstError, 'Không tìm thấy ảnh bìa để tải'))
+    onShowToast?.(
+      firstError
+        ? errorToast(firstError, { title: 'Không tải được ảnh bìa' })
+        : { type: 'error', title: 'Không tìm thấy ảnh bìa để tải' }
+    )
   }
 
   // Tải phụ đề
   const handleDownloadSubtitle = async (sub) => {
     if (!singleMedia) return
-    const targetDir = await pickTargetDir('Đã hủy lưu phụ đề do chưa chọn thư mục')
+    const targetDir = await pickTargetDir('Đã huỷ lưu phụ đề vì chưa chọn thư mục')
     if (targetDir === null) return
     try {
-      onShowToast?.(`Đang tải phụ đề: ${sub.name || sub.lang}...`)
+      onShowToast?.({ type: 'info', title: `Đang tải phụ đề ${sub.name || sub.lang}...` })
       const res = await downloadSubtitle({
         url: singleMedia.originalUrl,
         lang: sub.lang,
@@ -613,16 +756,16 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         destDir: targetDir,
       })
       if (res?.file_name) {
-        onShowToast?.(`Đã lưu phụ đề: ${res.file_name}`)
+        onShowToast?.(savedToast(res.file_path, { title: 'Đã lưu phụ đề', name: res.file_name }))
       }
     } catch (err) {
-      onShowToast?.(errorText(err, 'Lỗi khi tải phụ đề'))
+      onShowToast?.(errorToast(err, { title: 'Không tải được phụ đề' }))
     }
   }
 
   // Tải ảnh album đơn lẻ
   const handleDownloadImage = async (img) => {
-    const targetDir = await pickTargetDir('Đã hủy tải do chưa chọn thư mục lưu')
+    const targetDir = await pickTargetDir('Đã huỷ tải vì chưa chọn thư mục lưu')
     if (targetDir === null) return
 
     const kind = img.type === 'video' ? 'video' : 'ảnh'
@@ -643,7 +786,6 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
       const generated = generateBatchMediaFilenames([img], singleMedia?.originalUrl)
       const filename = generated[0]?.filename || `${sanitizeFilenamePart(img.title || 'photo')}.${img.ext || 'jpg'}`
-      onShowToast?.(`Đang tải ${kind}: ${filename}...`)
       const res = await downloadDirectFile({
         url: img.url,
         filename,
@@ -662,10 +804,12 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
           filePath: res.file_path,
           fileName: res.file_name,
         })
-        onShowToast?.(`Đã lưu: ${res.file_name}`)
+        onShowToast?.(
+          savedToast(res.file_path, { title: img.type === 'video' ? 'Đã tải xong video' : 'Đã lưu ảnh', name: res.file_name })
+        )
       }
     } catch (err) {
-      reportTaskError(taskId, err, 'Lỗi khi tải ảnh')
+      reportTaskError(taskId, err, img.type === 'video' ? 'Tải video thất bại' : 'Tải ảnh thất bại')
     } finally {
       if (typeof unlisten === 'function') unlisten()
     }
@@ -708,7 +852,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
   // Tải trực tiếp các tệp ảnh/video của MỘT bài đăng vào thư mục riêng (hoặc nén ZIP)
   const downloadMediaFiles = async ({ media, items: itemsToDownload, asZip, albumName: customAlbumName, sourceKey }) => {
-    const targetDir = await pickTargetDir('Đã hủy do chưa chọn thư mục lưu')
+    const targetDir = await pickTargetDir('Đã huỷ vì chưa chọn thư mục lưu')
     if (targetDir === null) return
 
     const taskId = createTaskId()
@@ -758,7 +902,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
           filePath: res.file_path,
           message: res.message,
         })
-        onShowToast?.(res.message || 'Nén ZIP thất bại')
+        onShowToast?.({ ...errorToast(res.message, { title: 'Nén ZIP thất bại' }), action: openFolderAction(res.file_path) })
         return
       }
 
@@ -772,9 +916,18 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         fileName: res?.file_name,
         message: res?.message,
       })
-      onShowToast?.(res?.message || (res?.file_path ? `Đã lưu tại: ${res.file_path}` : `Đã tải xong ${itemsToDownload.length} tệp!`))
+      const total = itemsToDownload.length
+      const failed = failedCountOf(res?.message)
+      onShowToast?.(
+        savedToast(res?.file_path, {
+          type: failed > 0 ? 'warning' : 'success',
+          title: failed > 0 ? `Đã tải ${total - failed}/${total} tệp` : asZip ? 'Đã nén ZIP xong' : `Đã tải xong ${total} tệp`,
+          name: res?.file_name,
+          message: failed > 0 ? `${failed} tệp không tải được — liên kết có thể đã hết hạn, hãy phân tích lại.` : undefined,
+        })
+      )
     } catch (err) {
-      reportTaskError(taskId, err, 'Lỗi khi tải album')
+      reportTaskError(taskId, err, asZip ? 'Nén ZIP thất bại' : 'Tải album thất bại')
     } finally {
       if (typeof unlisten === 'function') unlisten()
     }
@@ -783,7 +936,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const handleDownloadAlbum = async (asZip = false) => {
     const itemsToDownload = albumImages.filter((img) => selectedImages[img.id])
     if (itemsToDownload.length === 0) {
-      onShowToast?.('Vui lòng chọn ít nhất 1 ảnh để tải')
+      onShowToast?.({ type: 'warning', title: 'Hãy chọn ít nhất 1 tệp để tải' })
       return
     }
 
@@ -853,16 +1006,18 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     }
 
     const all = {}
-    batchMedias.forEach((media, index) => {
-      all[media.id || index] = true
+    batchMedias.forEach((_, index) => {
+      all[index] = true
     })
     setSelectedBatchIds(all)
   }
 
   const handleDownloadBatchZip = async () => {
-    const itemsToDownload = batchMedias.filter((media, index) => selectedBatchIds[media.id || index])
+    // Chọn theo VỊ TRÍ: hai link khác nhau có thể trả về cùng một media id (vd.
+    // youtu.be/x và youtube.com/watch?v=x) — chọn theo id thì tick một ô là tick cả hai.
+    const itemsToDownload = batchMedias.filter((_, index) => selectedBatchIds[index])
     if (itemsToDownload.length === 0) {
-      onShowToast?.('Vui lòng chọn ít nhất 1 mục để tải ZIP')
+      onShowToast?.({ type: 'warning', title: 'Hãy chọn ít nhất 1 mục để tải ZIP' })
       return
     }
 
@@ -873,7 +1028,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     if (promptResult === null) return
     const albumName = promptResult.trim() || 'Batch_Media'
 
-    const targetDir = await pickTargetDir('Đã hủy do chưa chọn thư mục lưu')
+    const targetDir = await pickTargetDir('Đã huỷ vì chưa chọn thư mục lưu')
     if (targetDir === null) return
 
     const taskId = createTaskId()
@@ -952,16 +1107,15 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             taskId,
             platform: itemsToDownload[0]?.platform,
           })
-          const failedImages = Number(imageRes?.message?.match(/(\d+) tệp thất bại/)?.[1] || 0)
+          const failedImages = failedCountOf(imageRes?.message)
           if (failedImages > 0) {
             failedCount += failedImages
-            failures.push(imageRes.message)
+            failures.push({ label: `${failedImages} ảnh`, err: 'Liên kết ảnh có thể đã hết hạn hoặc bị chặn.' })
           }
         } catch (err) {
-          const msg = errorText(err, 'Không tải được ảnh')
-          if (isCancelError(taskId, msg)) throw err
+          if (isCancelError(taskId, errorText(err, ''))) throw err
           failedCount += imageItems.length
-          failures.push(msg)
+          failures.push({ label: `${imageItems.length} ảnh`, err })
         } finally {
           unlisten()
           unlisten = null
@@ -1010,10 +1164,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             throw new Error(videoRes?.message || `Không tải được video thứ ${index + 1}`)
           }
         } catch (err) {
-          const msg = errorText(err, `Không tải được video thứ ${index + 1}`)
-          if (isCancelError(taskId, msg)) throw err
+          if (isCancelError(taskId, errorText(err, ''))) throw err
           failedCount++
-          failures.push(`${videoTitle || `Video ${index + 1}`}: ${msg}`)
+          failures.push({ label: videoTitle || `Video ${index + 1}`, err })
         } finally {
           if (typeof videoUnlisten === 'function') videoUnlisten()
           completed++
@@ -1048,15 +1201,16 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       } catch (err) {
         // Không mục nào tải được: báo nguyên nhân thật của mục đầu tiên
         if (failures.length > 0 && !isCancelError(taskId, errorText(err, ''))) {
-          throw new Error(`Không tải được mục nào để nén ZIP. ${failures[0]}`, { cause: err })
+          throw new Error(`Không tải được mục nào để nén ZIP. (Chi tiết: ${errorText(failures[0].err)})`, {
+            cause: err,
+          })
         }
         throw err
       }
       if (res?.success === false) throw new Error(res.message || 'Nén ZIP thất bại')
 
-      const summary = failedCount > 0
-        ? `Đã nén ZIP, ${failedCount} tệp lỗi — ${failures[0]}`
-        : res?.message
+      const summary = failedCount > 0 ? `Đã nén ZIP · ${failedCount} tệp lỗi` : res?.message
+      const failureDetail = failedCount > 0 ? formatFailures(failures) : ''
       updateTask(taskId, {
         percent: 100,
         speed: '',
@@ -1066,10 +1220,22 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         filePath: res?.file_path,
         fileName: res?.file_name,
         message: summary,
+        detail: failureDetail,
       })
-      onShowToast?.(summary || `Đã lưu ZIP: ${res?.file_path || res?.file_name || 'Batch_Media.zip'}`)
+      onShowToast?.({
+        ...savedToast(res?.file_path, {
+          type: failedCount > 0 ? 'warning' : 'success',
+          title: failedCount > 0 ? summary : 'Đã nén ZIP xong',
+          name: res?.file_name,
+          message:
+            failedCount > 0
+              ? `${describeError(failures[0].err).title}. Bấm "Chi tiết" để xem từng tệp lỗi.`
+              : undefined,
+        }),
+        detail: failureDetail,
+      })
     } catch (err) {
-      reportTaskError(taskId, err, 'Lỗi khi tải ZIP')
+      reportTaskError(taskId, err, 'Nén ZIP thất bại')
     } finally {
       if (typeof unlisten === 'function') unlisten()
     }
@@ -1097,20 +1263,34 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
   const handleClearBatch = () => {
     setBatchText('')
+    setLinkStatus({})
     setBatchMedias([])
     setSelectedBatchIds({})
     setSelectedImages({})
     clearFinishedTasks()
   }
 
+  // Bỏ dòng không phải link và dòng trùng; các liên kết còn lại giữ nguyên văn.
+  const handleCleanBatch = () => {
+    const cleaned = cleanLinkText(batchText)
+    const textarea = batchInputRef.current
+    if (textarea && !textarea.disabled) {
+      // Chọn toàn bộ rồi "gõ" nội dung mới để Ctrl+Z vẫn khôi phục được
+      textarea.focus()
+      textarea.select()
+      if (insertTextAtCursor(cleaned)) return
+    }
+    setBatchText(cleaned)
+  }
+
   const handleCopy = async (text) => {
     if (!text) return
     try {
       await navigator.clipboard.writeText(text)
-      onShowToast?.('Đã sao chép liên kết vào bộ nhớ tạm')
+      onShowToast?.({ type: 'success', title: 'Đã sao chép liên kết' })
     } catch {
       // Trước đây luôn báo "Đã sao chép" kể cả khi webview từ chối ghi clipboard
-      onShowToast?.('Không sao chép được — hãy bôi đen liên kết và nhấn Ctrl+C')
+      onShowToast?.({ type: 'warning', title: 'Không sao chép được', message: 'Hãy bôi đen liên kết và nhấn Ctrl+C.' })
     }
   }
 
@@ -1132,7 +1312,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             className={`pane-toggle-btn ${mode === 'batch' ? 'active' : ''}`}
             onClick={() => setMode('batch')}
           >
-            Nhiều link ({parsedBatchLinks.length}/10)
+            Nhiều link ({parsedBatchLinks.length}/{MAX_BATCH_LINKS})
           </button>
         </div>
       </div>
@@ -1145,8 +1325,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
               <input
                 type="text"
                 className="pane-input"
-                placeholder="Dán link YouTube, TikTok, Facebook, Instagram, phimhay.com, nhac.vn..."
+                placeholder="Dán link YouTube, TikTok, Facebook, Instagram... (dán nhiều link sẽ tự chuyển sang Nhiều link)"
                 value={url}
+                onPaste={handleSingleInputPaste}
                 onChange={(e) => {
                   const val = e.target.value
                   setUrl(val)
@@ -1234,28 +1415,57 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         ) : (
           <form onSubmit={handleBatchExtract} className="pane-form">
             <div className="batch-textarea-wrap">
-              <textarea
-                className="pane-textarea"
-                placeholder="Dán danh sách liên kết, mỗi link một dòng (tối đa 10 link)..."
+              <LinkListEditor
                 value={batchText}
-                onChange={(e) => {
-                  const val = e.target.value
+                onChange={(val) => {
                   setBatchText(val)
                   if (!val.trim()) {
+                    setLinkStatus({})
                     setBatchMedias([])
                     setSelectedImages({})
                     clearFinishedTasks()
                   }
                 }}
+                analysis={batchAnalysis}
+                statusByKey={linkStatus}
+                maxLinks={MAX_BATCH_LINKS}
                 disabled={isLoading}
+                inputRef={batchInputRef}
+                placeholder={`Dán một hoặc nhiều liên kết, mỗi link một dòng (tối đa ${MAX_BATCH_LINKS}).\nDán cả đoạn tin nhắn cũng được — link sẽ tự được tách và đánh số.`}
+                onLinksPasted={notifyLinksAdded}
+                onSubmit={() => {
+                  if (!isLoading) handleBatchExtract()
+                }}
               />
               <div className="textarea-footer-bar">
-                <span>{parsedBatchLinks.length}/10 link hợp lệ</span>
+                <span className="textarea-footer-stats">
+                  <span className="footer-stat-ok">
+                    {parsedBatchLinks.length}/{MAX_BATCH_LINKS} link
+                  </span>
+                  {batchCounts.duplicate > 0 && <span>{batchCounts.duplicate} trùng</span>}
+                  {batchCounts.invalid > 0 && (
+                    <span className="footer-stat-bad">{batchCounts.invalid} không hợp lệ</span>
+                  )}
+                  {batchCounts.overflow > 0 && (
+                    <span className="footer-stat-warn">{batchCounts.overflow} vượt giới hạn</span>
+                  )}
+                </span>
                 <div className="textarea-footer-actions">
+                  {batchCounts.duplicate + batchCounts.invalid > 0 && !isLoading && (
+                    <button
+                      type="button"
+                      className="minimal-small-btn"
+                      onClick={handleCleanBatch}
+                      title="Bỏ các dòng trùng và dòng không phải liên kết (Ctrl+Z để hoàn tác)"
+                    >
+                      Dọn dẹp
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="minimal-small-btn"
                     onClick={() => handlePaste('batch')}
+                    disabled={isLoading}
                   >
                     Dán thêm
                   </button>
@@ -1264,6 +1474,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                       type="button"
                       className="minimal-small-btn"
                       onClick={handleClearBatch}
+                      disabled={isLoading}
                     >
                       Xóa
                     </button>
@@ -1345,11 +1556,12 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                 type="submit"
                 className="pane-submit-btn"
                 disabled={isLoading || parsedBatchLinks.length === 0}
+                title="Phân tích tất cả liên kết (Ctrl+Enter)"
               >
                 {isLoading ? (
                   <>
                     <span className="minimal-spinner" />
-                    <span>{isCancelling ? 'Đang hủy...' : `Đang tải hàng loạt...`}</span>
+                    <span>{isCancelling ? 'Đang hủy...' : 'Đang phân tích...'}</span>
                   </>
                 ) : (
                   <>
@@ -1377,7 +1589,12 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       <div className="pane-results-container">
         {/* Tiến trình của mọi lượt tải trong khung này — nằm ngoài khối kết quả để
             đóng kết quả không làm mất nút Huỷ của lượt tải đang chạy */}
-        <DownloadTaskList tasks={downloadTasks} onCancel={handleCancelDownload} onDismiss={dismissTask} />
+        <DownloadTaskList
+          tasks={downloadTasks}
+          onCancel={handleCancelDownload}
+          onDismiss={dismissTask}
+          onShowToast={onShowToast}
+        />
 
         {/* Kết quả tải đơn */}
         {singleMedia && (
@@ -1906,20 +2123,14 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             <div className="batch-items-stack">
               {batchMedias.map((m, idx) => (
                 <div
-                  key={m.id || idx}
-                  className={`batch-row-item ${selectedBatchIds[m.id || idx] ? 'is-selected' : ''}`}
-                  onClick={() => {
-                    const itemId = m.id || idx
-                    setSelectedBatchIds((prev) => ({ ...prev, [itemId]: !prev[itemId] }))
-                  }}
+                  key={idx}
+                  className={`batch-row-item ${selectedBatchIds[idx] ? 'is-selected' : ''}`}
+                  onClick={() => setSelectedBatchIds((prev) => ({ ...prev, [idx]: !prev[idx] }))}
                 >
                   <input
                     type="checkbox"
-                    checked={Boolean(selectedBatchIds[m.id || idx])}
-                    onChange={() => {
-                      const itemId = m.id || idx
-                      setSelectedBatchIds((prev) => ({ ...prev, [itemId]: !prev[itemId] }))
-                    }}
+                    checked={Boolean(selectedBatchIds[idx])}
+                    onChange={() => setSelectedBatchIds((prev) => ({ ...prev, [idx]: !prev[idx] }))}
                     onClick={(e) => e.stopPropagation()}
                     aria-label={`Chọn ${m.title || 'liên kết'}`}
                   />

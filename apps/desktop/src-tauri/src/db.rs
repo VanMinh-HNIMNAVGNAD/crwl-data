@@ -480,6 +480,85 @@ impl Database {
         }
     }
 
+    /// Tham số cho `julianday('now', ?)`: "-30 days" = mốc 30 ngày trước (UTC).
+    ///
+    /// So sánh qua julianday() vì cột thời gian có HAI định dạng: `downloaded_at`
+    /// do Rust ghi dạng RFC 3339 ("2026-10-09T08:58:55.1+00:00") còn các bảng
+    /// nhật ký dùng CURRENT_TIMESTAMP ("2026-10-09 08:58:55") — so sánh chuỗi trực
+    /// tiếp sẽ sai trong cùng một ngày.
+    fn retention_cutoff(days: u32) -> String {
+        format!("-{days} days")
+    }
+
+    /// Số mục lịch sử tải cũ hơn `days` ngày — để hỏi xác nhận trước khi bật tự xoá.
+    pub async fn count_history_older_than(&self, days: u32) -> Option<i64> {
+        let pool = self.get_pool().await?;
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM download_history WHERE julianday(downloaded_at) < julianday('now', ?);",
+        )
+        .bind(Self::retention_cutoff(days))
+        .fetch_one(&pool)
+        .await
+        {
+            Ok(count) => Some(count),
+            Err(e) => {
+                error!("Lỗi khi đếm lịch sử cũ: {e}");
+                None
+            }
+        }
+    }
+
+    /// Xoá lịch sử tải cũ hơn `days` ngày, kèm nhật ký bóc tách (các URL đã dán)
+    /// cùng thời hạn. Trả về số mục lịch sử tải đã xoá; None nếu chưa có DB / lỗi.
+    pub async fn purge_history_older_than(&self, days: u32) -> Option<u64> {
+        let pool = self.get_pool().await?;
+        let cutoff = Self::retention_cutoff(days);
+        let old_jobs = "SELECT id FROM jobs WHERE julianday(started_at) < julianday('now', ?)";
+
+        let result: Result<u64, sqlx::Error> = async {
+            let mut tx = pool.begin().await?;
+            let removed = sqlx::query(
+                "DELETE FROM download_history WHERE julianday(downloaded_at) < julianday('now', ?);",
+            )
+            .bind(&cutoff)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            sqlx::query(&format!(
+                "DELETE FROM extracted_medias WHERE job_id IN ({old_jobs}) \
+                 OR (job_id IS NULL AND julianday(created_at) < julianday('now', ?));"
+            ))
+            .bind(&cutoff)
+            .bind(&cutoff)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(&format!("DELETE FROM job_items WHERE job_id IN ({old_jobs});"))
+                .bind(&cutoff)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM jobs WHERE julianday(started_at) < julianday('now', ?);")
+                .bind(&cutoff)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(removed)
+        }
+        .await;
+
+        match result {
+            Ok(removed) => {
+                if removed > 0 {
+                    info!("🧹 Đã tự động xoá {removed} mục lịch sử tải cũ hơn {days} ngày");
+                }
+                Some(removed)
+            }
+            Err(e) => {
+                error!("Lỗi khi xoá lịch sử cũ hơn {days} ngày: {e}");
+                None
+            }
+        }
+    }
+
     /// Ghi nhận phiên trích xuất media đơn vào jobs và extracted_medias
     pub async fn record_single_extraction(
         &self,
@@ -836,5 +915,78 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_entries_older_than_the_retention_window() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().filename(":memory:"))
+            .await
+            .unwrap();
+        Database::init_schema(&pool).await.unwrap();
+        let db = Database::from_pool(Some(pool.clone()));
+        let dev = "retention_device";
+
+        // Mục mới ghi bằng chính hàm của app (RFC 3339 + múi giờ)
+        db.record_download_history(dev, "Mới", "moi.mp4", "youtube", None, None, "success", None, None)
+            .await
+            .unwrap();
+        // Mục cũ ở CẢ HAI định dạng thời gian đang tồn tại trong DB, cùng một mục 2 ngày trước
+        let two_days_ago = chrono::Utc::now() - chrono::Duration::days(2);
+        for (name, at) in [
+            ("cu_sql.mp4", "2020-01-01 10:00:00".to_string()),
+            ("cu_rfc.mp4", "2020-01-01T10:00:00.123456789+00:00".to_string()),
+            ("hai_ngay.mp4", two_days_ago.to_rfc3339()),
+        ] {
+            sqlx::query("INSERT INTO download_history (file_name, status, device_id, downloaded_at) VALUES (?, 'success', ?, ?);")
+                .bind(name)
+                .bind(dev)
+                .bind(at)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // Nhật ký bóc tách: một phiên cũ (kèm media + job_item) và một phiên mới
+        sqlx::query("INSERT INTO jobs (id, title, device_id, started_at) VALUES ('old_job', 'cũ', ?, '2020-01-01 00:00:00');")
+            .bind(dev)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO job_items (id, job_id, source_url) VALUES ('old_item', 'old_job', 'https://a');")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO extracted_medias (id, job_id, original_url) VALUES ('old_media', 'old_job', 'https://a');")
+            .execute(&pool)
+            .await
+            .unwrap();
+        db.record_single_extraction(dev, "https://youtu.be/x", &serde_json::json!({"title": "mới"}), None)
+            .await
+            .unwrap();
+
+        let count = |sql: &'static str| {
+            let pool = pool.clone();
+            async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&pool).await.unwrap() }
+        };
+
+        assert_eq!(db.count_history_older_than(30).await, Some(2));
+        assert_eq!(db.purge_history_older_than(30).await, Some(2));
+        assert_eq!(count("SELECT COUNT(*) FROM download_history;").await, 2);
+        assert_eq!(count("SELECT COUNT(*) FROM jobs;").await, 1);
+        assert_eq!(count("SELECT COUNT(*) FROM job_items;").await, 0);
+        assert_eq!(count("SELECT COUNT(*) FROM extracted_medias;").await, 1);
+
+        // Chạy lại không xoá thêm gì; rút xuống 1 ngày thì mục 2 ngày trước bị xoá
+        assert_eq!(db.purge_history_older_than(30).await, Some(0));
+        assert_eq!(db.purge_history_older_than(1).await, Some(1));
+        let left: Vec<String> = sqlx::query_scalar("SELECT file_name FROM download_history;")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec!["moi.mp4".to_string()]);
+
+        // Chưa có kết nối DB: báo None thay vì giả vờ đã xoá
+        assert_eq!(Database::new().purge_history_older_than(30).await, None);
     }
 }

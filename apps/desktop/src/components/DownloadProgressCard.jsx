@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { IconDownload, IconCheck, IconClose } from './Icons'
 import { openDownloadFolder } from '../services/api'
 import { formatSeconds } from '../hooks/useDownloadTasks'
+import { describeError, fileNameOf, shortenMiddle } from '../utils/messages'
+import { errorToast } from '../utils/toasts'
 
 export function Timer({ startTime, isFinished }) {
   const [elapsed, setElapsed] = useState(0)
@@ -43,7 +45,10 @@ export default function DownloadProgressCard({
   onDismiss,
   onCancel,
   customStatusText,
+  onShowToast,
 }) {
+  const [showDetail, setShowDetail] = useState(false)
+  const [copied, setCopied] = useState(false)
   const status = progress?.status
   const isDone = status === 'completed'
   const isError = status === 'error'
@@ -65,17 +70,33 @@ export default function DownloadProgressCard({
       (isProcessing && percent === 0)
     )
 
+  // Lỗi: chỉ hiện câu ngắn + gợi ý; nguyên văn log (stderr yt-dlp...) nằm sau
+  // nút "Chi tiết". Trước đây cả đoạn log tiếng Anh được in thẳng lên thẻ.
+  const errorInfo = isError
+    ? describeError(progress?.message, { title: progress?.phase || 'Tải thất bại', message: '' })
+    : null
+  const detailText = (isError ? errorInfo.detail : '') || progress?.detail || ''
+
   const statusText =
     customStatusText ||
     (isDone
-      ? `✓ ${progress?.message || 'Tải hoàn tất thành công!'}`
+      ? `✓ ${progress?.message || 'Tải hoàn tất'}`
       : isCancelled
       ? (progress?.message || '✕ Đã hủy tải xuống (toàn bộ tệp dở dang đã được xoá sạch)')
       : isError
-      ? `✕ ${progress?.message || 'Có lỗi xảy ra trong quá trình tải'}`
+      ? `✕ ${errorInfo.title}`
       : // Ưu tiên mô tả thật do tiến trình tải gửi lên thay vì đoán theo phần trăm
         progress?.phase ||
         (isPreparing ? 'Đang lấy thông tin tệp...' : 'Đang nhận dữ liệu từ máy chủ...'))
+
+  const handleCopyDetail = async () => {
+    try {
+      await navigator.clipboard.writeText(detailText)
+      setCopied(true)
+    } catch {
+      setCopied(false)
+    }
+  }
 
   return (
     <div className={`download-progress-card ${isDone ? 'is-completed' : ''} ${isError ? 'is-error' : ''} ${isCancelled ? 'is-cancelled' : ''}`}>
@@ -96,11 +117,24 @@ export default function DownloadProgressCard({
             <h4 className="progress-task-name" title={title || 'Tệp tải xuống'}>
               {title ? (title.length > 50 ? `${title.slice(0, 48)}...` : title) : 'Đang xử lý tải xuống...'}
             </h4>
-            <span className="progress-sub-status">{statusText}</span>
+            <span className={`progress-sub-status ${isError ? 'is-error-text' : ''}`}>{statusText}</span>
+            {isError && errorInfo.message && <span className="progress-error-hint">{errorInfo.message}</span>}
             {isFinished && savedPath && !isCancelled && (
               <span className="progress-saved-path" title={savedPath}>
-                {isError ? 'Tệp đã tải nằm tại: ' : 'Đã lưu tại: '}
-                {savedPath}
+                {isError ? 'Tệp đã tải nằm trong: ' : 'Đã lưu: '}
+                {shortenMiddle(fileNameOf(savedPath), 60)}
+              </span>
+            )}
+            {isFinished && detailText && (
+              <span className="progress-detail-toggles">
+                <button type="button" className="progress-detail-btn" onClick={() => setShowDetail((v) => !v)}>
+                  {showDetail ? 'Ẩn chi tiết' : 'Chi tiết'}
+                </button>
+                {showDetail && (
+                  <button type="button" className="progress-detail-btn" onClick={handleCopyDetail}>
+                    {copied ? 'Đã sao chép' : 'Sao chép'}
+                  </button>
+                )}
               </span>
             )}
           </div>
@@ -125,6 +159,7 @@ export default function DownloadProgressCard({
               onClick={() => {
                 openDownloadFolder(savedPath).catch((err) => {
                   console.warn('Không mở được thư mục:', err)
+                  onShowToast?.(errorToast(err, { title: 'Không mở được thư mục' }))
                 })
               }}
               title={`Mở thư mục chứa tệp:\n${savedPath}`}
@@ -144,6 +179,8 @@ export default function DownloadProgressCard({
           )}
         </div>
       </div>
+
+      {isFinished && showDetail && detailText && <pre className="progress-detail-box">{detailText}</pre>}
 
       {/* Progress Track */}
       <div className="progress-bar-container">
@@ -188,7 +225,7 @@ export default function DownloadProgressCard({
 }
 
 /** Một thẻ tiến trình cho mỗi tác vụ tải (xem hooks/useDownloadTasks). */
-export function DownloadTaskList({ tasks, onCancel, onDismiss }) {
+export function DownloadTaskList({ tasks, onCancel, onDismiss, onShowToast }) {
   if (!tasks?.length) return null
   return (
     <div className="download-task-list">
@@ -200,6 +237,7 @@ export function DownloadTaskList({ tasks, onCancel, onDismiss }) {
           startTime={task.startedAt}
           onCancel={() => onCancel?.(task.id)}
           onDismiss={() => onDismiss?.(task.id)}
+          onShowToast={onShowToast}
         />
       ))}
     </div>

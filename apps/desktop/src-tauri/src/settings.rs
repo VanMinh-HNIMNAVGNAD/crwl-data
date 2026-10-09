@@ -74,6 +74,19 @@ pub(crate) fn normalize_proxy(raw: &str) -> Result<String, String> {
     Ok(with_scheme)
 }
 
+/// Giới hạn hợp lệ của "tự động xoá lịch sử sau N ngày" (tối đa ~10 năm).
+pub const MAX_HISTORY_RETENTION_DAYS: u32 = 3650;
+
+pub(crate) fn validate_retention_days(days: u32) -> Result<u32, String> {
+    if (1..=MAX_HISTORY_RETENTION_DAYS).contains(&days) {
+        Ok(days)
+    } else {
+        Err(format!(
+            "Số ngày giữ lịch sử phải từ 1 đến {MAX_HISTORY_RETENTION_DAYS} (đang nhập: {days})"
+        ))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +108,10 @@ pub struct AppSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
 
+    /// Tự động xoá lịch sử tải cũ hơn số ngày này. None = giữ mãi.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_retention_days: Option<u32>,
+
     /// Phiên bản settings schema (để migrate sau này)
     #[serde(default = "default_version")]
     pub schema_version: u32,
@@ -111,6 +128,7 @@ impl Default for AppSettings {
             ytdlp_path: None,
             gallery_dl_path: None,
             proxy: None,
+            history_retention_days: None,
             schema_version: 1,
         }
     }
@@ -159,6 +177,22 @@ impl SettingsManager {
         }
     }
 
+    /// Số ngày giữ lịch sử tải (None = không tự xoá). Giá trị sai trong tệp cấu
+    /// sửa tay bị bỏ qua thay vì xoá nhầm cả lịch sử.
+    pub fn history_retention_days() -> Option<u32> {
+        Self::load()
+            .history_retention_days
+            .and_then(|days| validate_retention_days(days).ok())
+    }
+
+    /// Bật / tắt tự động xoá lịch sử mà KHÔNG đụng tới các mục cấu hình khác.
+    pub fn set_history_retention_days(days: Option<u32>) -> Result<(), String> {
+        let days = days.map(validate_retention_days).transpose()?;
+        let mut settings = Self::load();
+        settings.history_retention_days = days;
+        Self::save(&settings)
+    }
+
     /// Proxy người dùng cấu hình (đã bỏ khoảng trắng), None nếu để trống.
     pub fn proxy() -> Option<String> {
         Self::load()
@@ -196,12 +230,17 @@ impl SettingsManager {
             .map(|raw| validate_executable("gallery-dl", &raw))
             .transpose()?;
         let proxy = clean(settings.proxy).map(|raw| normalize_proxy(&raw)).transpose()?;
+        let history_retention_days = settings
+            .history_retention_days
+            .map(validate_retention_days)
+            .transpose()?;
 
         Ok(AppSettings {
             download_dir,
             ytdlp_path,
             gallery_dl_path,
             proxy,
+            history_retention_days,
             schema_version: settings.schema_version,
         })
     }
@@ -325,6 +364,35 @@ mod tests {
         .unwrap();
         assert_eq!(ok.download_dir.as_deref(), Some(tmp.to_string_lossy().as_ref()));
         assert_eq!(ok.proxy, None);
+    }
+
+    #[test]
+    fn history_retention_is_validated_and_round_trips() {
+        assert_eq!(validate_retention_days(30), Ok(30));
+        assert!(validate_retention_days(0).is_err());
+        assert!(validate_retention_days(MAX_HISTORY_RETENTION_DAYS + 1).is_err());
+
+        let ok = SettingsManager::validate(AppSettings {
+            history_retention_days: Some(7),
+            ..AppSettings::default()
+        })
+        .unwrap();
+        assert_eq!(ok.history_retention_days, Some(7));
+        assert!(SettingsManager::validate(AppSettings {
+            history_retention_days: Some(0),
+            ..AppSettings::default()
+        })
+        .is_err());
+
+        // Tệp settings.json cũ (chưa có trường này) vẫn đọc được, mặc định là giữ mãi
+        let old: AppSettings = serde_json::from_str(r#"{"downloadDir":"/tmp","schemaVersion":1}"#).unwrap();
+        assert_eq!(old.history_retention_days, None);
+        let json = serde_json::to_string(&AppSettings {
+            history_retention_days: Some(30),
+            ..AppSettings::default()
+        })
+        .unwrap();
+        assert!(json.contains("\"historyRetentionDays\":30"), "{json}");
     }
 
     #[test]

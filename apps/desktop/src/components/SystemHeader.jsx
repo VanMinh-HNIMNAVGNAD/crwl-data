@@ -10,6 +10,7 @@ import {
   setAlwaysAskDownloadDir,
 } from '../services/api'
 import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings } from './Icons'
+import { describeError } from '../utils/messages'
 const mediaLogo = '/favicon.svg'
 
 export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools, cookieRefreshKey, settingsVersion }) {
@@ -44,7 +45,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
       if (cs) setCookieCount(cs.platforms?.filter((p) => p.has_cookies).length || 0)
     } catch (err) {
       console.warn('Lỗi khi làm mới trình duyệt:', err)
-      showToast(typeof err === 'string' ? err : err?.message || 'Lỗi khi làm mới trình duyệt')
+      showToast(describeError(err, { title: 'Không làm mới được danh sách trình duyệt' }).title)
     }
   }
 
@@ -69,7 +70,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
       })
       .catch((err) => {
         console.warn('Lỗi khi tải thông tin hệ thống:', err)
-        if (active) showToast(typeof err === 'string' ? err : err?.message || 'Lỗi khi tải thông tin hệ thống')
+        if (active) showToast(describeError(err, { title: 'Không đọc được thông tin hệ thống' }).title)
       })
     return () => {
       active = false
@@ -105,7 +106,7 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
       }
     } catch (err) {
       console.warn('Lỗi khi chọn thư mục:', err)
-      showToast(typeof err === 'string' ? err : err?.message || 'Lỗi khi chọn thư mục')
+      showToast(describeError(err, { title: 'Không chọn được thư mục' }).title)
     }
   }
 
