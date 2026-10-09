@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![App Version](https://img.shields.io/badge/version-2.8.1-blue.svg?style=for-the-badge)
+![App Version](https://img.shields.io/badge/version-2.9.2-blue.svg?style=for-the-badge)
 ![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8D8?style=for-the-badge&logo=tauri&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-2021%20Edition-black?style=for-the-badge&logo=rust&logoColor=white)
 ![React](https://img.shields.io/badge/React-19.x-61DAFB?style=for-the-badge&logo=react&logoColor=black)

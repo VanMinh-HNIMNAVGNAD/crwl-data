@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "social-media-crawler",
-  "version": "2.8.1",
+  "version": "2.9.2",
   "identifier": "com.crwl.socialmedia",
   "build": {
     "frontendDist": "../dist",
