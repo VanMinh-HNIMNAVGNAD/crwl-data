@@ -5,11 +5,12 @@ across yt-dlp, gallery-dl, tiktok embed resolver, movie extractor, and Playwrigh
 Ported from MediaDispatcherService into standalone Python.
 """
 
+import re
 from typing import Optional, Dict, Any, List
 from .models import MediaMetadata, ProfileCrawlResult, ResolveUrlResult, StreamFormat
 from .resolver.url_resolver import UrlResolver
 from .extractors.base import BaseExtractor
-from .extractors.ytdlp import YtDlpExtractor
+from .extractors.ytdlp import PlaylistUrlError, YtDlpExtractor
 from .extractors.gallery import GalleryDlExtractor
 from .extractors.tiktok import TikTokExtractor
 from .extractors.movie import MovieExtractor
@@ -176,7 +177,17 @@ class MediaDispatcher(BaseExtractor):
         ))
 
     @staticmethod
-    def _make_login_error(platform_url: str) -> RuntimeError:
+    def _short_reason(err: Optional[Exception]) -> str:
+        """Câu lỗi gốc của yt-dlp/gallery-dl, bỏ tiền tố "ERROR: [youtube] <id>:" và phần hướng dẫn dài."""
+        if err is None:
+            return ""
+        text = str(err).strip()
+        m = re.search(r"ERROR:\s*(?:\[[^\]]+\]\s*)?(?:[\w-]+:\s*)?(.*)", text)
+        reason = (m.group(1) if m else text).split(". ")[0].strip()
+        return reason[:160]
+
+    @classmethod
+    def _make_login_error(cls, platform_url: str, cause: Optional[Exception] = None) -> RuntimeError:
         """Tạo thông báo lỗi đăng nhập thân thiện"""
         if "facebook.com" in platform_url or "fb.watch" in platform_url:
             name = "Facebook"
@@ -188,11 +199,26 @@ class MediaDispatcher(BaseExtractor):
             name = "TikTok"
         elif "x.com" in platform_url or "twitter.com" in platform_url:
             name = "X (Twitter)"
+        elif "youtube.com" in platform_url or "youtu.be" in platform_url:
+            name = "YouTube"
         else:
             name = "nền tảng này"
+        detail = cls._short_reason(cause)
         return RuntimeError(
             f"Nội dung {name} yêu cầu đăng nhập. "
             f"Vui lòng vào Cookie Manager (🍪), chọn tab {name} và dán cookie từ trình duyệt."
+            + (f" (Chi tiết: {detail})" if detail else "")
+        )
+
+    @staticmethod
+    def _has_real_media_stream(res: Optional[MediaMetadata]) -> bool:
+        """Kết quả web_scraper có trỏ tới TỆP video/luồng phát thật không.
+
+        Trên trang của nền tảng video, web_scraper chỉ thấy ảnh bìa og:image và
+        og:video là trang nhúng (youtube.com/embed/...) — không phải media tải được.
+        """
+        return bool(res and res.streams) and any(
+            WebScraperExtractor.is_video_url(s.url or "") for s in res.streams
         )
 
     def extract(self, url: str, browser: Optional[str] = None) -> MediaMetadata:
@@ -259,6 +285,8 @@ class MediaDispatcher(BaseExtractor):
                 b_override = "none" if ("tiktok.com" in target_url and (not browser or browser == "auto")) else browser
                 res = self.ytdlp.extract_metadata(target_url, browser=b_override)
                 return self._enhance_metadata(res, target_url)
+            except PlaylistUrlError:
+                raise
             except Exception as yt_err:
                 # Nếu TikTok bị chặn, thử lại không cookies
                 if "tiktok.com" in target_url and browser and browser != "none":
@@ -266,6 +294,8 @@ class MediaDispatcher(BaseExtractor):
                         self.log("TikTok video thử lại không dùng cookies ('none')...")
                         res = self.ytdlp.extract_metadata(target_url, browser="none")
                         return self._enhance_metadata(res, target_url)
+                    except PlaylistUrlError:
+                        raise
                     except Exception:
                         pass
                 # Fallback sang gallery-dl
@@ -277,11 +307,18 @@ class MediaDispatcher(BaseExtractor):
                 except Exception as gal_err:
                     # Nếu cả 2 đều lỗi auth -> trả thông báo đăng nhập rõ ràng
                     if is_fb and (self._is_auth_error(yt_err) or self._is_auth_error(gal_err)):
-                        raise self._make_login_error(target_url)
+                        raise self._make_login_error(target_url, yt_err)
+                    # Video giới hạn tuổi / riêng tư / YouTube đòi "xác nhận không phải bot":
+                    # trang vẫn có ảnh bìa nên web_scraper từng trả "thành công" một album
+                    # chỉ gồm ảnh bìa, che mất lỗi thật là cần cookie đăng nhập.
+                    if self._is_auth_error(yt_err):
+                        raise self._make_login_error(target_url, yt_err)
                     self.warn(f"gallery-dl fallback cũng thất bại ({gal_err}), web_scraper fallback...")
                     try:
                         res = self.web_scraper.extract(target_url)
-                        if res and (res.streams or res.images):
+                        # Chỉ nhận khi tìm được TỆP video thật. Ảnh bìa hay trang nhúng
+                        # của chính nền tảng không phải nội dung tải được.
+                        if self._has_real_media_stream(res):
                             return self._enhance_metadata(res, target_url)
                     except Exception:
                         pass
@@ -315,14 +352,18 @@ class MediaDispatcher(BaseExtractor):
                     try:
                         res = self.ytdlp.extract_metadata(target_url, browser=browser)
                         return self._enhance_metadata(res, target_url)
+                    except PlaylistUrlError:
+                        raise
                     except Exception as yt_err2:
                         if self._is_auth_error(yt_err2):
-                            raise self._make_login_error(target_url)
+                            raise self._make_login_error(target_url, gal_err)
                         raise yt_err2
                 self.warn(f"gallery-dl thất bại ({gal_err}), yt-dlp fallback...")
                 try:
                     res = self.ytdlp.extract_metadata(target_url, browser=browser)
                     return self._enhance_metadata(res, target_url)
+                except PlaylistUrlError:
+                    raise
                 except Exception as yt_err:
                     self.warn(f"yt-dlp thất bại ({yt_err}), web_scraper fallback...")
                     try:
@@ -338,6 +379,11 @@ class MediaDispatcher(BaseExtractor):
                 self.log(f"URL không xác định -> yt-dlp first: {target_url}")
                 res = self.ytdlp.extract_metadata(target_url, browser=browser)
                 return self._enhance_metadata(res, target_url)
+            except PlaylistUrlError:
+                # Trang nhiều video / playlist của site yt-dlp hỗ trợ: báo đúng thay vì để
+                # web_scraper/Playwright vớt đại một ảnh hay một luồng trên trang.
+                # (Trang phim đã qua bước 4 — ở đó vẫn để sniffer thử tìm luồng thật.)
+                raise
             except Exception as e:
                 yt_err = e
         self.warn(f"yt-dlp thất bại ({yt_err}), gallery-dl fallback...")

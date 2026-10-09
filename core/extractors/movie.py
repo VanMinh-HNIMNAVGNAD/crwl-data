@@ -142,9 +142,7 @@ class MovieExtractor(BaseExtractor):
                 self.log(f"Tìm thấy luồng stream (HTML tĩnh): {stream_url}")
                 try:
                     meta = self.ytdlp.extract_metadata(stream_url, browser=browser, timeout=timeout)
-                    meta.platform = "movie"
-                    meta.original_url = target_url
-                    return meta
+                    return self._stream_result(meta, stream_url, target_url)
                 except Exception as e:
                     self.warn(f"yt-dlp với stream URL thất bại ({e})")
 
@@ -155,15 +153,28 @@ class MovieExtractor(BaseExtractor):
                     sub = self._scrape_stream_url(embed_url)
                     if sub and sub[0]:
                         meta = self.ytdlp.extract_metadata(sub[0], browser=browser, timeout=timeout)
-                        meta.platform = "movie"
-                        meta.original_url = target_url
-                        return meta
+                        # Player trong iframe tải luồng với Referer là chính trang nhúng
+                        return self._stream_result(meta, sub[0], embed_url)
                 except Exception:
                     continue
 
         # Fallback sang yt-dlp trực tiếp
         meta = self.ytdlp.extract_metadata(target_url, browser=browser, timeout=timeout)
         meta.platform = "movie"
+        return meta
+
+    @staticmethod
+    def _stream_result(meta: MediaMetadata, stream_url: str, page_url: str) -> MediaMetadata:
+        """Kết quả cho luồng phát tìm được BÊN TRONG trang.
+
+        Trước đây `original_url` bị đặt lại thành URL trang phim. UI tải theo
+        `original_url`, nên yt-dlp chạy lại trên đúng trang mà nó không đọc được (lý
+        do phải dò HTML): mọi định dạng hiển thị ra đều tải thất bại. Nay trỏ thẳng
+        vào luồng đã bóc tách được, còn trang gốc được giữ làm Referer.
+        """
+        meta.platform = "movie"
+        meta.original_url = stream_url
+        meta.referer = page_url
         return meta
 
     def _scrape_stream_url(self, page_url: str, timeout: int = 15) -> Optional[Tuple[Optional[str], List[str]]]:

@@ -52,6 +52,38 @@ fn write_private_cookie_file(path: &std::path::Path, content: &str) -> std::io::
     std::fs::write(path, content)
 }
 
+const NETSCAPE_HEADER: &str = "# Netscape HTTP Cookie File";
+
+/// Dòng đầu có khớp mẫu `#( Netscape)? HTTP Cookie File` mà http.cookiejar bắt buộc.
+fn has_netscape_header(content: &str) -> bool {
+    let first = content.lines().next().unwrap_or("").trim();
+    first.starts_with(NETSCAPE_HEADER) || first.starts_with("# HTTP Cookie File")
+}
+
+/// Sửa tại chỗ tệp cookie đã lưu: bỏ BOM, thêm dòng đầu Netscape nếu thiếu.
+///
+/// Bản cũ lưu nguyên văn các dòng cookie người dùng dán (không có dòng đầu). yt-dlp
+/// từ chối hẳn tệp đó ("does not look like a Netscape format cookies file") nên mọi
+/// lượt tải của nền tảng tương ứng đều thất bại cho tới khi người dùng xoá cookie.
+fn repair_cookie_file(path: &std::path::Path) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let stripped = content.trim_start_matches('\u{feff}');
+    if stripped.len() == content.len() && has_netscape_header(stripped) {
+        return;
+    }
+    let fixed = if has_netscape_header(stripped) {
+        stripped.to_string()
+    } else {
+        format!("{NETSCAPE_HEADER}\n{stripped}")
+    };
+    match write_private_cookie_file(path, &fixed) {
+        Ok(()) => info!("Đã bổ sung dòng đầu Netscape cho tệp cookie {:?}", path),
+        Err(e) => warn!("Không sửa được tệp cookie {:?}: {e}", path),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,7 +161,14 @@ impl CookieService {
                 .filter(|l| !l.trim().is_empty() && (!l.starts_with('#') || l.starts_with("#HttpOnly_")))
                 .filter(|l| l.split('\t').count() >= 6)
                 .count();
-            return (trimmed.to_string(), count);
+            // Người dùng thường chỉ copy các dòng cookie, không kèm dòng đầu. Lưu nguyên
+            // văn như trước thì yt-dlp từ chối cả tệp (xem repair_cookie_file).
+            let content = if has_netscape_header(trimmed) {
+                trimmed.to_string()
+            } else {
+                format!("{NETSCAPE_HEADER}\n{trimmed}")
+            };
+            return (content, count);
         }
 
         // 1b. Netscape nhưng tab đã thành dấu cách
@@ -437,6 +476,14 @@ impl CookieService {
                 }
             }
         }
+
+        // Tệp đã lưu bởi bản cũ (thiếu dòng đầu Netscape) được sửa luôn tại đây
+        for platform in Self::supported_platforms() {
+            let path = cookie_file_path(&platform);
+            if path.is_file() {
+                repair_cookie_file(&path);
+            }
+        }
     }
 
     /// Lưu cookie string vào file cho một platform
@@ -557,6 +604,7 @@ impl CookieService {
         let norm = Self::normalize_platform(platform).unwrap_or_else(|| platform.to_lowercase());
         let path = cookie_file_path(&norm);
         if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            repair_cookie_file(&path);
             Some(path)
         } else {
             None
@@ -734,6 +782,49 @@ mod tests {
         for line in out.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
             assert_eq!(line.split('\t').count(), 7, "Dòng cookie hỏng: {line:?}");
         }
+    }
+
+    /// Dán các dòng cookie Netscape (đúng tab) nhưng không có dòng đầu: yt-dlp từ
+    /// chối tệp nếu dòng đầu không phải "# Netscape HTTP Cookie File".
+    #[test]
+    fn netscape_lines_without_header_get_one() {
+        let raw = ".youtube.com\tTRUE\t/\tTRUE\t1890000000\tPREF\tf6=4\n\
+                   .youtube.com\tTRUE\t/\tFALSE\t0\tVISITOR_INFO1_LIVE\tabc";
+        let (out, count) = CookieService::convert_to_netscape("youtube", raw);
+        assert_eq!(count, 2);
+        assert!(out.starts_with("# Netscape HTTP Cookie File\n"), "thiếu dòng đầu: {out:?}");
+        assert!(out.ends_with("VISITOR_INFO1_LIVE\tabc"));
+
+        // Đã có dòng đầu (kể cả biến thể "# HTTP Cookie File") thì giữ nguyên
+        let with_header = format!("# HTTP Cookie File\n{raw}");
+        assert_eq!(CookieService::convert_to_netscape("youtube", &with_header).0, with_header);
+    }
+
+    #[test]
+    fn saved_cookie_files_without_header_are_repaired() {
+        let dir = std::env::temp_dir().join(format!("crwl_cookie_repair_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines = ".x.com\tTRUE\t/\tTRUE\t0\tauth_token\tabc\n";
+
+        let bare = dir.join("bare.txt");
+        std::fs::write(&bare, lines).unwrap();
+        repair_cookie_file(&bare);
+        assert_eq!(std::fs::read_to_string(&bare).unwrap(), format!("{NETSCAPE_HEADER}\n{lines}"));
+
+        // BOM trước dòng đầu cũng làm http.cookiejar không nhận ra định dạng
+        let bom = dir.join("bom.txt");
+        std::fs::write(&bom, format!("\u{feff}{NETSCAPE_HEADER}\n{lines}")).unwrap();
+        repair_cookie_file(&bom);
+        assert_eq!(std::fs::read_to_string(&bom).unwrap(), format!("{NETSCAPE_HEADER}\n{lines}"));
+
+        // Tệp đã đúng thì không bị đụng tới
+        let good = dir.join("good.txt");
+        let good_content = format!("{NETSCAPE_HEADER}\n{lines}");
+        std::fs::write(&good, &good_content).unwrap();
+        repair_cookie_file(&good);
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), good_content);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -71,11 +71,14 @@ impl SystemService {
         }
 
         // 4. Chromium
-        let chromium_paths = vec![
+        let mut chromium_paths = vec![
             home.join(".config/chromium"),
             home.join("snap/chromium/common/chromium"),
             home.join(".var/app/org.chromium.Chromium/config/chromium"),
         ];
+        if let Some(ref l) = local_app_data {
+            chromium_paths.push(l.join("Chromium").join("User Data"));
+        }
 
         // 5. Brave
         let mut brave_paths = vec![
@@ -136,4 +139,22 @@ impl SystemService {
             .collect()
     }
 
+    /// Trình duyệt trong chuỗi `--cookies-from-browser` (vd. "chrome", "firefox:Profile")
+    /// có thư mục dữ liệu (nơi chứa cookie) trên máy không.
+    ///
+    /// Danh sách trình duyệt trên UI cho chọn cả mục "Chưa cài": khi đó yt-dlp báo
+    /// "could not find ... cookies database" và CẢ lượt tải thất bại, dù nội dung công
+    /// khai không cần cookie. Trình duyệt app không quản lý thì để yt-dlp tự xử lý.
+    pub fn browser_has_cookie_store(spec: &str) -> bool {
+        let id = spec
+            .split([':', '+'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        match Self::get_browsers_list().into_iter().find(|b| b.id == id) {
+            Some(browser) => browser.cookie_path.is_some(),
+            None => true,
+        }
+    }
 }

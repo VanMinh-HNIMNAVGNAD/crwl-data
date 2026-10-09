@@ -152,6 +152,11 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const [isTrimmerOpen, setIsTrimmerOpen] = useState(false)
   const [trimStart, setTrimStart] = useState('')
   const [trimEnd, setTrimEnd] = useState('')
+  const resetTrimmer = () => {
+    setIsTrimmerOpen(false)
+    setTrimStart('')
+    setTrimEnd('')
+  }
 
   // Advanced options UI state
   const [isOptionsOpen, setIsOptionsOpen] = useState(false)
@@ -285,6 +290,13 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       if (!cancelRef.current && data) {
         setSingleMedia(data)
         setBatchMedias([])
+        // Lựa chọn của kết quả TRƯỚC không được áp sang kết quả mới. Trước đây ảnh
+        // được đánh dấu theo id (1, 2, 3...) nên album mới hiện sẵn các ô đã chọn và
+        // "Tải ZIP" tải luôn những ảnh người dùng chưa hề chọn; mốc "Cắt đoạn" của
+        // video trước cũng âm thầm cắt cụt video sau.
+        setSelectedImages({})
+        setUserSelectedSubLang('')
+        resetTrimmer()
         onShowToast?.(`Đã trích xuất: ${data.title?.slice(0, 30) || 'Thành công'}...`)
       }
     } catch (err) {
@@ -495,14 +507,18 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
       const downloadUrl = isDirectStreamOnly && stream.url ? stream.url : (media.originalUrl || stream.url)
       const downloadFormatId = isDirectStreamOnly && stream.url ? null : (stream.formatId || null)
 
+      // "Cắt đoạn" chỉ áp dụng khi hộp cắt đang mở: đóng hộp lại là tải nguyên video
+      // (trước đây mốc đã nhập vẫn âm thầm được dùng dù hộp đã đóng).
+      const useTrim = isSingle && isTrimmerOpen
       const res = await startNativeDownload({
         url: downloadUrl,
         formatId: downloadFormatId,
         isAudio: isAudioOnly,
         isMute: isMute,
-        referer: media.originalUrl || undefined,
-        startTime: (isSingle && trimStart) || undefined,
-        endTime: (isSingle && trimEnd) || undefined,
+        // Luồng tìm thấy bên trong một trang (trang phim) cần Referer là trang đó
+        referer: media.referer || media.originalUrl || undefined,
+        startTime: (useTrim && trimStart) || undefined,
+        endTime: (useTrim && trimEnd) || undefined,
         title: media.title,
         destDir: targetDir,
         embedSubs: isSingle && embedSubs,
@@ -1076,7 +1092,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     setAsyncResolved(null)
     setSelectedImages({})
     clearFinishedTasks()
-    setIsTrimmerOpen(false)
+    resetTrimmer()
   }
 
   const handleClearBatch = () => {

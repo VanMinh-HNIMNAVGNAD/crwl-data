@@ -4,7 +4,7 @@ The `core/` package provides a standalone, robust media extraction and crawler e
 
 ## Architecture
 
-- **`extractor_cli.py`**: CLI entry point and IPC sidecar worker. Supports `--json`, `--ipc-stream` (NDJSON line protocol for Tauri sidecar), and `--output` flags.
+- **`extractor_cli.py`**: CLI entry point and IPC sidecar worker. Subcommands `extract`, `crawl`, `resolve` (output is always JSON; `--pretty` indents it) and `--stdin` (NDJSON line protocol used by the Tauri sidecar).
 - **`dispatcher.py`**: Intelligent routing mechanism that resolves input URLs and dispatches them to the best-suited extractor.
 - **`models.py`**: Standardized dataclasses (`MediaItem`, `ExtractionResult`, `JobStatus`) ensuring unified output across all extractors.
 - **`resolver/`**:
@@ -23,10 +23,10 @@ The `core/` package provides a standalone, robust media extraction and crawler e
 
 ```bash
 # Single URL extraction via CLI
-python3 core/extractor_cli.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --json
+python3 core/extractor_cli.py extract "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --pretty
 
 # Profile crawling
-python3 core/extractor_cli.py "@username" --platform tiktok --type profile --json
+python3 core/extractor_cli.py crawl "@username" --platform tiktok --limit 10 --pretty
 
 # Running system tests
 python3 scripts/test_desktop_system.py

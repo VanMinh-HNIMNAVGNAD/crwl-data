@@ -209,6 +209,9 @@ class MediaMetadata:
     is_short: Optional[bool] = None
     is_story: Optional[bool] = None
     playlist_count: Optional[int] = None
+    # Trang chứa media khi `original_url` là luồng phát tìm được bên trong trang đó
+    # (trang phim): máy chủ luồng thường chỉ phục vụ khi có Referer là trang này.
+    referer: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = {
@@ -257,6 +260,8 @@ class MediaMetadata:
             res["isStory"] = self.is_story
         if self.playlist_count is not None:
             res["playlistCount"] = self.playlist_count
+        if self.referer:
+            res["referer"] = self.referer
         return res
 
 

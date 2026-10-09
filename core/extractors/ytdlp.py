@@ -8,6 +8,8 @@ import json
 import math
 import os
 import re
+import subprocess
+import threading
 from typing import Optional, List, Dict, Any, Tuple
 from .base import BaseExtractor
 from ..models import (
@@ -24,12 +26,62 @@ from ..cookies.browser_cookies import get_browser_cookies_txt
 YOUTUBE_VIDEO_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 
 
+class PlaylistUrlError(RuntimeError):
+    """Liên kết là một DANH SÁCH (playlist, kênh, trang cá nhân), không phải một video.
+
+    Trước đây `--dump-json` bóc tách đầy đủ TỪNG video của danh sách: playlist lớn
+    luôn quá 30 giây, rồi chuỗi fallback để web_scraper vớt ảnh og:image và trả về
+    "thành công" một album giả chỉ có ảnh bìa. Playlist nhỏ thì UI hiện thông tin
+    video đầu tiên nhưng bấm tải lại kéo về cả danh sách. Dispatcher phải ném lỗi
+    này thẳng ra ngoài, không thử engine khác.
+    """
+
+
 class YtDlpExtractor(BaseExtractor):
     """Wrapper cho yt-dlp binary"""
+
+    # (đường dẫn yt-dlp, mtime) -> bản yt-dlp có hiểu `--js-runtimes` không
+    _js_runtimes_support: Dict[Tuple[str, float], bool] = {}
+    _js_runtimes_lock = threading.Lock()
 
     def __init__(self):
         super().__init__()
         self.binary_path = self.find_binary("yt-dlp", "YT_DLP_PATH")
+
+    def supports_js_runtimes(self) -> bool:
+        """Bản yt-dlp đang dùng có tuỳ chọn `--js-runtimes` không.
+
+        Tuỳ chọn này chỉ có từ các bản yt-dlp cuối 2025. Bản cũ (vd. gói apt của
+        Ubuntu/Debian) gặp nó là thoát ngay với "no such option: --js-runtimes":
+        trước đây máy nào có Node.js là MỌI lượt bóc tách đều thất bại. Kết quả được
+        nhớ theo mtime để lần cập nhật yt-dlp sau được kiểm tra lại.
+        """
+        path = self.binary_path or ""
+        try:
+            key = (path, os.path.getmtime(path))
+        except OSError:
+            return False
+        with self._js_runtimes_lock:
+            cached = self._js_runtimes_support.get(key)
+        if cached is not None:
+            return cached
+        try:
+            out = subprocess.run(
+                [path, "--help"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+            supported = "--js-runtimes" in (out.stdout or "")
+        except (OSError, subprocess.SubprocessError):
+            # Không đọc được trợ giúp thì đừng thêm cờ: thiếu cờ chỉ làm YouTube kém
+            # đi, còn thêm nhầm thì yt-dlp cũ thất bại hoàn toàn.
+            supported = False
+        with self._js_runtimes_lock:
+            self._js_runtimes_support[key] = supported
+        return supported
 
     def is_available(self) -> bool:
         # Cài yt-dlp SAU khi engine đã khởi động thì lần dò lúc khởi động không thấy:
@@ -49,9 +101,10 @@ class YtDlpExtractor(BaseExtractor):
         ]
 
 
-        # Sử dụng Node.js runtime cho YouTube n-sig solver nếu có
+        # Sử dụng Node.js runtime cho YouTube n-sig solver nếu có — và chỉ khi bản
+        # yt-dlp hiểu tuỳ chọn này (xem supports_js_runtimes).
         node_bin = self.find_binary("node")
-        if node_bin and os.path.exists(node_bin):
+        if node_bin and os.path.exists(node_bin) and self.supports_js_runtimes():
             args.extend(["--js-runtimes", f"node:{node_bin}"])
 
         if not allow_playlist:
@@ -83,7 +136,10 @@ class YtDlpExtractor(BaseExtractor):
             raise RuntimeError("yt-dlp binary không được tìm thấy trên hệ thống.")
 
         args, tmp_cookie = self.get_base_args(allow_playlist=False, browser=browser, target_url=url)
-        cmd = [self.binary_path] + args + ["--dump-json", url]
+        # `--flat-playlist` không đổi gì với một video đơn (vẫn bóc tách đầy đủ), nhưng
+        # với playlist/kênh thì chỉ liệt kê nhanh các mục thay vì bóc tách từng video
+        # tới khi quá giờ — nhờ đó nhận ra ngay đây là danh sách (PlaylistUrlError).
+        cmd = [self.binary_path] + args + ["--flat-playlist", "--dump-json", url]
 
         self.log(f"yt-dlp extract: {url}")
         try:
@@ -125,7 +181,25 @@ class YtDlpExtractor(BaseExtractor):
                 return self.extract_metadata(url, browser="none", timeout=timeout)
             raise ValueError(f"Lỗi parse JSON yt-dlp: {e}")
 
+        # Mục "phẳng" (chỉ là liên kết tới video khác) chỉ xuất hiện khi URL là một
+        # danh sách — xem chú thích của PlaylistUrlError.
+        if raw_data.get("_type") in ("url", "url_transparent"):
+            raise PlaylistUrlError(self._playlist_message(raw_data, stdout))
+
         return self._normalize_metadata(raw_data, url)
+
+    @staticmethod
+    def _playlist_message(entry: Dict[str, Any], stdout: str) -> str:
+        count = entry.get("playlist_count") or entry.get("n_entries")
+        if not isinstance(count, int) or count <= 0:
+            count = sum(1 for line in stdout.splitlines() if line.strip().startswith("{"))
+        title = entry.get("playlist_title") or entry.get("playlist")
+        name = f" «{title}»" if title else ""
+        return (
+            f"Liên kết này là một danh sách{name} gồm {count} mục (playlist, kênh hoặc trang "
+            f"nhiều video), không phải một video đơn. Hãy dán liên kết vào khung "
+            f"'Tải theo tài khoản' để quét và chọn video cần tải, hoặc dán liên kết của từng video."
+        )
 
     def extract_video_posters(self, url: str, browser: Optional[str] = None, timeout: int = 25) -> List[Tuple[str, str]]:
         """Danh sách (media_id, ảnh poster) của mọi video trong một bài đăng.
@@ -219,6 +293,13 @@ class YtDlpExtractor(BaseExtractor):
             raise RuntimeError(f"yt-dlp playlist thất bại: {stderr.strip() or f'Exit code {code}'}")
 
         result = self._parse_playlist_data(stdout, url)
+        # URL kênh gốc (youtube.com/@kenh) là danh sách các TAB (Videos, Shorts, Live):
+        # yt-dlp áp `--playlist-items` cho TỪNG tab, nên chọn 20 bài lại nhận về tới 60.
+        wanted = (to_item - from_item + 1) if (from_item and to_item and to_item >= from_item) else limit
+        if wanted and wanted > 0 and len(result.media) > wanted:
+            result.media = result.media[:wanted]
+            result.total_count = len(result.media)
+            result.stats = f"Đã quét {len(result.media)} tệp phương tiện"
         if timed_out and result.media:
             # --flat-playlist in từng mục ngay khi có: trả về phần đã quét được
             result.stats = f"{result.stats} (dừng sớm vì hết thời gian)"
@@ -437,6 +518,27 @@ class YtDlpExtractor(BaseExtractor):
                             url=f.get("url"),
                         )
                     )
+
+            # Nguồn không khai báo độ phân giải (HLS "media playlist" .m3u8, link
+            # .mp4/.webm trực tiếp...) không lọt vào nhóm nào ở trên, nên trước đây
+            # chỉ còn các lựa chọn ÂM THANH — không có cách nào tải video. Chỉ bỏ qua
+            # khi mọi định dạng đều khai báo rõ là không có hình (vd. SoundCloud).
+            has_video_option = any(s.stream_type in ("full", "mute") for s in streams)
+            might_have_video = any((f.get("vcodec") or "") != "none" for f in formats)
+            if not has_video_option and might_have_video:
+                best = formats[-1] if formats else {}
+                streams.append(
+                    StreamFormat(
+                        format_id="bestvideo+bestaudio/best",
+                        quality="Video tốt nhất hiện có — Có âm thanh",
+                        format=(best.get("ext") or "mp4").upper(),
+                        size=None,
+                        raw_size=None,
+                        stream_type="full",
+                        has_audio=True,
+                        has_video=True,
+                    )
+                )
 
             # Audio formats chuẩn
             audio_presets = [

@@ -494,6 +494,35 @@ def crwl_config_dir() -> str:
     return os.path.join(base, "crwl")
 
 
+_NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
+
+
+def _ensure_netscape_header(path: str) -> None:
+    """Thêm dòng đầu "# Netscape HTTP Cookie File" nếu tệp chưa có.
+
+    yt-dlp (http.cookiejar) từ chối thẳng tệp cookie có dòng đầu khác — "does not
+    look like a Netscape format cookies file". Bản cũ của Cookie Manager lưu nguyên
+    văn các dòng cookie người dùng dán vào (không kèm dòng đầu), nên mọi lượt bóc
+    tách dùng tệp đó đều thất bại.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return
+    # BOM ở đầu tệp cũng làm dòng đầu không khớp mẫu của http.cookiejar
+    stripped = content.lstrip("﻿")
+    first = stripped.split("\n", 1)[0].strip()
+    has_header = first.startswith(_NETSCAPE_HEADER) or first.startswith("# HTTP Cookie File")
+    if has_header and stripped == content:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(stripped if has_header else f"{_NETSCAPE_HEADER}\n{stripped}")
+    except OSError:
+        pass
+
+
 def _find_manual_cookie_file(domain: Optional[str] = None) -> Optional[str]:
     """Tìm file cookie thủ công trong <config>/crwl/cookies/ theo domain hoặc platform."""
     cookies_dir = os.path.join(crwl_config_dir(), "cookies")
@@ -548,6 +577,7 @@ def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str]
                 fd, output_path = tempfile.mkstemp(prefix="cookies_manual_", suffix=".txt")
                 os.close(fd)
             shutil.copyfile(manual, output_path)
+            _ensure_netscape_header(output_path)
             return output_path
 
         # Ưu tiên 2: trích xuất từ trình duyệt hệ thống

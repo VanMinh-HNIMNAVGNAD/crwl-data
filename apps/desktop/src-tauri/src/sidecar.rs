@@ -303,7 +303,8 @@ impl SidecarManager {
             let cli = this.cli_path.clone();
             let inner_arc = this.inner.clone();
             let spawn_time = std::time::Instant::now();
-            let python_bin = crate::binary_manager::BinaryManager::find_python()
+            let python_bin = crate::binary_manager::BinaryManager::find_working_python()
+                .await
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| {
                     if cfg!(windows) { "python".to_string() } else { "python3".to_string() }

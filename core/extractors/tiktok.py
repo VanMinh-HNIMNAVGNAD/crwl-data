@@ -83,13 +83,19 @@ class TikTokExtractor(BaseExtractor):
         # Tạo danh sách CrawlMediaItem
         media_entries: List[CrawlMediaItem] = []
         for idx, item in enumerate(video_list[:effective_limit], 1):
-            vid_id = item.get("id") or str(idx)
+            vid_id = item.get("id")
             title = (item.get("desc") or "").strip() or None
             w = item.get("width")
             h = item.get("height")
             quality = f"{w}x{h}" if w and h else None
             thumb = item.get("coverUrl") or item.get("originCoverUrl") or item.get("dynamicCoverUrl") or None
-            play_url = item.get("playAddr") or f"https://www.tiktok.com/@{username}/video/{vid_id}"
+            # Ưu tiên trang video: yt-dlp tải được kèm cookie/Referer đúng. `playAddr`
+            # là link CDN ký tạm thời, cần cookie tt_chain_token + Referer TikTok — tải
+            # trực tiếp bị 403, và trước đây nó được ưu tiên nên mọi mục đều tải lỗi.
+            # Không có id thì không dựng được trang video (từng dựng bằng số thứ tự → link sai).
+            play_url = f"https://www.tiktok.com/@{username}/video/{vid_id}" if vid_id else item.get("playAddr")
+            if not play_url:
+                continue
 
             media_entries.append(
                 CrawlMediaItem(

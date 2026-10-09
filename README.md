@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![App Version](https://img.shields.io/badge/version-0.1.7-blue.svg?style=for-the-badge)
+![App Version](https://img.shields.io/badge/version-2.8.1-blue.svg?style=for-the-badge)
 ![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8D8?style=for-the-badge&logo=tauri&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-2021%20Edition-black?style=for-the-badge&logo=rust&logoColor=white)
 ![React](https://img.shields.io/badge/React-19.x-61DAFB?style=for-the-badge&logo=react&logoColor=black)
@@ -106,8 +106,8 @@ flowchart TD
 - [x] **Account / Profile Crawler:** Cào toàn bộ video hoặc bài viết từ trang cá nhân (@username), tải danh sách hoặc nén gói ZIP tiện lợi.
 - [x] **Cookie Manager Thông Minh:** Tự động đọc cookie sạch từ các trình duyệt đã cài đặt (Chrome, Brave, Firefox, Edge, Chromium) hoặc nhập file `cookies.txt` để tải nội dung riêng tư / giới hạn độ tuổi.
 - [x] **Quản Lý Bộ Công Cụ (Tools Manager):** Kiểm tra phiên bản và **cập nhật `yt-dlp` chỉ bằng 1 cú click** ngay trong giao diện ứng dụng.
-- [x] **Quản Lý Tiến Trình Thời Gian Thực:** Hiển thị phần trăm tải, tốc độ (MB/s), dung lượng và thời gian còn lại. Hỗ trợ tạm dừng, hủy và mở thư mục lưu file tức thì.
-- [x] **Lịch Sử Tải & Thống Kê:** Lưu trữ nhật ký đầy đủ qua SQLite cục bộ, hỗ trợ tìm kiếm, lọc theo nền tảng và dọn dẹp lịch sử.
+- [x] **Quản Lý Tiến Trình Thời Gian Thực:** Mỗi lượt tải có thẻ riêng hiển thị phần trăm, tốc độ, thời gian đã chạy và thời gian còn lại; hủy tải (xoá sạch tệp dở dang) và mở thư mục lưu file ngay trên thẻ.
+- [x] **Lịch Sử Tải:** Lưu 50 lượt tải gần nhất (thành công / lỗi / đã hủy) trong SQLite cục bộ, kèm nền tảng, dung lượng, thời gian và nút xoá toàn bộ lịch sử.
 
 ---
 
@@ -205,11 +205,11 @@ Dành cho việc kiểm thử bóc tách link, viết extractor mới hoặc deb
 pnpm test:core
 # Hoặc: python3 scripts/test_desktop_system.py
 
-# 2. Thử bóc tách một liên kết bất kỳ:
-python3 core/extractor_cli.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --json
+# 2. Thử bóc tách một liên kết bất kỳ (kết quả in ra dạng JSON):
+python3 core/extractor_cli.py extract "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --pretty
 
-# 3. Quét toàn bộ kênh/profile:
-python3 core/extractor_cli.py "@username" --platform tiktok --type profile --limit 10 --json
+# 3. Quét kênh/profile (--type: all | video | image):
+python3 core/extractor_cli.py crawl "@username" --platform tiktok --limit 10 --pretty
 ```
 
 ---
@@ -231,21 +231,21 @@ Hệ thống được cấu thành từ 3 thành phần chính: **Frontend**, **
   RUST_LOG=debug RUST_BACKTRACE=1 pnpm dev:tauri
   ```
 - **Kiểm tra File Log của Ứng Dụng:**
-  Ứng dụng tích hợp `tauri-plugin-log`, toàn bộ log hệ thống được ghi lại tại:
-  - **Linux:** `~/.config/crwl/logs/` hoặc xuất thẳng ra terminal `stderr`.
-  - **Windows:** `%APPDATA%/crwl/logs/`.
+  Ứng dụng tích hợp `tauri-plugin-log`, log được in ra terminal và ghi vào tệp `social-media-crawler.log` tại:
+  - **Linux:** `~/.local/share/com.crwl.socialmedia/logs/`
+  - **Windows:** `%LOCALAPPDATA%\com.crwl.socialmedia\logs\`
 
 ### 3. Debug Lõi Bóc Tách Python Engine (Sidecar IPC)
 - **Kiểm tra trạng thái Sidecar từ ứng dụng:**
-  Ứng dụng có Tauri Command `get_sidecar_status` và `restart_sidecar` để theo dõi tiến trình Python đang chạy ngầm.
+  Mở **Công cụ** (⚙): mục **Python 3** hiển thị trạng thái engine (lấy từ Tauri Command `get_sidecar_status`), lỗi gần nhất nếu engine đã dừng, và nút **Khởi động lại** (`restart_sidecar`).
 - **Tự chạy kiểm tra luồng NDJSON:**
-  Mở terminal và gọi trực tiếp `extractor_cli.py` với cờ `--ipc-stream` để kiểm tra luồng dữ liệu chuẩn mà Rust nhận được:
+  Mở terminal và gọi trực tiếp `extractor_cli.py` với cờ `--stdin` — đúng chế độ mà Rust dùng để chạy engine:
   ```bash
-  python3 core/extractor_cli.py --ipc-stream
-  # Sau đó gửi JSON request qua stdin:
+  python3 core/extractor_cli.py --stdin
+  # Sau đó gửi JSON request qua stdin (mỗi request một dòng):
   {"id": "req-1", "action": "extract", "url": "https://youtu.be/dQw4w9WgXcQ"}
   ```
-- **Kiểm tra ngoại lệ (Exceptions):** Nếu một extractor bị lỗi do trang web đổi cấu trúc HTML, chạy trực tiếp URL đó qua lệnh CLI sẽ in ra đầy đủ Python Traceback để xác định vị trí lỗi ngay lập tức.
+- **Kiểm tra lỗi của từng extractor:** chạy URL đó qua lệnh CLI (`extract` / `crawl`); diễn biến từng bước (engine nào được thử, lỗi gì) được in ra stderr với tiền tố `[Extractor]`, kết quả hoặc lỗi cuối cùng in ra stdout dạng JSON.
 
 ### 4. Debug Cơ Sở Dữ Liệu SQLite Cục Bộ
 - Vị trí cơ sở dữ liệu:

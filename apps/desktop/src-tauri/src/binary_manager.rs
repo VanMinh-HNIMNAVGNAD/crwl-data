@@ -5,11 +5,12 @@
  * Thiết kế: chỉ check + báo cáo + update manual theo yêu cầu user.
  * Không tự động cập nhật khi start.
  */
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
-use std::time::Duration;
-use log::info;
+use std::time::{Duration, SystemTime};
+use log::{info, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -206,6 +207,81 @@ impl BinaryManager {
         Self::find_binary("python3")
     }
 
+    /// Trình thông dịch Python 3 CHẠY ĐƯỢC THẬT để khởi động engine bóc tách.
+    ///
+    /// Trên Windows, `python3.exe` trong PATH thường là "App execution alias" của
+    /// Microsoft Store: khi chưa cài Python từ Store nó chỉ in "Python was not found"
+    /// rồi thoát, kể cả khi máy đã cài Python từ python.org (bản này không tạo
+    /// python3.exe). Trước đây app luôn chọn nó trước, nên engine chết 3 lần liên tiếp
+    /// và chuyển FAILED. Trên Windows nay thử `py` (launcher của python.org) và
+    /// `python` trước, mỗi ứng viên phải trả lời `--version` là Python 3.
+    /// Linux/macOS giữ cách dò cũ (không tốn thêm một tiến trình).
+    pub async fn find_working_python() -> Option<PathBuf> {
+        if !cfg!(windows) {
+            return Self::find_python();
+        }
+        let mut candidates: Vec<PathBuf> = ["py", "python", "python3"]
+            .iter()
+            .filter_map(|name| which::which(name).ok())
+            .collect();
+        if let Some(p) = Self::find_python() {
+            candidates.push(p);
+        }
+        if let Some(local) = dirs::data_local_dir() {
+            if let Ok(entries) = std::fs::read_dir(local.join("Programs").join("Python")) {
+                candidates.extend(entries.flatten().map(|e| e.path().join("python.exe")).filter(|p| p.is_file()));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|p| seen.insert(p.clone()));
+
+        for candidate in &candidates {
+            let mut cmd = background_command(candidate);
+            cmd.arg("--version");
+            if let Ok(out) = run_with_timeout(cmd, VERSION_TIMEOUT).await {
+                let text = format!("{}{}", out.stdout, out.stderr);
+                if out.success && text.trim_start().starts_with("Python 3") {
+                    return Some(candidate.clone());
+                }
+            }
+            warn!("[Python] Bỏ qua {:?}: không phải trình thông dịch Python 3 chạy được", candidate);
+        }
+        // Không ứng viên nào chạy được: trả về ứng viên đầu để lỗi khởi động nêu rõ đường dẫn
+        candidates.into_iter().next()
+    }
+
+    /// Bản yt-dlp này có tuỳ chọn `--js-runtimes` không.
+    ///
+    /// Tuỳ chọn chỉ có từ các bản yt-dlp cuối 2025; bản cũ (vd. gói apt của
+    /// Ubuntu/Debian) gặp nó là thoát ngay với "no such option: --js-runtimes".
+    /// Trước đây app luôn thêm cờ này khi máy có Node.js, nên với yt-dlp cũ thì MỌI
+    /// lượt tải đều thất bại. Kết quả được nhớ theo (đường dẫn, mtime): cập nhật
+    /// yt-dlp xong là được kiểm tra lại.
+    pub async fn ytdlp_supports_js_runtimes(bin: &Path) -> bool {
+        type Cache = std::sync::Mutex<HashMap<(PathBuf, Option<SystemTime>), bool>>;
+        static CACHE: OnceLock<Cache> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+
+        let key = (bin.to_path_buf(), std::fs::metadata(bin).and_then(|m| m.modified()).ok());
+        if let Some(known) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
+            return known;
+        }
+        let mut cmd = background_command(bin);
+        cmd.arg("--help");
+        match run_with_timeout(cmd, Duration::from_secs(20)).await {
+            Ok(out) => {
+                let supported = out.stdout.contains("--js-runtimes");
+                if let Ok(mut c) = cache.lock() {
+                    c.insert(key, supported);
+                }
+                supported
+            }
+            // Không đọc được trợ giúp (máy quá chậm...): lần này bỏ cờ cho chắc, lần
+            // sau thử lại. Thiếu cờ chỉ làm YouTube kém đi; thêm nhầm thì hỏng hẳn.
+            Err(_) => false,
+        }
+    }
+
     /// Kiểm tra xem binary có sẵn trên máy không
     pub fn has_binary(name: &str) -> bool {
         Self::find_binary(name).is_some()
@@ -249,7 +325,12 @@ impl BinaryManager {
     }
 
     async fn status_of(name: &str) -> BinaryStatus {
-        let path = Self::find_binary(name);
+        // Python: báo đúng trình thông dịch mà engine bóc tách thật sự dùng
+        let path = if name == "python3" {
+            Self::find_working_python().await
+        } else {
+            Self::find_binary(name)
+        };
         let version = match path.as_deref() {
             Some(p) => Self::get_version(p).await,
             None => None,
@@ -738,6 +819,37 @@ mod tests {
         let plain = "a\nb\n\nc\nd\n";
         assert_eq!(BinaryManager::tail_lines(plain), "b | c | d");
         assert!(BinaryManager::tail_lines(&"x".repeat(2000)).chars().count() <= 501);
+    }
+
+    /// yt-dlp cũ (vd. gói apt) thoát ngay với "no such option: --js-runtimes":
+    /// chỉ được thêm cờ khi `--help` của chính binary đó có nó.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn js_runtimes_flag_is_only_used_when_ytdlp_supports_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("jsrt");
+        let make = |name: &str, help: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{help}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let new = make("yt-dlp-new", "    --js-runtimes RUNTIME[:PATH]    Additional JavaScript runtime");
+        let old = make("yt-dlp-old", "    --cookies-from-browser BROWSER");
+        assert!(BinaryManager::ytdlp_supports_js_runtimes(&new).await);
+        assert!(!BinaryManager::ytdlp_supports_js_runtimes(&old).await);
+        // Lần hỏi thứ hai lấy từ bộ nhớ đệm, kết quả không đổi
+        assert!(BinaryManager::ytdlp_supports_js_runtimes(&new).await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_python_used_for_the_engine_actually_runs() {
+        if let Some(python) = BinaryManager::find_working_python().await {
+            let out = std::process::Command::new(&python).arg("--version").output().unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(text.starts_with("Python 3"), "{python:?}: {text}");
+        }
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {

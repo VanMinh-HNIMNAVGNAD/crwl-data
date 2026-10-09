@@ -14,6 +14,16 @@ use crate::binary_manager::BinaryManager;
 use crate::cookies::CookieService;
 use crate::db::Database;
 use crate::settings::SettingsManager;
+use crate::system::SystemService;
+
+/// Nguồn cookie truyền cho yt-dlp ở một lượt tải
+enum CookieArg {
+    None,
+    /// File cookie thủ công (Cookie Manager) → `--cookies`
+    File(PathBuf),
+    /// Trình duyệt người dùng chọn → `--cookies-from-browser`
+    Browser(String),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DownloadOptions {
@@ -566,6 +576,13 @@ impl DownloaderService {
         }
     }
 
+    pub async fn unregister_pid(task_id: &str, pid: u32) {
+        let mut reg = get_download_registry().lock().await;
+        if let Some(state) = reg.get_mut(task_id) {
+            state.pids.retain(|p| *p != pid);
+        }
+    }
+
     pub async fn record_file_path(task_id: &str, path: PathBuf) {
         let mut reg = get_download_registry().lock().await;
         if let Some(state) = reg.get_mut(task_id) {
@@ -666,15 +683,54 @@ impl DownloaderService {
         Ok(true)
     }
 
-    /// Thực thi tiến trình tải xuống bằng yt-dlp và stream % tiến trình về UI
-    pub async fn start_download(
-        app_handle: AppHandle,
-        db: Arc<Database>,
-        opts: DownloadOptions,
-    ) -> Result<DownloadResult, String> {
-        let ytdlp_path = Self::find_ytdlp()?;
-        let dest_folder = Self::canonical_download_dir(opts.dest_dir.as_deref())?;
+    /// Nguồn cookie cho một lượt tải yt-dlp: ưu tiên 1) file cookie thủ công đã lưu,
+    /// 2) cookie của trình duyệt người dùng chọn.
+    fn cookie_arg_for(opts: &DownloadOptions) -> CookieArg {
+        // Luôn thử dùng file cookie thủ công theo platform (bất kể browser có được chọn hay không)
+        if let Some(path) = Self::detect_platform_from_url(&opts.url).and_then(CookieService::get_cookie_file_path) {
+            info!("Dùng cookie file thủ công đã lưu: {:?}", path);
+            return CookieArg::File(path);
+        }
+        let Some(browser) = opts.browser.as_deref().map(str::trim) else {
+            return CookieArg::None;
+        };
+        if browser.is_empty() || browser == "none" {
+            return CookieArg::None;
+        }
+        if !SystemService::browser_has_cookie_store(browser) {
+            warn!("Trình duyệt '{browser}' không có dữ liệu cookie trên máy — tải không dùng cookie trình duyệt");
+            return CookieArg::None;
+        }
+        CookieArg::Browser(browser.to_string())
+    }
 
+    /// yt-dlp thất bại vì KHÔNG ĐỌC ĐƯỢC kho cookie của trình duyệt (không có profile,
+    /// DB bị trình duyệt đang chạy khoá, mã hoá DPAPI/app-bound trên Windows...),
+    /// chứ không phải vì nội dung cần đăng nhập.
+    fn is_browser_cookie_failure(stderr_lines: &[String]) -> bool {
+        const MARKERS: &[&str] = &[
+            "cookies database",
+            "cookie database",
+            "failed to decrypt with dpapi",
+            "containers.json",
+            "firefox container",
+            "unsupported browser",
+            "does not support profiles",
+        ];
+        stderr_lines.iter().any(|line| {
+            let lower = line.to_lowercase();
+            MARKERS.iter().any(|m| lower.contains(m))
+        })
+    }
+
+    /// Dựng lệnh yt-dlp cho một lượt tải (mỗi lần thử cần một `Command` mới).
+    fn build_ytdlp_command(
+        ytdlp_path: &Path,
+        dest_folder: &Path,
+        opts: &DownloadOptions,
+        js_runtime: Option<&str>,
+        cookies: &CookieArg,
+    ) -> Command {
         // Giới hạn cả title và id ngay trong template: yt-dlp mở file trước khi
         // backend có cơ hội đổi tên sau đó, nên chỉ sanitize ở Rust là chưa đủ.
         // Template TƯƠNG ĐỐI + `-P <thư mục tải>`: mọi loại tệp (video, ảnh bìa, phụ
@@ -685,7 +741,7 @@ impl DownloaderService {
         let chapter_template =
             "chapter:%(title).50s - %(section_number)03d %(section_title).40s [%(id).50s].%(ext)s";
 
-        let mut cmd = Command::new(&ytdlp_path);
+        let mut cmd = Command::new(ytdlp_path);
         #[cfg(windows)]
         {
             #[allow(unused_imports)]
@@ -693,7 +749,7 @@ impl DownloaderService {
             cmd.creation_flags(0x08000000);
         }
         cmd.arg(&opts.url);
-        cmd.arg("-P").arg(&dest_folder);
+        cmd.arg("-P").arg(dest_folder);
         cmd.arg("-o").arg(output_template);
         cmd.arg("-o").arg(chapter_template);
         cmd.arg("--no-playlist");
@@ -710,9 +766,10 @@ impl DownloaderService {
         cmd.arg("--no-quiet");
         cmd.arg("--progress");
 
-        // Tự động dùng Node.js runtime cho YouTube n-sig challenge nếu có
-        if let Some(node_path) = BinaryManager::find_binary("node") {
-            cmd.arg("--js-runtimes").arg(format!("node:{}", node_path.to_string_lossy()));
+        // Node.js cho YouTube n-sig challenge — chỉ khi bản yt-dlp hiểu tuỳ chọn này
+        // (xem BinaryManager::ytdlp_supports_js_runtimes).
+        if let Some(runtime) = js_runtime {
+            cmd.arg("--js-runtimes").arg(runtime);
         }
 
         // Giữ số kết nối thấp để tránh làm nghẽn CPU, RAM và băng thông trên máy yếu.
@@ -900,21 +957,14 @@ impl DownloaderService {
             cmd.arg("--split-chapters");
         }
 
-        // Cookies — ưu tiên: 1) file cookie thủ công đã lưu, 2) cookie-from-browser
-        {
-            // Luôn thử dùng file cookie thủ công theo platform (bất kể browser có được chọn hay không)
-            let platform = Self::detect_platform_from_url(&opts.url);
-            let manual_cookie = platform.and_then(|p| CookieService::get_cookie_file_path(p));
-
-            if let Some(ref cookie_path) = manual_cookie {
-                info!("Dùng cookie file thủ công đã lưu: {:?}", cookie_path);
-                cmd.arg("--cookies").arg(cookie_path);
-            } else if let Some(ref b) = opts.browser {
-                // Fallback: dùng cookie từ trình duyệt hệ thống nếu được chỉ định
-                if !b.trim().is_empty() && b != "none" {
-                    cmd.arg("--cookies-from-browser").arg(b);
-                }
+        match cookies {
+            CookieArg::File(path) => {
+                cmd.arg("--cookies").arg(path);
             }
+            CookieArg::Browser(browser) => {
+                cmd.arg("--cookies-from-browser").arg(browser);
+            }
+            CookieArg::None => {}
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -923,6 +973,24 @@ impl DownloaderService {
             cmd.process_group(0);
         }
         cmd.kill_on_drop(true);
+        cmd
+    }
+
+    /// Thực thi tiến trình tải xuống bằng yt-dlp và stream % tiến trình về UI
+    pub async fn start_download(
+        app_handle: AppHandle,
+        db: Arc<Database>,
+        opts: DownloadOptions,
+    ) -> Result<DownloadResult, String> {
+        let ytdlp_path = Self::find_ytdlp()?;
+        let dest_folder = Self::canonical_download_dir(opts.dest_dir.as_deref())?;
+        let js_runtime = match BinaryManager::find_binary("node") {
+            Some(node) if BinaryManager::ytdlp_supports_js_runtimes(&ytdlp_path).await => {
+                Some(format!("node:{}", node.to_string_lossy()))
+            }
+            _ => None,
+        };
+        let mut cookies = Self::cookie_arg_for(&opts);
 
         // Mã tác vụ: UI lọc sự kiện tiến trình theo mã này nên nhiều tệp tải
         // song song không còn ghi đè lên nhau trên cùng một thanh tiến trình.
@@ -940,45 +1008,6 @@ impl DownloaderService {
             return Err("Tác vụ tải đã bị hủy trong lúc khởi tạo".to_string());
         }
         let start_time = std::time::SystemTime::now();
-
-        info!("Bắt đầu tải tệp với yt-dlp [{task_id}]: {}", opts.url);
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                Self::unregister_task(&task_id).await;
-                return Err(format!("Không thể khởi chạy yt-dlp: {e}"));
-            }
-        };
-
-        if let Some(pid) = child.id() {
-            Self::register_pid(&task_id, pid).await;
-        }
-
-        let stdout = child.stdout.take().ok_or("Không thể đọc stdout của yt-dlp")?;
-        let stderr = child.stderr.take().ok_or("Không thể đọc stderr của yt-dlp")?;
-
-        // stderr PHẢI được đọc song song. Trước đây ống stderr được mở nhưng không
-        // ai đọc: yt-dlp ghi đầy bộ đệm ~64KB rồi bị chặn vĩnh viễn — đây là
-        // nguyên nhân các luồng tải "đứng hình" và cuối cùng báo lỗi.
-        let stderr_lines: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
-        let stderr_sink = Arc::clone(&stderr_lines);
-        let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let trimmed = line.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let mut buf = stderr_sink.lock().await;
-                // Chỉ giữ phần cuối để thông báo lỗi ngắn gọn và không phình bộ nhớ
-                if buf.len() >= 60 {
-                    buf.remove(0);
-                }
-                buf.push(trimmed);
-            }
-        });
-
-        let mut reader = BufReader::new(stdout).lines();
 
         // yt-dlp in "Downloading N format(s): 137+140" trước khi tải, nhờ đó biết
         // chính xác sẽ có mấy lượt tải để quy đổi ra phần trăm tổng thể.
@@ -1005,16 +1034,6 @@ impl DownloaderService {
             },
         ));
 
-        // Phần trăm chỉ đi tiến, không bao giờ lùi: trước đây mỗi luồng (video rồi
-        // audio) đều chạy 0→100% nên thanh tiến trình tụt về 0 giữa chừng.
-        let mut overall_percent = 0.0_f64;
-        let mut expected_passes = 1usize;
-        let mut pass_index = 0usize;
-        let mut current_format: Option<String> = None;
-        let mut downloaded_file_path: Option<String> = None;
-        let mut printed_final_path: Option<String> = None;
-        let mut is_cancelled = false;
-
         // Tối đa 96% dành cho giai đoạn tải, 4% còn lại cho ghép/hậu xử lý
         const DOWNLOAD_SHARE: f64 = 96.0;
 
@@ -1022,284 +1041,371 @@ impl DownloaderService {
         // nhanh là hàng trăm dòng/giây. Mỗi dòng là một sự kiện IPC + một lần React
         // render, nhân với số video tải song song thì UI giật và CPU tăng vọt.
         const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
-        let mut last_progress_emit: Option<std::time::Instant> = None;
-        let mut last_emitted_pass = usize::MAX;
 
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => {
-                    info!("Nhận được lệnh hủy tác vụ yt-dlp [{task_id}]");
-                    is_cancelled = true;
-                    break;
-                }
-                line_res = reader.next_line() => {
-                    let line = match line_res {
-                        Ok(Some(l)) => l,
-                        Ok(None) => break,
-                        Err(e) => {
-                            warn!("Lỗi đọc stdout của yt-dlp: {e}");
-                            break;
-                        }
-                    };
+        // Tối đa hai lượt: lượt thứ hai chỉ chạy khi lượt đầu thất bại vì không đọc
+        // được cookie của trình duyệt. Trước đây lỗi đó (trình duyệt "Chưa cài", DB
+        // cookie bị trình duyệt đang mở khoá, mã hoá DPAPI trên Windows...) làm MỌI
+        // lượt tải thất bại kể cả nội dung công khai, kèm thông báo sai là "cần đăng
+        // nhập". Engine bóc tách (Python) vốn đã tự thử lại không cookie như vậy.
+        let (status, collected_stderr, downloaded_file_path, printed_final_path, overall_percent) = loop {
+            let mut cmd = Self::build_ytdlp_command(&ytdlp_path, &dest_folder, &opts, js_runtime.as_deref(), &cookies);
 
-                    if let Some(rest) = line.strip_prefix("download-progress:") {
-                        let p = Self::parse_ytdlp_progress(rest);
-
-                        // Đổi format_id nghĩa là yt-dlp đã chuyển sang lượt tải kế tiếp
-                        if !p.format_id.is_empty() {
-                            match current_format {
-                                Some(ref f) if f == &p.format_id => {}
-                                Some(_) => {
-                                    pass_index = (pass_index + 1).min(expected_passes.saturating_sub(1));
-                                    current_format = Some(p.format_id.clone());
-                                }
-                                None => current_format = Some(p.format_id.clone()),
-                            }
-                        }
-
-                        // Máy chủ không báo dung lượng (thiếu Content-Length) thì yt-dlp vẫn
-                        // in "0.0%" suốt lượt tải nên thanh tiến trình đứng im ở 0; nay báo
-                        // UI chạy dạng "chưa rõ tiến độ".
-                        let percent_known = p.percent.is_some();
-                        let pass_percent = p.percent.unwrap_or(0.0);
-
-                        let raw = Self::weighted_percent(pass_index, expected_passes, pass_percent);
-                        overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
-
-                        let due = last_progress_emit
-                            .map(|t| t.elapsed() >= PROGRESS_EMIT_INTERVAL)
-                            .unwrap_or(true);
-                        if !due && pass_percent < 100.0 && last_emitted_pass == pass_index {
-                            continue;
-                        }
-                        last_progress_emit = Some(std::time::Instant::now());
-                        last_emitted_pass = pass_index;
-
-                        let mut phase = if expected_passes > 1 {
-                            format!("Đang tải luồng {}/{}", pass_index + 1, expected_passes)
-                        } else {
-                            "Đang tải dữ liệu".to_string()
-                        };
-                        // Không có phần trăm thì ít nhất cho thấy dữ liệu vẫn đang về
-                        if !percent_known && !p.downloaded.is_empty() {
-                            phase = format!("{phase} (đã nhận {})", p.downloaded);
-                        }
-
-                        progress_emit(DownloadProgressPayload {
-                            id: task_id.clone(),
-                            percent: overall_percent,
-                            speed: p.speed,
-                            eta: p.eta,
-                            status: "downloading".to_string(),
-                            phase,
-                            file_path: None,
-                            message: None,
-                            is_indeterminate: !percent_known,
-                        });
-                        continue;
-                    }
-
-                    // Bắt và parse output tiến trình của aria2c nếu có
-                    if let Some(aria_p) = Self::parse_aria2c_progress(&aria2c_regex, &line) {
-                        let raw = Self::weighted_percent(pass_index, expected_passes, aria_p.percent);
-                        overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
-
-                        let phase = if expected_passes > 1 {
-                            format!(
-                                "Đang tải qua Aria2c luồng {}/{} ({}/{})",
-                                pass_index + 1,
-                                expected_passes,
-                                aria_p.downloaded,
-                                aria_p.total
-                            )
-                        } else {
-                            format!(
-                                "Đang tải qua Aria2c ({}/{})",
-                                aria_p.downloaded, aria_p.total
-                            )
-                        };
-
-                        progress_emit(DownloadProgressPayload {
-                            id: task_id.clone(),
-                            percent: overall_percent,
-                            speed: aria_p.speed,
-                            eta: aria_p.eta,
-                            status: "downloading".to_string(),
-                            phase,
-                            file_path: None,
-                            message: None,
-                            is_indeterminate: false,
-                        });
-                        continue;
-                    }
-
-                    if let Some(n) = Self::parse_expected_passes(&formats_regex, &line) {
-                        expected_passes = n;
-                        pass_index = 0;
-                        continue;
-                    }
-
-                    if let Some(rest) = line.strip_prefix("[download] Destination: ") {
-                        let path_str = rest.trim().trim_matches('"').to_string();
-                        Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
-                        if opts.use_aria2c && downloaded_file_path.is_some() && pass_index + 1 < expected_passes {
-                            pass_index += 1;
-                        }
-                        downloaded_file_path = Some(path_str);
-                        continue;
-                    }
-
-                    if let Some(rest) = line.strip_prefix("[ExtractAudio] Destination: ") {
-                        let path_str = rest.trim().trim_matches('"').to_string();
-                        Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
-                        downloaded_file_path = Some(path_str);
-                        continue;
-                    }
-
-                    if let Some(rest) = line.strip_prefix("[Merger] Merging formats into ") {
-                        let path_str = rest.trim().trim_matches('"').to_string();
-                        Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
-                        downloaded_file_path = Some(path_str);
-                        overall_percent = overall_percent.max(DOWNLOAD_SHARE);
-                        progress_emit(DownloadProgressPayload {
-                            id: task_id.clone(),
-                            percent: overall_percent,
-                            speed: String::new(),
-                            eta: String::new(),
-                            status: "processing".to_string(),
-                            phase: "Đang ghép hình và tiếng qua FFmpeg...".to_string(),
-                            file_path: None,
-                            message: None,
-                            is_indeterminate: false,
-                        });
-                        continue;
-                    }
-
-                    // Các bước hậu xử lý còn lại — báo đúng trạng thái thay vì đoán theo %
-                    if let Some(phase) = Self::postprocess_phase(&line) {
-                        overall_percent = overall_percent.max(DOWNLOAD_SHARE);
-                        progress_emit(DownloadProgressPayload {
-                            id: task_id.clone(),
-                            percent: overall_percent,
-                            speed: String::new(),
-                            eta: String::new(),
-                            status: "processing".to_string(),
-                            phase: phase.to_string(),
-                            file_path: None,
-                            message: None,
-                            is_indeterminate: false,
-                        });
-                        continue;
-                    }
-
-                    if line.contains("Writing video thumbnail")
-                        || line.contains("Writing video subtitles to:")
-                        || line.contains("[Thumbnails] Writing thumbnail to:")
-                    {
-                        if let Some(path) = Self::path_after_to(&line) {
-                            Self::record_file_path(&task_id, PathBuf::from(&path)).await;
-                            downloaded_file_path = Some(path);
-                        }
-                        continue;
-                    }
-
-                    if let Some(converted) = Self::converted_thumbnail_path(&line) {
-                        Self::record_file_path(&task_id, converted.clone()).await;
-                        downloaded_file_path = Some(converted.to_string_lossy().to_string());
-                        continue;
-                    }
-
-                    // Dòng trần còn lại là kết quả của `--print after_move:filepath`,
-                    // tức đường dẫn cuối cùng sau khi đã merge/remux xong.
-                    let candidate = line.trim().trim_matches('"');
-                    if !candidate.is_empty() && Path::new(candidate).is_absolute() {
-                        Self::record_file_path(&task_id, PathBuf::from(candidate)).await;
-                        printed_final_path = Some(candidate.to_string());
-                    }
-                }
-            }
-        }
-
-        let status = if is_cancelled {
-            None
-        } else {
-            tokio::select! {
-                _ = &mut cancel_rx => {
-                    is_cancelled = true;
-                    None
-                }
-                res = child.wait() => Some(res),
-            }
-        };
-        let status = match status {
-            Some(Err(e)) => {
-                Self::unregister_task(&task_id).await;
-                return Err(format!("Lỗi chờ yt-dlp: {e}"));
-            }
-            Some(Ok(st)) => Some(st),
-            None => None,
-        };
-
-        if is_cancelled {
-            info!("Hủy tác vụ tải yt-dlp [{task_id}], dừng tiến trình và xoá sạch tệp dở dang...");
-            if let Some(pid) = child.id() {
-                kill_process_tree(pid);
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = stderr_task.await;
-
-            let mut known = Vec::new();
-            // Đọc nốt stdout còn trong ống: dòng "Destination:" của tệp đang tải có
-            // thể chưa kịp xử lý lúc bấm Huỷ. Không quét mù mọi .part trong thư mục
-            // nữa vì sẽ xoá nhầm tệp của lượt tải song song khác.
-            let drain = async {
-                while let Ok(Some(l)) = reader.next_line().await {
-                    if let Some(rest) = l.strip_prefix("[download] Destination: ") {
-                        known.push(PathBuf::from(rest.trim().trim_matches('"')));
-                    }
+            info!("Bắt đầu tải tệp với yt-dlp [{task_id}]: {}", opts.url);
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    Self::unregister_task(&task_id).await;
+                    return Err(format!("Không thể khởi chạy yt-dlp: {e}"));
                 }
             };
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
-            if let Some(ref p) = downloaded_file_path {
-                known.push(PathBuf::from(p));
-            }
-            if let Some(ref p) = printed_final_path {
-                known.push(PathBuf::from(p));
-            }
-            cleanup_task_files(Some(&dest_folder), &known, &[], start_time);
 
-            progress_emit(DownloadProgressPayload {
-                id: task_id.clone(),
-                percent: 0.0,
-                speed: String::new(),
-                eta: String::new(),
-                status: "cancelled".to_string(),
-                phase: "Đã hủy tải xuống".to_string(),
-                file_path: None,
-                message: Some("Đã hủy tải xuống và xoá sạch tệp dở dang".to_string()),
-                is_indeterminate: false,
+            let child_pid = child.id();
+            if let Some(pid) = child_pid {
+                Self::register_pid(&task_id, pid).await;
+            }
+
+            let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+                let _ = child.kill().await;
+                Self::unregister_task(&task_id).await;
+                return Err("Không thể đọc đầu ra của yt-dlp".to_string());
+            };
+
+            // stderr PHẢI được đọc song song. Trước đây ống stderr được mở nhưng không
+            // ai đọc: yt-dlp ghi đầy bộ đệm ~64KB rồi bị chặn vĩnh viễn — đây là
+            // nguyên nhân các luồng tải "đứng hình" và cuối cùng báo lỗi.
+            let stderr_lines: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+            let stderr_sink = Arc::clone(&stderr_lines);
+            let stderr_task = tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let trimmed = line.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let mut buf = stderr_sink.lock().await;
+                    // Chỉ giữ phần cuối để thông báo lỗi ngắn gọn và không phình bộ nhớ
+                    if buf.len() >= 60 {
+                        buf.remove(0);
+                    }
+                    buf.push(trimmed);
+                }
             });
 
-            db.record_download_history(
-                &opts.device_id,
-                opts.title.as_deref().unwrap_or("Untitled"),
-                "cancelled_download",
-                &history_platform,
-                None,
-                None,
-                "cancelled",
-                Some("Người dùng đã hủy tải xuống"),
-                opts.client_ip.as_deref(),
-            ).await;
+            let mut reader = BufReader::new(stdout).lines();
 
-            Self::unregister_task(&task_id).await;
-            return Err("Tác vụ tải đã bị hủy".to_string());
-        }
+            // Phần trăm chỉ đi tiến, không bao giờ lùi: trước đây mỗi luồng (video rồi
+            // audio) đều chạy 0→100% nên thanh tiến trình tụt về 0 giữa chừng.
+            let mut overall_percent = 0.0_f64;
+            let mut expected_passes = 1usize;
+            let mut pass_index = 0usize;
+            let mut current_format: Option<String> = None;
+            let mut downloaded_file_path: Option<String> = None;
+            let mut printed_final_path: Option<String> = None;
+            let mut is_cancelled = false;
+            let mut last_progress_emit: Option<std::time::Instant> = None;
+            let mut last_emitted_pass = usize::MAX;
 
-        let status = status.unwrap();
-        let _ = stderr_task.await;
-        let collected_stderr = stderr_lines.lock().await.clone();
+            loop {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        info!("Nhận được lệnh hủy tác vụ yt-dlp [{task_id}]");
+                        is_cancelled = true;
+                        break;
+                    }
+                    line_res = reader.next_line() => {
+                        let line = match line_res {
+                            Ok(Some(l)) => l,
+                            Ok(None) => break,
+                            Err(e) => {
+                                warn!("Lỗi đọc stdout của yt-dlp: {e}");
+                                break;
+                            }
+                        };
+
+                        if let Some(rest) = line.strip_prefix("download-progress:") {
+                            let p = Self::parse_ytdlp_progress(rest);
+
+                            // Đổi format_id nghĩa là yt-dlp đã chuyển sang lượt tải kế tiếp
+                            if !p.format_id.is_empty() {
+                                match current_format {
+                                    Some(ref f) if f == &p.format_id => {}
+                                    Some(_) => {
+                                        pass_index = (pass_index + 1).min(expected_passes.saturating_sub(1));
+                                        current_format = Some(p.format_id.clone());
+                                    }
+                                    None => current_format = Some(p.format_id.clone()),
+                                }
+                            }
+
+                            // Máy chủ không báo dung lượng (thiếu Content-Length) thì yt-dlp vẫn
+                            // in "0.0%" suốt lượt tải nên thanh tiến trình đứng im ở 0; nay báo
+                            // UI chạy dạng "chưa rõ tiến độ".
+                            let percent_known = p.percent.is_some();
+                            let pass_percent = p.percent.unwrap_or(0.0);
+
+                            let raw = Self::weighted_percent(pass_index, expected_passes, pass_percent);
+                            overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
+
+                            let due = last_progress_emit
+                                .map(|t| t.elapsed() >= PROGRESS_EMIT_INTERVAL)
+                                .unwrap_or(true);
+                            if !due && pass_percent < 100.0 && last_emitted_pass == pass_index {
+                                continue;
+                            }
+                            last_progress_emit = Some(std::time::Instant::now());
+                            last_emitted_pass = pass_index;
+
+                            let mut phase = if expected_passes > 1 {
+                                format!("Đang tải luồng {}/{}", pass_index + 1, expected_passes)
+                            } else {
+                                "Đang tải dữ liệu".to_string()
+                            };
+                            // Không có phần trăm thì ít nhất cho thấy dữ liệu vẫn đang về
+                            if !percent_known && !p.downloaded.is_empty() {
+                                phase = format!("{phase} (đã nhận {})", p.downloaded);
+                            }
+
+                            progress_emit(DownloadProgressPayload {
+                                id: task_id.clone(),
+                                percent: overall_percent,
+                                speed: p.speed,
+                                eta: p.eta,
+                                status: "downloading".to_string(),
+                                phase,
+                                file_path: None,
+                                message: None,
+                                is_indeterminate: !percent_known,
+                            });
+                            continue;
+                        }
+
+                        // Bắt và parse output tiến trình của aria2c nếu có
+                        if let Some(aria_p) = Self::parse_aria2c_progress(&aria2c_regex, &line) {
+                            let raw = Self::weighted_percent(pass_index, expected_passes, aria_p.percent);
+                            overall_percent = overall_percent.max(raw).clamp(0.0, DOWNLOAD_SHARE);
+
+                            let phase = if expected_passes > 1 {
+                                format!(
+                                    "Đang tải qua Aria2c luồng {}/{} ({}/{})",
+                                    pass_index + 1,
+                                    expected_passes,
+                                    aria_p.downloaded,
+                                    aria_p.total
+                                )
+                            } else {
+                                format!(
+                                    "Đang tải qua Aria2c ({}/{})",
+                                    aria_p.downloaded, aria_p.total
+                                )
+                            };
+
+                            progress_emit(DownloadProgressPayload {
+                                id: task_id.clone(),
+                                percent: overall_percent,
+                                speed: aria_p.speed,
+                                eta: aria_p.eta,
+                                status: "downloading".to_string(),
+                                phase,
+                                file_path: None,
+                                message: None,
+                                is_indeterminate: false,
+                            });
+                            continue;
+                        }
+
+                        if let Some(n) = Self::parse_expected_passes(&formats_regex, &line) {
+                            expected_passes = n;
+                            pass_index = 0;
+                            continue;
+                        }
+
+                        if let Some(rest) = line.strip_prefix("[download] Destination: ") {
+                            let path_str = rest.trim().trim_matches('"').to_string();
+                            Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
+                            if opts.use_aria2c && downloaded_file_path.is_some() && pass_index + 1 < expected_passes {
+                                pass_index += 1;
+                            }
+                            downloaded_file_path = Some(path_str);
+                            continue;
+                        }
+
+                        if let Some(rest) = line.strip_prefix("[ExtractAudio] Destination: ") {
+                            let path_str = rest.trim().trim_matches('"').to_string();
+                            Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
+                            downloaded_file_path = Some(path_str);
+                            continue;
+                        }
+
+                        if let Some(rest) = line.strip_prefix("[Merger] Merging formats into ") {
+                            let path_str = rest.trim().trim_matches('"').to_string();
+                            Self::record_file_path(&task_id, PathBuf::from(&path_str)).await;
+                            downloaded_file_path = Some(path_str);
+                            overall_percent = overall_percent.max(DOWNLOAD_SHARE);
+                            progress_emit(DownloadProgressPayload {
+                                id: task_id.clone(),
+                                percent: overall_percent,
+                                speed: String::new(),
+                                eta: String::new(),
+                                status: "processing".to_string(),
+                                phase: "Đang ghép hình và tiếng qua FFmpeg...".to_string(),
+                                file_path: None,
+                                message: None,
+                                is_indeterminate: false,
+                            });
+                            continue;
+                        }
+
+                        // Các bước hậu xử lý còn lại — báo đúng trạng thái thay vì đoán theo %
+                        if let Some(phase) = Self::postprocess_phase(&line) {
+                            overall_percent = overall_percent.max(DOWNLOAD_SHARE);
+                            progress_emit(DownloadProgressPayload {
+                                id: task_id.clone(),
+                                percent: overall_percent,
+                                speed: String::new(),
+                                eta: String::new(),
+                                status: "processing".to_string(),
+                                phase: phase.to_string(),
+                                file_path: None,
+                                message: None,
+                                is_indeterminate: false,
+                            });
+                            continue;
+                        }
+
+                        if line.contains("Writing video thumbnail")
+                            || line.contains("Writing video subtitles to:")
+                            || line.contains("[Thumbnails] Writing thumbnail to:")
+                        {
+                            if let Some(path) = Self::path_after_to(&line) {
+                                Self::record_file_path(&task_id, PathBuf::from(&path)).await;
+                                downloaded_file_path = Some(path);
+                            }
+                            continue;
+                        }
+
+                        if let Some(converted) = Self::converted_thumbnail_path(&line) {
+                            Self::record_file_path(&task_id, converted.clone()).await;
+                            downloaded_file_path = Some(converted.to_string_lossy().to_string());
+                            continue;
+                        }
+
+                        // Dòng trần còn lại là kết quả của `--print after_move:filepath`,
+                        // tức đường dẫn cuối cùng sau khi đã merge/remux xong.
+                        let candidate = line.trim().trim_matches('"');
+                        if !candidate.is_empty() && Path::new(candidate).is_absolute() {
+                            Self::record_file_path(&task_id, PathBuf::from(candidate)).await;
+                            printed_final_path = Some(candidate.to_string());
+                        }
+                    }
+                }
+            }
+
+            let status = if is_cancelled {
+                None
+            } else {
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        is_cancelled = true;
+                        None
+                    }
+                    res = child.wait() => Some(res),
+                }
+            };
+            let status = match status {
+                Some(Err(e)) => {
+                    Self::unregister_task(&task_id).await;
+                    return Err(format!("Lỗi chờ yt-dlp: {e}"));
+                }
+                Some(Ok(st)) => Some(st),
+                None => None,
+            };
+
+            if is_cancelled {
+                info!("Hủy tác vụ tải yt-dlp [{task_id}], dừng tiến trình và xoá sạch tệp dở dang...");
+                if let Some(pid) = child.id() {
+                    kill_process_tree(pid);
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stderr_task.await;
+
+                let mut known = Vec::new();
+                // Đọc nốt stdout còn trong ống: dòng "Destination:" của tệp đang tải có
+                // thể chưa kịp xử lý lúc bấm Huỷ. Không quét mù mọi .part trong thư mục
+                // nữa vì sẽ xoá nhầm tệp của lượt tải song song khác.
+                let drain = async {
+                    while let Ok(Some(l)) = reader.next_line().await {
+                        if let Some(rest) = l.strip_prefix("[download] Destination: ") {
+                            known.push(PathBuf::from(rest.trim().trim_matches('"')));
+                        }
+                    }
+                };
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
+                if let Some(ref p) = downloaded_file_path {
+                    known.push(PathBuf::from(p));
+                }
+                if let Some(ref p) = printed_final_path {
+                    known.push(PathBuf::from(p));
+                }
+                cleanup_task_files(Some(&dest_folder), &known, &[], start_time);
+
+                progress_emit(DownloadProgressPayload {
+                    id: task_id.clone(),
+                    percent: 0.0,
+                    speed: String::new(),
+                    eta: String::new(),
+                    status: "cancelled".to_string(),
+                    phase: "Đã hủy tải xuống".to_string(),
+                    file_path: None,
+                    message: Some("Đã hủy tải xuống và xoá sạch tệp dở dang".to_string()),
+                    is_indeterminate: false,
+                });
+
+                db.record_download_history(
+                    &opts.device_id,
+                    opts.title.as_deref().unwrap_or("Untitled"),
+                    "cancelled_download",
+                    &history_platform,
+                    None,
+                    None,
+                    "cancelled",
+                    Some("Người dùng đã hủy tải xuống"),
+                    opts.client_ip.as_deref(),
+                ).await;
+
+                Self::unregister_task(&task_id).await;
+                return Err("Tác vụ tải đã bị hủy".to_string());
+            }
+
+            let status = status.expect("đã xử lý trường hợp huỷ ở trên");
+            let _ = stderr_task.await;
+            let collected_stderr = stderr_lines.lock().await.clone();
+
+            if !status.success()
+                && matches!(cookies, CookieArg::Browser(_))
+                && Self::is_browser_cookie_failure(&collected_stderr)
+            {
+                warn!(
+                    "[{task_id}] yt-dlp không đọc được cookie trình duyệt ({}) — thử lại không dùng cookie",
+                    collected_stderr.last().map(String::as_str).unwrap_or("")
+                );
+                progress_emit(DownloadProgressPayload::new(
+                    &task_id,
+                    0.0,
+                    "preparing",
+                    "Không đọc được cookie của trình duyệt — đang thử lại không dùng cookie...",
+                ));
+                // Tiến trình cũ đã thoát: gỡ PID của nó để lệnh Huỷ sau này không kill
+                // nhầm một tiến trình khác được hệ điều hành cấp lại đúng PID đó.
+                if let Some(pid) = child_pid {
+                    Self::unregister_pid(&task_id, pid).await;
+                }
+                cookies = CookieArg::None;
+                continue;
+            }
+
+            break (status, collected_stderr, downloaded_file_path, printed_final_path, overall_percent);
+        };
 
         let media_file_exists = printed_final_path
             .as_deref()
@@ -1677,6 +1783,15 @@ impl DownloaderService {
         };
 
         let lower = raw.to_lowercase();
+        // Lỗi ĐỌC cookie của trình duyệt (chứ không phải nội dung cần đăng nhập): trước
+        // đây rơi vào nhánh "cookies" bên dưới và bảo người dùng đi dán cookie.
+        if Self::is_browser_cookie_failure(std::slice::from_ref(&raw)) {
+            return format!(
+                "Không đọc được cookie từ trình duyệt đã chọn. Hãy chọn đúng trình duyệt bạn đang \
+                 đăng nhập ở mục \"Cookies\" trên thanh trên cùng, đóng trình duyệt đó rồi thử lại, \
+                 hoặc chọn \"Tắt Cookies\". (Chi tiết: {raw})"
+            );
+        }
         if lower.contains("login") || lower.contains("sign in") || lower.contains("cookies")
             || lower.contains("private") || lower.contains("403") || lower.contains("401")
         {
@@ -4495,6 +4610,80 @@ mod tests {
         assert_eq!(kept, renamed, "đã có đuôi media thì giữ nguyên");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lỗi ĐỌC cookie trình duyệt phải được nhận ra (để thử lại không cookie) và không
+    /// bị báo nhầm thành "nội dung cần đăng nhập".
+    #[test]
+    fn browser_cookie_failures_are_told_apart_from_login_errors() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for msg in [
+            "ERROR: could not find vivaldi cookies database in \"/home/u/.config/vivaldi\"",
+            "ERROR: Could not copy Chrome cookie database. See  https://github.com/yt-dlp/yt-dlp/issues/7271  for more info",
+            "ERROR: Failed to decrypt with DPAPI. See  https://github.com/yt-dlp/yt-dlp/issues/10927  for more info",
+            "ERROR: could not find firefox cookies database in /home/u/.mozilla/firefox",
+        ] {
+            assert!(D::is_browser_cookie_failure(&lines(&[msg])), "phải nhận ra: {msg}");
+            let summary = D::summarize_ytdlp_error(&lines(&[msg]));
+            assert!(summary.contains("Không đọc được cookie từ trình duyệt"), "{summary}");
+        }
+        assert!(!D::is_browser_cookie_failure(&lines(&[
+            "ERROR: [youtube] abc: Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication.",
+        ])));
+        assert!(!D::is_browser_cookie_failure(&lines(&["ERROR: [instagram] x: login required"])));
+    }
+
+    #[test]
+    fn ytdlp_command_only_carries_the_requested_optional_flags() {
+        let args_of = |cmd: &tokio::process::Command| -> Vec<String> {
+            cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect()
+        };
+        let opts = super::DownloadOptions {
+            url: "https://example.com/v".to_string(),
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir();
+        let ytdlp = std::path::Path::new("/usr/bin/true");
+
+        let plain = args_of(&D::build_ytdlp_command(ytdlp, &dir, &opts, None, &super::CookieArg::None));
+        assert!(!plain.iter().any(|a| a == "--js-runtimes"), "yt-dlp cũ không hiểu --js-runtimes");
+        assert!(!plain.iter().any(|a| a.starts_with("--cookies")));
+
+        let full = args_of(&D::build_ytdlp_command(
+            ytdlp,
+            &dir,
+            &opts,
+            Some("node:/usr/bin/node"),
+            &super::CookieArg::Browser("firefox".to_string()),
+        ));
+        let pos = full.iter().position(|a| a == "--js-runtimes").expect("thiếu --js-runtimes");
+        assert_eq!(full[pos + 1], "node:/usr/bin/node");
+        let pos = full.iter().position(|a| a == "--cookies-from-browser").expect("thiếu cookie trình duyệt");
+        assert_eq!(full[pos + 1], "firefox");
+    }
+
+    /// Đối chiếu với stderr THẬT của yt-dlp: trình duyệt không có kho cookie phải được
+    /// nhận ra để lượt tải được thử lại không dùng cookie.
+    #[tokio::test]
+    async fn real_ytdlp_cookie_store_error_is_recognised() {
+        let Some(ytdlp) = crate::binary_manager::BinaryManager::find_binary("yt-dlp") else {
+            return;
+        };
+        let out = tokio::process::Command::new(ytdlp)
+            .args([
+                "--cookies-from-browser",
+                "firefox:/khong/ton/tai/profile",
+                "--skip-download",
+                "--print",
+                "id",
+                "https://example.invalid/video",
+            ])
+            .output()
+            .await
+            .expect("chạy được yt-dlp");
+        let stderr: Vec<String> = String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
+        assert!(!out.status.success());
+        assert!(D::is_browser_cookie_failure(&stderr), "stderr: {stderr:?}");
     }
 
     #[test]
