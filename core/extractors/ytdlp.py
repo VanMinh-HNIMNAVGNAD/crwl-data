@@ -34,7 +34,15 @@ class PlaylistUrlError(RuntimeError):
     "thành công" một album giả chỉ có ảnh bìa. Playlist nhỏ thì UI hiện thông tin
     video đầu tiên nhưng bấm tải lại kéo về cả danh sách. Dispatcher phải ném lỗi
     này thẳng ra ngoài, không thử engine khác.
+
+    `entry_urls`: URL các mục yt-dlp liệt kê. Một bài viết nhúng 2 video YouTube cũng bị
+    yt-dlp coi là "danh sách" — các mục khi đó trỏ sang tên miền KHÁC trang gốc, nhờ
+    vậy dispatcher phân biệt được với playlist/kênh thật.
     """
+
+    def __init__(self, message: str, entry_urls: Optional[List[str]] = None):
+        super().__init__(message)
+        self.entry_urls = list(entry_urls or [])
 
 
 class YtDlpExtractor(BaseExtractor):
@@ -184,9 +192,32 @@ class YtDlpExtractor(BaseExtractor):
         # Mục "phẳng" (chỉ là liên kết tới video khác) chỉ xuất hiện khi URL là một
         # danh sách — xem chú thích của PlaylistUrlError.
         if raw_data.get("_type") in ("url", "url_transparent"):
-            raise PlaylistUrlError(self._playlist_message(raw_data, stdout))
+            raise PlaylistUrlError(self._playlist_message(raw_data, stdout), self._entry_urls(stdout))
 
-        return self._normalize_metadata(raw_data, url)
+        meta = self._normalize_metadata(raw_data, url)
+        meta.extractor_key = str(raw_data.get("extractor_key") or raw_data.get("extractor") or "") or None
+        meta.webpage_url = raw_data.get("webpage_url") if isinstance(raw_data.get("webpage_url"), str) else None
+        count = raw_data.get("playlist_count") or raw_data.get("n_entries")
+        meta.page_video_count = count if isinstance(count, int) and count > 0 else None
+        return meta
+
+    @staticmethod
+    def _entry_urls(stdout: str, limit: int = 50) -> List[str]:
+        urls: List[str] = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            value = entry.get("url") or entry.get("webpage_url")
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                urls.append(value)
+            if len(urls) >= limit:
+                break
+        return urls
 
     @staticmethod
     def _playlist_message(entry: Dict[str, Any], stdout: str) -> str:

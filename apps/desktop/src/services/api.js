@@ -466,10 +466,18 @@ export async function deletePlatformCookies(platform = null) {
 // nên URL CDN được dùng trực tiếp, không cần biến đổi gì ở phía JS.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Cookie cho bước tải tệp (curl): cùng trình duyệt với bước bóc tách. Tệp nằm sau
+// đăng nhập (tệp đính kèm diễn đàn, CDN dùng cookie ký) cần cookie mới tải được.
+// Không chọn trình duyệt nào = "auto" như khi bóc tách; "none" = không dùng cookie.
+function downloadCookieBrowser(browser) {
+  const target = browser !== null && browser !== undefined ? browser : getActiveBrowser()
+  return target === 'none' ? 'none' : target || 'auto'
+}
+
 /**
  * Tải một tệp ảnh trực tiếp về thư mục Downloads với header chống chặn 403
  */
-export async function downloadDirectFile({ url, filename, referer, destDir, taskId = null, platform = null }) {
+export async function downloadDirectFile({ url, filename, referer, destDir, taskId = null, platform = null, browser = null }) {
   const customDir = destDir || null
 
   try {
@@ -481,6 +489,7 @@ export async function downloadDirectFile({ url, filename, referer, destDir, task
       deviceId: getDeviceId(),
       taskId: taskId || null,
       platform: platform || null,
+      browser: downloadCookieBrowser(browser),
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải tệp', { cause: err })
@@ -495,7 +504,7 @@ export async function downloadDirectFile({ url, filename, referer, destDir, task
  *   bước nối tiếp (tải ảnh → tải video → nén ZIP) cùng thao tác trên đúng một
  *   thư mục. Bỏ trống thì backend cấp phát thư mục mới, sạch.
  */
-export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, albumDir = null, asZip = false, taskId = null, platform = null }) {
+export async function downloadAlbumBatch({ items, albumName = 'Album_Media', destDir, albumDir = null, asZip = false, taskId = null, platform = null, browser = null }) {
   const customDir = destDir || null
 
   try {
@@ -508,6 +517,7 @@ export async function downloadAlbumBatch({ items, albumName = 'Album_Media', des
       deviceId: getDeviceId(),
       taskId: taskId || null,
       platform: platform || null,
+      browser: downloadCookieBrowser(browser),
     })
   } catch (err) {
     throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi tải album', { cause: err })

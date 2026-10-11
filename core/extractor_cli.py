@@ -40,6 +40,7 @@ from core.cancellation import (
     cancel_request,
     end_request,
 )
+from core.cookies.browser_cookies import export_cookies_for_domains
 from core.dispatcher import MediaDispatcher
 from core.resolver.url_resolver import UrlResolver
 
@@ -51,6 +52,11 @@ _STDOUT_LOCK = threading.Lock()
 # yt-dlp/gallery-dl riêng nên cần chặn trên để không làm nghẽn máy.
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("CRWL_MAX_WORKERS", "4"))
 
+# Yêu cầu ngắn mà người dùng đang chờ trực tiếp (giải mã link rút gọn khi gõ, cookie
+# cho lượt tải vừa bấm) chạy ở hàng đợi riêng: nếu xếp chung với 4 lượt bóc tách dài
+# (mỗi lượt tới vài phút), bấm "Tải" phải chờ cả phút mới bắt đầu.
+QUICK_ACTIONS = frozenset({"resolve", "cookies"})
+
 
 def output_json(data: dict, pretty: bool = False) -> None:
     indent = 2 if pretty else None
@@ -60,11 +66,19 @@ def output_json(data: dict, pretty: bool = False) -> None:
         sys.stdout.flush()
 
 
+def _ipc_id(value):
+    """Mã request dùng làm khoá trong sổ huỷ: phải hash được (Rust luôn gửi chuỗi)."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
 def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict) -> dict:
     """Xử lý một request IPC, luôn trả về dict response (không ném exception)."""
-    req_id = req.get("id")
-    action = (req.get("action") or "extract").lower()
-    url = (req.get("url") or "").strip()
+    req_id = _ipc_id(req.get("id"))
+    action = str(req.get("action") or "extract").lower()
+    url = req.get("url")
+    url = url.strip() if isinstance(url, str) else ""
 
     if not url:
         return {"id": req_id, "success": False, "error": "Missing 'url' parameter"}
@@ -99,6 +113,13 @@ def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict
             expected = req.get("expected") or req.get("expectedPlatform")
             res = resolver.resolve_url(url, expected_platform=expected)
             return {"id": req_id, "success": True, "data": res.to_dict()}
+
+        if action == "cookies":
+            # Tệp cookie tạm cho bước tải bằng curl (Rust xoá sau khi tải xong)
+            domains = req.get("domains")
+            domains = [d for d in domains if isinstance(d, str)] if isinstance(domains, list) else [url]
+            path, count = export_cookies_for_domains(domains, req.get("browser"))
+            return {"id": req_id, "success": True, "data": {"path": path, "count": count}}
 
         return {"id": req_id, "success": False, "error": f"Unknown action: '{action}'"}
     except RequestTimedOut:
@@ -142,6 +163,7 @@ def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None
         max_workers=MAX_CONCURRENT_REQUESTS,
         thread_name_prefix="crwl-req",
     )
+    quick_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="crwl-quick")
 
     def process(raw_req: dict) -> None:
         # Luôn phải trả lời: một request rơi mất (lỗi ngoài handle_request, dữ liệu
@@ -149,9 +171,13 @@ def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None
         try:
             output_json(handle_request(dispatcher, resolver, raw_req))
         except BaseException as e:  # noqa: BLE001 — luồng pool, không được chết im lặng
-            sys.stderr.write(f"[Sidecar:ERROR] Không gửi được phản hồi cho {raw_req.get('id')}: {e}\n")
+            req_id = _ipc_id(raw_req.get("id"))
+            sys.stderr.write(f"[Sidecar:ERROR] Không gửi được phản hồi cho {req_id}: {e}\n")
             sys.stderr.flush()
-            output_json({"id": raw_req.get("id"), "success": False, "error": f"Lỗi nội bộ engine bóc tách: {e}"})
+            try:
+                output_json({"id": req_id, "success": False, "error": f"Lỗi nội bộ engine bóc tách: {e}"})
+            except Exception:
+                pass  # stdout đã đóng (Rust thoát) — không còn ai để báo
 
     try:
         for line in sys.stdin:
@@ -161,14 +187,21 @@ def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None
 
             try:
                 req = json.loads(line)
-            except json.JSONDecodeError as e:
+            except (json.JSONDecodeError, RecursionError) as e:
                 output_json({"success": False, "error": f"Invalid JSON input: {e}"})
+                continue
+
+            # Một dòng JSON hợp lệ nhưng không phải object (mảng, chuỗi, số) hay có
+            # "action" không phải chuỗi từng làm vòng đọc ném AttributeError → CẢ engine
+            # thoát, mọi request đang chờ phía sau mất phản hồi.
+            if not isinstance(req, dict):
+                output_json({"success": False, "error": "Yêu cầu IPC phải là một JSON object"})
                 continue
 
             # Lệnh huỷ phải xử lý NGAY tại vòng đọc. Nếu đẩy vào pool, nó sẽ xếp
             # hàng sau đúng những request đang bận mà nó cần huỷ → không bao giờ chạy.
-            if (req.get("action") or "").lower() == "cancel":
-                target = (req.get("target") or req.get("target_id") or "").strip()
+            if str(req.get("action") or "").lower() == "cancel":
+                target = str(req.get("target") or req.get("target_id") or "").strip()
                 killed = cancel_request(target) if target else 0
                 sys.stderr.write(f"[Sidecar] Huỷ request '{target}': đã kill {killed} tiến trình con\n")
                 sys.stderr.flush()
@@ -179,9 +212,11 @@ def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None
                 })
                 continue
 
-            pool.submit(process, req)
+            action = str(req.get("action") or "extract").lower()
+            (quick_pool if action in QUICK_ACTIONS else pool).submit(process, req)
     finally:
         pool.shutdown(wait=True)
+        quick_pool.shutdown(wait=True)
 
 
 def main() -> None:

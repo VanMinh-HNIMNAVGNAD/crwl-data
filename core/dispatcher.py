@@ -7,7 +7,7 @@ Ported from MediaDispatcherService into standalone Python.
 
 import re
 from typing import Optional, Dict, Any, List
-from .models import MediaMetadata, ProfileCrawlResult, ResolveUrlResult, StreamFormat
+from .models import MediaImage, MediaMetadata, ProfileCrawlResult, ResolveUrlResult, StreamFormat
 from .resolver.url_resolver import UrlResolver
 from .extractors.base import BaseExtractor
 from .extractors.ytdlp import PlaylistUrlError, YtDlpExtractor
@@ -16,8 +16,10 @@ from .extractors.tiktok import TikTokExtractor
 from .extractors.movie import MovieExtractor
 from .extractors.direct import DirectImageExtractor
 from .extractors.web_scraper import WebScraperExtractor
+from .extractors.page_media import PageMediaExtractor, NoPostMediaError, describe_media
 from .extractors.stream_sniffer import get_sniffer
 from .extractors.story import StoryExtractor
+from .cookies.browser_cookies import registrable_domain
 
 
 class MediaDispatcher(BaseExtractor):
@@ -34,6 +36,8 @@ class MediaDispatcher(BaseExtractor):
         self.web_scraper = WebScraperExtractor()
         self.story = StoryExtractor()
         self.sniffer = get_sniffer()  # Playwright-based stream sniffer (lazy)
+        # Lấy hết ảnh/video của bài viết trên trang bất kỳ (dùng chung Chromium của sniffer)
+        self.page_media = PageMediaExtractor(self.sniffer)
 
     # ─────────────────────────────────────────────────────────────────────────
     # URL Classification
@@ -365,24 +369,50 @@ class MediaDispatcher(BaseExtractor):
                 except PlaylistUrlError:
                     raise
                 except Exception as yt_err:
-                    self.warn(f"yt-dlp thất bại ({yt_err}), web_scraper fallback...")
+                    self.warn(f"yt-dlp thất bại ({yt_err}), đọc trực tiếp ảnh/video của bài viết...")
+                    # Trước đây chỉ còn web_scraper: với trang mạng xã hội nó chỉ thấy ảnh
+                    # og:image (thẻ chia sẻ) nên trả về một "album" 1 ảnh giả. Nay mở trang
+                    # (kèm cookie đăng nhập) và lấy media trong chính bài viết.
+                    try:
+                        res = self.page_media.extract(
+                            target_url, browser=browser, platform=self._platform_id(target_url)
+                        )
+                        return self._enhance_metadata(res, target_url)
+                    except Exception as page_err:
+                        self.warn(f"Không đọc được media của bài viết: {page_err}")
                     try:
                         res = self.web_scraper.extract(target_url)
                         return self._enhance_metadata(res, target_url)
                     except Exception:
                         raise RuntimeError(str(gal_err) or str(yt_err) or "Không thể trích xuất nội dung từ liên kết này")
 
-        # 7. URL không rõ -> yt-dlp -> gallery-dl -> web_scraper -> Playwright sniffer
+        # 7. URL không rõ -> yt-dlp -> gallery-dl -> media của bài viết -> Playwright sniffer
+        #
+        # "Trang web bất kỳ" thường là MỘT BÀI VIẾT có nhiều ảnh và/hoặc video. Trước đây:
+        # bài chỉ có ảnh → "Không tìm được nguồn video"; bài nhiều video → chỉ video đầu;
+        # bài nhúng 1 video YouTube + 10 ảnh → chỉ video YouTube; bài nhúng 2 video →
+        # lỗi "đây là danh sách". Nay yt-dlp chỉ được giữ nguyên kết quả khi chính trang
+        # là trang video của một nền tảng nó hỗ trợ; còn lại lấy toàn bộ media của bài.
         yt_err: Optional[Exception] = movie_err
         if movie_err is None:
             try:
                 self.log(f"URL không xác định -> yt-dlp first: {target_url}")
                 res = self.ytdlp.extract_metadata(target_url, browser=browser)
-                return self._enhance_metadata(res, target_url)
-            except PlaylistUrlError:
+                whole_post = self._whole_post_media(target_url, res, browser)
+                return self._enhance_metadata(whole_post or res, target_url)
+            except PlaylistUrlError as pl_err:
                 # Trang nhiều video / playlist của site yt-dlp hỗ trợ: báo đúng thay vì để
                 # web_scraper/Playwright vớt đại một ảnh hay một luồng trên trang.
+                # Ngoại lệ: các mục trỏ sang tên miền KHÁC — đó là bài viết nhúng nhiều
+                # video (YouTube, Vimeo...), cần lấy cả bài.
                 # (Trang phim đã qua bước 4 — ở đó vẫn để sniffer thử tìm luồng thật.)
+                if self._is_embedded_video_list(target_url, pl_err):
+                    self.log("Danh sách video là các video NHÚNG trong bài viết → lấy cả bài")
+                    try:
+                        res = self.page_media.extract(target_url, browser=browser)
+                        return self._enhance_metadata(res, target_url)
+                    except Exception as page_err:
+                        self.warn(f"Không đọc được media của bài viết: {page_err}")
                 raise
             except Exception as e:
                 yt_err = e
@@ -392,19 +422,22 @@ class MediaDispatcher(BaseExtractor):
             self._fill_video_posters(res, target_url, browser)
             return self._enhance_metadata(res, target_url)
         except Exception as gal_err:
-            self.warn(f"gallery-dl thất bại ({gal_err}), web_scraper fallback...")
+            self.warn(f"gallery-dl thất bại ({gal_err}), đọc media của bài viết...")
             try:
-                res = self.web_scraper.extract(target_url)
-                # Nếu web_scraper tìm thấy streams → trả về
-                if res.streams:
-                    return self._enhance_metadata(res, target_url)
-                # Nếu không có streams → thử Playwright sniffer
-                raise RuntimeError("web_scraper không tìm được stream")
-            except Exception as web_err:
-                # Thử Playwright sniffer (headless browser intercept)
-                self.warn(f"web_scraper thất bại ({web_err}), thử Playwright stream sniffer...")
-                return self._try_playwright_sniff(target_url, gal_err, yt_err)
-
+                res = self.page_media.extract(target_url, browser=browser)
+                return self._enhance_metadata(res, target_url)
+            except NoPostMediaError as page_err:
+                # Đã mở trang bằng trình duyệt thật mà không thấy gì: dò mạng lần nữa
+                # cũng không ra thêm, chỉ tốn thêm 20-40 giây.
+                if page_err.dynamic_ran:
+                    raise RuntimeError(str(page_err))
+                self.warn(f"Không thấy media trong bài viết ({page_err}), thử Playwright stream sniffer...")
+            except Exception as page_err:
+                if self._is_login_wall_error(page_err):
+                    raise
+                self.warn(f"Không đọc được bài viết ({page_err}), thử Playwright stream sniffer...")
+            # Thử Playwright sniffer (headless browser intercept)
+            return self._try_playwright_sniff(target_url, gal_err, yt_err, browser)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Crawl Profile
@@ -594,7 +627,77 @@ class MediaDispatcher(BaseExtractor):
             res.thumbnail = next((img.thumb for img in res.images if img.thumb), None)
             res.high_res_thumbnail = res.high_res_thumbnail or res.thumbnail
 
-    def _try_playwright_sniff(self, target_url: str, gal_err: Exception, yt_err: Exception) -> MediaMetadata:
+    # yt-dlp xử lý bằng bộ đọc TRANG CHUNG (không phải extractor riêng của một nền tảng)
+    _GENERIC_YTDLP_EXTRACTORS = frozenset({"generic", "html5mediaembed", "html5"})
+
+    @classmethod
+    def _same_site(cls, url_a: str, url_b: str) -> bool:
+        a = registrable_domain(cls._hostname_of(url_a))
+        b = registrable_domain(cls._hostname_of(url_b))
+        return bool(a) and a == b
+
+    def _is_embedded_video_list(self, target_url: str, err: PlaylistUrlError) -> bool:
+        urls = getattr(err, "entry_urls", None) or []
+        return bool(urls) and not any(self._same_site(u, target_url) for u in urls)
+
+    @staticmethod
+    def _is_login_wall_error(err: Exception) -> bool:
+        return "yêu cầu đăng nhập" in str(err)
+
+    def _platform_id(self, url: str) -> str:
+        try:
+            platform, _ = self.resolver.detect_platform(url)
+        except Exception:
+            platform = None
+        return platform or "generic"
+
+    def _whole_post_media(self, target_url: str, ytdlp_res: MediaMetadata, browser: Optional[str]) -> Optional[MediaMetadata]:
+        """Video yt-dlp tìm được chỉ là MỘT phần của bài viết? → trả về cả bài, hoặc None.
+
+        Hai dấu hiệu: yt-dlp dùng bộ đọc trang chung (trang có thẻ <video>), hoặc video
+        nằm ở tên miền khác trang (bài viết nhúng video YouTube/Vimeo...).
+        """
+        key = (ytdlp_res.extractor_key or "").lower()
+        generic = key in self._GENERIC_YTDLP_EXTRACTORS
+        embedded = bool(ytdlp_res.webpage_url) and not self._same_site(ytdlp_res.webpage_url, target_url)
+        if not (generic or embedded):
+            return None
+        try:
+            page = self.page_media.extract(target_url, browser=browser)
+        except Exception as err:
+            self.warn(f"Không đọc được phần còn lại của bài viết: {err}")
+            return None
+        items = list(page.images or [])
+        # Trang chỉ có đúng video này: giữ kết quả yt-dlp (có đủ lựa chọn chất lượng)
+        if not items or (len(items) == 1 and items[0].type == "video" and (ytdlp_res.page_video_count or 1) <= 1):
+            return None
+        # page_media không thấy video (player dựng bằng JS lạ, nhúng từ nơi khác) mà
+        # yt-dlp thì thấy: thêm nó vào đầu album, tải qua yt-dlp bằng chính URL nó đã đọc.
+        # Riêng thẻ <video> thường của chính trang (HTML5MediaEmbed) thì page_media cũng
+        # đã thấy và đã loại vì nằm NGOÀI bài viết (vd. video hướng dẫn "thêm vào màn
+        # hình chính" trong khung giao diện của diễn đàn) — không được đưa lại vào.
+        if key not in ("html5mediaembed", "html5") and not any(i.type == "video" for i in items):
+            video_url = target_url if generic else (ytdlp_res.webpage_url or target_url)
+            items.insert(0, MediaImage(
+                id=0, url=video_url, title=ytdlp_res.title, type="video",
+                thumb=ytdlp_res.thumbnail, duration=ytdlp_res.duration, via="ytdlp",
+            ))
+            for idx, item in enumerate(items, 1):
+                item.id = idx
+            page.images = items
+            page.type = "album"
+            page.streams = None
+            page.description = describe_media(items)
+        self.log(f"Video chỉ là một phần của bài viết → trả về cả bài ({len(items)} tệp)")
+        return page
+
+    def _try_playwright_sniff(
+        self,
+        target_url: str,
+        gal_err: Exception,
+        yt_err: Exception,
+        browser: Optional[str] = None,
+    ) -> MediaMetadata:
         """Dùng Playwright headless để sniff stream URLs bị ẩn qua XHR/fetch"""
         import urllib.parse
         parsed = urllib.parse.urlparse(target_url)
@@ -609,7 +712,7 @@ class MediaDispatcher(BaseExtractor):
             )
 
         self.log(f"Playwright stream sniffer đang quét: {target_url}")
-        sniff_result = self.sniffer.sniff_streams(target_url)
+        sniff_result = self.sniffer.sniff_streams(target_url, browser=browser or "auto")
 
         if sniff_result.get("error") and not sniff_result.get("streams"):
             raise RuntimeError(

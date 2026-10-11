@@ -708,6 +708,8 @@ impl SidecarManager {
         let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("extract");
         match action {
             "resolve" => Duration::from_secs(30),
+            // Đọc + giải mã kho cookie của trình duyệt (lần đầu có thể vài giây)
+            "cookies" => Duration::from_secs(45),
             "crawl" => {
                 let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(50);
                 // Với "Khoảng", gallery-dl phải đi qua mọi bài trước range_end nên chi
@@ -911,6 +913,25 @@ impl SidecarManager {
             }
         }
         self.send_request(payload, None).await
+    }
+
+    /// Tệp cookie Netscape TẠM của các tên miền, cho bước tải bằng curl. Bên gọi phải
+    /// xoá tệp sau khi dùng. `browser = "none"` thì Python không đọc cookie nào.
+    pub async fn export_cookies(&self, domains: &[String], browser: Option<&str>) -> Result<Option<PathBuf>, String> {
+        let mut payload = json!({
+            "action": "cookies",
+            "url": domains.first().cloned().unwrap_or_default(),
+            "domains": domains,
+        });
+        if let Some(b) = browser.map(str::trim).filter(|b| !b.is_empty()) {
+            payload["browser"] = Value::String(b.to_string());
+        }
+        let data = self.send_request(payload, None).await?;
+        Ok(data
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from))
     }
 
     /// Quét profile / channel / playlist
@@ -1384,6 +1405,70 @@ for line in sys.stdin:
         mgr.stop().await;
         let _ = std::fs::remove_file(&script_path);
         let _ = std::fs::remove_file(&child_pid_path);
+    }
+
+    /// Nhiều yêu cầu cùng lúc, worker trả lời LỘN THỨ TỰ, chen dòng rác, phản hồi cho
+    /// id lạ và một dòng phản hồi rất lớn: mỗi bên gọi phải nhận đúng kết quả của mình
+    /// và bảng `pending` phải trống sau cùng (không rò rỉ oneshot nào).
+    #[tokio::test]
+    async fn concurrent_out_of_order_responses_are_routed_and_leave_nothing_pending() {
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join(format!("test_sidecar_router_{}.py", uuid::Uuid::new_v4()));
+        {
+            let mut file = std::fs::File::create(&script_path).expect("Tạo mock script");
+            let body = r#"import sys, json, threading, random, time
+lock = threading.Lock()
+def emit(obj):
+    with lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+def serve(req):
+    time.sleep(random.random() * 0.2)
+    url = req.get("url", "")
+    if url.endswith("/big"):
+        data = {"echo": url, "blob": "x" * (8 * 1024 * 1024)}
+    else:
+        data = {"echo": url}
+    with lock:
+        sys.stdout.write("dong rac khong phai json\n")
+        sys.stdout.write(json.dumps({"id": "id-la-" + req["id"], "success": True, "data": {}}) + "\n")
+        sys.stdout.write(json.dumps({"khong_co_id": True}) + "\n")
+        sys.stdout.flush()
+    emit({"id": req["id"], "success": True, "data": data})
+for line in sys.stdin:
+    line = line.strip()
+    if line:
+        threading.Thread(target=serve, args=(json.loads(line),), daemon=True).start()
+"#;
+            use std::io::Write as _;
+            file.write_all(body.as_bytes()).unwrap();
+        }
+
+        let mgr = SidecarManager::new(script_path.clone()).await;
+        let mut handles = Vec::new();
+        for i in 0..120 {
+            let m = mgr.clone();
+            handles.push(tokio::spawn(async move {
+                let url = if i == 7 { "https://example.com/big".to_string() } else { format!("https://example.com/{i}") };
+                let res = m.extract_media(&url, None, None).await;
+                (url, res)
+            }));
+        }
+        for handle in handles {
+            let (url, res) = handle.await.unwrap();
+            let data = res.unwrap_or_else(|e| panic!("Yêu cầu {url} lỗi: {e}"));
+            assert_eq!(data.get("echo").and_then(|v| v.as_str()), Some(url.as_str()), "Nhận nhầm phản hồi");
+        }
+        {
+            let lock = mgr.inner.lock().await;
+            let inner = lock.as_ref().expect("Worker phải còn sống");
+            assert_eq!(inner.pending.lock().await.len(), 0, "Bảng pending phải trống");
+        }
+        assert_eq!(mgr.status().await, WorkerStatus::Running);
+        assert_eq!(mgr.consecutive_crashes().await, 0);
+
+        mgr.stop().await;
+        let _ = std::fs::remove_file(&script_path);
     }
 
     #[tokio::test]

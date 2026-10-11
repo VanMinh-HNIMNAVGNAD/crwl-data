@@ -5,6 +5,7 @@ extracts stream links using regex and delegates to yt-dlp.
 Ported from MovieExtractorService into standalone Python.
 """
 
+import html as html_lib
 import re
 import urllib.request
 import urllib.parse
@@ -47,15 +48,24 @@ EXCLUDED_SOCIAL_DOMAINS = [
     "threads.net", "bsky.app",
 ]
 
-# Regex patterns tìm stream URLs trong HTML/JS (theo thứ tự ưu tiên)
-STREAM_URL_PATTERNS = [
-    (r'(https?://[^\s"\'<>\{\}]+\.m3u8[^\s"\'<>\{\}]*)', "hls"),
-    (r'(https?://[^\s"\'<>\{\}]+\.mpd[^\s"\'<>\{\}]*)', "dash"),
-    (r'(https?://[^\s"\'<>\{\}]+/hls/[^\s"\'<>\{\}]*)', "hls"),
-    (r'(https?://[^\s"\'<>\{\}]+/dash/[^\s"\'<>\{\}]*)', "dash"),
-    (r'(https?://[^\s"\'<>\{\}]+\.mp4[^\s"\'<>\{\}]*)', "mp4"),
-    (r'(https?://[^\s"\'<>\{\}]+\.m4s[^\s"\'<>\{\}]*)', "m4s"),
+# Dấu hiệu stream URL trong HTML/JS (theo thứ tự ưu tiên).
+#
+# Trước đây mỗi loại là một regex dạng `https?://[^...]+\.m3u8[^...]*`: phần `[^...]+`
+# nuốt tới cuối đoạn rồi QUAY LUI tìm ".m3u8" — với mỗi chuỗi "http" trong một đoạn
+# dài không có dấu nháy (JSON trong thuộc tính của trang React/Next.js, `&quot;`)
+# là quét lại cả đoạn: trang 1,6 MB mất hơn 60 giây, và regex giữ GIL nên CẢ engine
+# đứng theo. Nay tách các đoạn URL bằng một regex không quay lui rồi kiểm tra dấu
+# hiệu bằng phép so chuỗi — kết quả như cũ, thời gian tuyến tính.
+STREAM_URL_MARKERS = [
+    (".m3u8", "hls"),
+    (".mpd", "dash"),
+    ("/hls/", "hls"),
+    ("/dash/", "dash"),
+    (".mp4", "mp4"),
+    (".m4s", "m4s"),
 ]
+_URL_TOKEN_RE = re.compile(r'https?://[^\s"\'<>\{\}]+', re.IGNORECASE)
+_IFRAME_SRC_RE = re.compile(r'\bsrc=["\']([^"\']+)["\']', re.IGNORECASE)
 
 # JSON property keys thường chứa stream URL
 STREAM_JSON_KEY_PATTERN = re.compile(
@@ -209,14 +219,23 @@ class MovieExtractor(BaseExtractor):
         found_stream: Optional[str] = None
         embed_urls: List[str] = []
 
-        # --- Kỹ thuật 1: Regex tìm stream URLs trực tiếp trong HTML ---
-        for pattern, kind in STREAM_URL_PATTERNS:
-            matches = re.findall(pattern, html, re.IGNORECASE)
-            if matches and kind in ("hls", "dash", "mp4") and not found_stream:
-                candidate = matches[0].split('"')[0].split("'")[0].replace("\\/", "/").rstrip("\\")
+        # URL trong JSON nhúng hay bị escape (`https:\/\/`, `\u002F`) hoặc nằm trong thuộc
+        # tính có dấu nháy mã hoá (`&quot;`): giải mã trước để mỗi URL tách riêng ra.
+        scan_text = html_lib.unescape(
+            html.replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+        )
+
+        # --- Kỹ thuật 1: tìm stream URLs trực tiếp trong HTML ---
+        tokens = [(t, t.lower()) for t in _URL_TOKEN_RE.findall(scan_text)]
+        for marker, kind in STREAM_URL_MARKERS:
+            if found_stream or kind not in ("hls", "dash", "mp4"):
+                continue
+            match = next((t for t, low in tokens if marker in low), None)
+            if match:
+                candidate = match.split('"')[0].split("'")[0].rstrip("\\")
                 if len(candidate) > 15:
                     found_stream = candidate
-                    self.log(f"Tìm thấy [{kind.upper()}] qua HTML regex: {found_stream[:80]}")
+                    self.log(f"Tìm thấy [{kind.upper()}] qua HTML: {found_stream[:80]}")
                     break
 
         # --- Kỹ thuật 2: Tìm trong JSON blobs ---
@@ -236,7 +255,21 @@ class MovieExtractor(BaseExtractor):
                 self.log(f"Tìm thấy qua JS variable: {found_stream[:80]}")
 
         # --- Kỹ thuật 4: Tìm iframe embed players ---
-        iframe_matches = re.findall(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        # Xét từng thẻ <iframe ...> (tối đa 4 KB mỗi thẻ) thay vì `<iframe[^>]+src=`
+        # trên cả trang: thẻ thiếu ">" từng khiến regex quét lại tới cuối tài liệu.
+        iframe_matches: List[str] = []
+        lower_html = html.lower()
+        pos = 0
+        while len(iframe_matches) < 50:
+            start = lower_html.find("<iframe", pos)
+            if start < 0:
+                break
+            end = lower_html.find(">", start, start + 4096)
+            tag = html[start:end if end >= 0 else start + 4096]
+            m = _IFRAME_SRC_RE.search(tag)
+            if m:
+                iframe_matches.append(m.group(1))
+            pos = start + 7
         for iframe_url in iframe_matches:
             if iframe_url.startswith("//"):
                 iframe_url = "https:" + iframe_url

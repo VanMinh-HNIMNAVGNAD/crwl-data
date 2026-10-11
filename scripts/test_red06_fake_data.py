@@ -373,7 +373,7 @@ def run_test_2():
     # Kiểm tra _try_playwright_sniff khi không tìm được streams
     class DummySniffer:
         def is_available(self): return True
-        def sniff_streams(self, url): return {"streams": [], "images": []}
+        def sniff_streams(self, url, **kwargs): return {"streams": [], "images": []}
     disp.sniffer = DummySniffer()
     sniff_meta = disp._try_playwright_sniff("https://example.com/drm-page", Exception("gal"), Exception("yt"))
     assert sniff_meta.title is None, f"Sniff title phải là None: {sniff_meta.title}"

@@ -8,6 +8,7 @@ Extracts high-resolution images, embedded HTML5 videos, and HLS/MP4 streams.
 import os
 import re
 import urllib.request
+from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -19,6 +20,48 @@ from ..cancellation import cap_timeout
 class OversizedResponseError(RuntimeError):
     """Ném ra khi phản hồi HTTP vượt quá giới hạn dung lượng tối đa cho phép (chống OOM/RAM spike)."""
     pass
+
+
+class _TagCollector(HTMLParser):
+    """Gom các thẻ web_scraper cần (meta, img, video/source, title) theo thứ tự xuất hiện."""
+
+    MAX_TAGS = 20000
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.metas: List[Dict[str, str]] = []
+        self.imgs: List[Dict[str, str]] = []
+        self.videos: List[Dict[str, str]] = []
+        self.media_srcs: List[Dict[str, str]] = []
+        self.title_parts: List[str] = []
+        self._in_title = False
+        self._title_done = False
+
+    def handle_starttag(self, tag, attrs):
+        a: Dict[str, str] = {}
+        for key, value in attrs:
+            if key not in a:
+                a[key] = value or ""
+        if tag == "meta" and len(self.metas) < self.MAX_TAGS:
+            self.metas.append(a)
+        elif tag == "img" and len(self.imgs) < self.MAX_TAGS:
+            self.imgs.append(a)
+        elif tag == "video" and len(self.videos) < self.MAX_TAGS:
+            self.videos.append(a)
+            self.media_srcs.append(a)
+        elif tag == "source" and len(self.media_srcs) < self.MAX_TAGS:
+            self.media_srcs.append(a)
+        elif tag == "title" and not self._title_done:
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        if tag == "title" and self._in_title:
+            self._in_title = False
+            self._title_done = True
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title_parts.append(data)
 
 
 class WebScraperExtractor(BaseExtractor):
@@ -193,6 +236,15 @@ class WebScraperExtractor(BaseExtractor):
         try:
             with urllib.request.urlopen(req, timeout=cap_timeout(timeout)) as resp:
                 content_type = resp.headers.get("Content-Type", "").lower()
+                mime = content_type.split(";")[0].strip()
+                # Liên kết thẳng tới tệp video/ảnh: trước đây vẫn đọc tới 50 MB dữ liệu
+                # nhị phân vào RAM rồi chạy cả loạt regex dò thẻ HTML trên đó.
+                if mime.startswith(("video/", "image/", "audio/")) or mime in (
+                    "application/octet-stream", "application/zip", "application/pdf",
+                ):
+                    raise RuntimeError(
+                        f"Liên kết trả về tệp '{mime}', không phải trang web để bóc tách."
+                    )
                 raw_bytes = self._read_response_safely(resp, max_size=limit)
                 html = raw_bytes.decode("utf-8", errors="ignore")
         except OversizedResponseError:
@@ -200,32 +252,37 @@ class WebScraperExtractor(BaseExtractor):
         except Exception as e:
             raise RuntimeError(f"Không thể truy cập trang web để bóc tách: {e}")
 
-        parsed_url = urlparse(target_url)
-        domain = parsed_url.netloc
+        # Đọc thẻ bằng html.parser (tuyến tính). Các regex `<meta[^>]+property=...`,
+        # `<(?:video|source)[^>]+src=` cũ quay lui tới cuối trang ở mỗi thẻ thiếu ">"
+        # — trang lỗi / cố ý vài MB làm regex chạy hàng phút và khoá cả engine (GIL).
+        tags = _TagCollector()
+        try:
+            tags.feed(html)
+            tags.close()
+        except Exception:
+            pass
+
+        def meta_content(*, props=(), names=()) -> List[str]:
+            out = []
+            for m in tags.metas:
+                prop = (m.get("property") or "").strip().lower()
+                name = (m.get("name") or "").strip().lower()
+                content = (m.get("content") or "").strip()
+                if content and ((prop and prop in props) or (name and name in names)):
+                    out.append(content)
+            return out
 
         # 1. Trích xuất Tiêu đề
-        title = None
-        og_title = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        if not og_title:
-            og_title = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']', html, re.I)
-        if og_title:
-            title = og_title.group(1).strip()
-        else:
-            title_tag = re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S)
-            if title_tag:
-                title = title_tag.group(1).strip()
+        og_titles = meta_content(props=("og:title",))
+        title = og_titles[0] if og_titles else (" ".join("".join(tags.title_parts).split()) or None)
 
         # 2. Trích xuất Mô tả
-        description = ""
-        og_desc = re.search(r'<meta[^>]+(?:property=["\']og:description["\']|name=["\']description["\'])[^>]+content=["\']([^"\']+)["\']', html, re.I)
-        if og_desc:
-            description = og_desc.group(1).strip()
+        descs = meta_content(props=("og:description",), names=("description",))
+        description = descs[0] if descs else ""
 
         # 3. Trích xuất Tác giả / Tên trang
-        author = None
-        og_site = re.search(r'<meta[^>]+property=["\']og:site_name["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        if og_site:
-            author = og_site.group(1).strip()
+        sites = meta_content(props=("og:site_name",))
+        author = sites[0] if sites else None
 
         # 4. Trích xuất Video nếu có (<video src>, <source src>, .mp4, .m3u8, poster)
         streams: List[StreamFormat] = []
@@ -233,28 +290,25 @@ class WebScraperExtractor(BaseExtractor):
         found_posters: List[str] = []
 
         # Bóc tách video poster từ thẻ <video>
-        video_tags = re.findall(r'<video[^>]*>', html, re.I)
-        for vtag in video_tags:
-            poster_m = re.search(r'(?:poster|data-poster)=["\']([^"\']+)["\']', vtag, re.I)
-            if poster_m:
-                raw_poster = poster_m.group(1).strip()
-                if raw_poster and not raw_poster.startswith("data:"):
-                    clean_poster = urljoin(target_url, raw_poster)
-                    if self.is_thumbnail_candidate(clean_poster) and clean_poster not in found_posters:
-                        found_posters.append(clean_poster)
+        for vtag in tags.videos:
+            raw_poster = (vtag.get("poster") or vtag.get("data-poster") or "").strip()
+            if raw_poster and not raw_poster.startswith("data:"):
+                clean_poster = urljoin(target_url, raw_poster)
+                if self.is_thumbnail_candidate(clean_poster) and clean_poster not in found_posters:
+                    found_posters.append(clean_poster)
 
-        og_video = re.search(r'<meta[^>]+property=["\'](?:og:video|og:video:url|og:video:secure_url)["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        if not og_video:
-            og_video = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\'](?:og:video|og:video:url|og:video:secure_url)["\']', html, re.I)
-        if og_video:
-            v_cand = urljoin(target_url, og_video.group(1).strip())
+        og_videos = meta_content(props=("og:video", "og:video:url", "og:video:secure_url"))
+        if og_videos:
+            v_cand = urljoin(target_url, og_videos[0])
             # Không nhận segment hay image vào danh sách video
             if not self.is_video_segment_url(v_cand) and not self.is_image_url(v_cand):
                 found_videos.append(v_cand)
 
-        video_srcs = re.findall(r'<(?:video|source)[^>]+src=["\']([^"\']+)["\']', html, re.I)
-        for v in video_srcs:
-            clean_v = urljoin(target_url, v.strip())
+        for media_tag in tags.media_srcs:
+            v = (media_tag.get("src") or media_tag.get("data-src") or "").strip()
+            if not v:
+                continue
+            clean_v = urljoin(target_url, v)
             if clean_v not in found_videos and not clean_v.startswith("blob:"):
                 # Không nhận segment (.ts, .m4s) hay image (.jpg, .png) vào stream list
                 if not self.is_video_segment_url(clean_v) and not self.is_image_url(clean_v):
@@ -294,41 +348,32 @@ class WebScraperExtractor(BaseExtractor):
         ordered_img_urls: List[str] = []
 
         # Ưu tiên og:image, twitter:image
-        og_img_patterns = [
-            r'<meta[^>]+property=["\'](?:og:image|og:image:url|og:image:secure_url)["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\'](?:og:image|og:image:url|og:image:secure_url)["\']',
-            r'<meta[^>]+name=["\'](?:twitter:image|twitter:image:src)["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\'](?:twitter:image|twitter:image:src)["\']',
-        ]
-        for pat in og_img_patterns:
-            for match in re.finditer(pat, html, re.I):
-                raw_img = match.group(1).strip()
-                if raw_img and not raw_img.startswith("data:"):
-                    full_img = urljoin(target_url, raw_img)
-                    # Bắt buộc: Phải là URL ảnh hợp lệ, tuyệt đối không nhận .m3u8, .m4s, .ts, .mp4
-                    if self.is_thumbnail_candidate(full_img) and full_img not in seen_img_urls:
-                        seen_img_urls.add(full_img)
-                        ordered_img_urls.append(full_img)
+        meta_images = meta_content(props=("og:image", "og:image:url", "og:image:secure_url")) + \
+            meta_content(names=("twitter:image", "twitter:image:src"))
+        for raw_img in meta_images:
+            if raw_img and not raw_img.startswith("data:"):
+                full_img = urljoin(target_url, raw_img)
+                # Bắt buộc: Phải là URL ảnh hợp lệ, tuyệt đối không nhận .m3u8, .m4s, .ts, .mp4
+                if self.is_thumbnail_candidate(full_img) and full_img not in seen_img_urls:
+                    seen_img_urls.add(full_img)
+                    ordered_img_urls.append(full_img)
 
         # Lấy từ <img> tags (ưu tiên data-original, data-src, data-lazy-src, src)
-        img_tags = re.findall(r'<img[^>]+>', html, re.I)
-        for tag in img_tags:
+        for tag in tags.imgs:
             src = None
             for attr in ("data-original", "data-src", "data-lazy-src", "data-full-url", "data-url", "src"):
-                m = re.search(rf'{attr}=["\']([^"\']+)["\']', tag, re.I)
-                if m:
-                    val = m.group(1).strip()
-                    if val and not val.startswith("data:image/"):
-                        src = val
-                        break
+                val = (tag.get(attr) or "").strip()
+                if val and not val.startswith("data:image/"):
+                    src = val
+                    break
 
             if not src:
                 continue
 
             # Xử lý srcset nếu có
-            srcset_m = re.search(r'srcset=["\']([^"\']+)["\']', tag, re.I)
-            if srcset_m:
-                parts = [p.strip().split(" ")[0] for p in srcset_m.group(1).split(",") if p.strip()]
+            srcset_value = (tag.get("srcset") or tag.get("data-srcset") or "").strip()
+            if srcset_value:
+                parts = [p.strip().split(" ")[0] for p in srcset_value.split(",") if p.strip()]
                 if parts:
                     src = parts[-1]  # lấy chất lượng cao nhất
 

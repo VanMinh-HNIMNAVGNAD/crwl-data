@@ -1914,6 +1914,7 @@ impl DownloaderService {
         platform: Option<&str>,
         task_id: Option<String>,
         db: Arc<Database>,
+        cookie_file: Option<&Path>,
     ) -> Result<DownloadResult, String> {
         let dest_folder = Self::canonical_download_dir(dest_dir)?;
 
@@ -1940,7 +1941,7 @@ impl DownloaderService {
         }
 
         info!("Đang tải tệp trực tiếp qua curl: {url} -> {:?}", target_path);
-        let curl_fut = Self::curl_to_file_with_meta(url, &referer_header, &target_path);
+        let curl_fut = Self::curl_to_file_with_cookies(url, &referer_header, &target_path, cookie_file);
         let (ok, content_type) = if let Some(mut cancel_rx) = cancel_rx_opt {
             tokio::select! {
                 _ = &mut cancel_rx => {
@@ -2044,6 +2045,7 @@ impl DownloaderService {
         client_ip: Option<&str>,
         platform: Option<&str>,
         db: Arc<Database>,
+        cookie_file: Option<PathBuf>,
     ) -> Result<DownloadResult, String> {
         let base_dest = Self::canonical_download_dir(dest_dir)?;
         let history_platform = Self::history_platform(
@@ -2181,6 +2183,7 @@ impl DownloaderService {
             for (item, dest_file) in planned_items {
                 let permit_src = Arc::clone(&semaphore);
                 let counter = Arc::clone(&completed);
+                let cookie = cookie_file.clone();
 
                 handles.push(tokio::spawn(async move {
                     let _permit = match permit_src.acquire_owned().await {
@@ -2190,7 +2193,8 @@ impl DownloaderService {
 
                     let referer_header = Self::get_referer_for_url(&item.url, item.referer.as_deref());
 
-                    let (ok, content_type) = Self::curl_to_file_with_meta(&item.url, &referer_header, &dest_file).await;
+                    let (ok, content_type) =
+                        Self::curl_to_file_with_cookies(&item.url, &referer_header, &dest_file, cookie.as_deref()).await;
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if ok {
                         Some(Self::add_extension_from_content_type(dest_file, content_type.as_deref()))
@@ -3088,6 +3092,20 @@ impl DownloaderService {
         referer: &str,
         dest: &Path,
     ) -> (bool, Option<String>) {
+        Self::curl_to_file_with_cookies(url, referer, dest, None).await
+    }
+
+    /// Như `curl_to_file_with_meta`, kèm tệp cookie Netscape (`curl -b`) cho tệp nằm
+    /// sau đăng nhập (tệp đính kèm diễn đàn, CDN dùng cookie ký). Trước đây bước tải
+    /// không gửi cookie nào: bài viết cần đăng nhập bóc tách được nhưng tệp tải về
+    /// toàn là trang đăng nhập. curl chỉ gửi mỗi cookie cho đúng tên miền / đường dẫn
+    /// của nó, kể cả ở các bước chuyển hướng.
+    pub(crate) async fn curl_to_file_with_cookies(
+        url: &str,
+        referer: &str,
+        dest: &Path,
+        cookie_file: Option<&Path>,
+    ) -> (bool, Option<String>) {
         const MAX_REDIRECTS: usize = 5;
         const META_MARKER: &str = "---CURL_META---";
         const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -3128,6 +3146,10 @@ impl DownloaderService {
                 .arg("-w").arg(format!("\n{META_MARKER}\n%{{http_code}}\n%{{content_type}}\n%{{redirect_url}}\n"));
             if let Some(ref p) = proxy {
                 cmd.arg("-x").arg(p);
+            }
+            // `-b` không có dấu "=" mới được curl hiểu là TÊN TỆP (có "=" là chuỗi cookie)
+            if let Some(cookie) = cookie_file.filter(|c| c.is_file() && !c.to_string_lossy().contains('=')) {
+                cmd.arg("-b").arg(cookie);
             }
             let output = match cmd.arg(&current).arg("-o").arg(dest).output().await {
                 Ok(o) => o,
@@ -4147,6 +4169,15 @@ mod tests {
                                 let _ = socket.flush().await;
                                 return;
                             }
+                            // Tệp chỉ dành cho thành viên: thiếu cookie phiên → trang đăng nhập
+                            let logged_in = req
+                                .lines()
+                                .any(|l| l.to_ascii_lowercase().starts_with("cookie:") && l.contains("session=hop-le"));
+                            let path = if path == "/members/photo.jpg" {
+                                if logged_in { "/valid_image.jpg" } else { "/challenge.html" }
+                            } else {
+                                path
+                            };
 
                             let (status, content_type, body): (&str, &str, Vec<u8>) = match path {
                                 "/valid_image.jpg" => (
@@ -4190,6 +4221,43 @@ mod tests {
         });
 
         (format!("http://{}", addr), shutdown_tx)
+    }
+
+    /// Bài viết cần đăng nhập: tệp của nó cũng cần cookie. Trước đây curl không gửi
+    /// cookie nào nên mọi tệp "chỉ thành viên" tải về là trang đăng nhập (bị loại).
+    #[tokio::test]
+    async fn members_only_files_download_with_the_session_cookie_file() {
+        let (server_url, _shutdown) = run_mock_server().await;
+        let dir = std::env::temp_dir().join(format!("test_cookie_dl_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cookies = dir.join("cookies_dl_test.txt");
+        std::fs::write(
+            &cookies,
+            "# Netscape HTTP Cookie File\n\
+             127.0.0.1\tFALSE\t/\tFALSE\t0\tsession\thop-le\n\
+             .khac.example\tTRUE\t/\tFALSE\t0\tsession\tkhong-gui\n",
+        )
+        .unwrap();
+        let url = format!("{server_url}/members/photo.jpg");
+
+        let without = dir.join("without.jpg");
+        let (ok, _) = D::curl_to_file_with_cookies(&url, "", &without, None).await;
+        assert!(!ok, "Không có cookie thì máy chủ trả trang đăng nhập — phải bị loại");
+        assert!(!without.exists());
+
+        let with = dir.join("with.jpg");
+        let (ok, ct) = D::curl_to_file_with_cookies(&url, "", &with, Some(&cookies)).await;
+        assert!(ok, "Có cookie phiên thì phải tải được");
+        assert_eq!(ct.as_deref(), Some("image/jpeg"));
+        assert!(with.metadata().unwrap().len() > 0);
+
+        // Tên tệp có "=" thì curl hiểu là chuỗi cookie chứ không phải tên tệp: bỏ qua
+        let weird = dir.join("a=b.txt");
+        std::fs::copy(&cookies, &weird).unwrap();
+        let (ok, _) = D::curl_to_file_with_cookies(&url, "", &dir.join("weird.jpg"), Some(&weird)).await;
+        assert!(!ok);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Trước đây `-L --max-redirs 0` làm mọi URL có chuyển hướng thất bại (curl 47).

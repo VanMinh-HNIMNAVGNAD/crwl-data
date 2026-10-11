@@ -699,6 +699,9 @@ class StoryExtractor(BaseExtractor):
         urls = []
         if is_video:
             # Tìm video source URLs
+            # Các đoạn "bất kỳ ký tự trừ X" đều có giới hạn độ dài: thẻ <source thiếu
+            # ">" hay object thiếu "}" từng khiến regex quét lại tới cuối trang cho MỖI
+            # lần xuất hiện (HTML trang Facebook dài vài MB).
             patterns = [
                 r'"video_url"\s*:\s*"([^"]+)"',
                 r'"playable_url"\s*:\s*"([^"]+)"',
@@ -707,18 +710,18 @@ class StoryExtractor(BaseExtractor):
                 r'"browser_native_sd_url"\s*:\s*"([^"]+)"',
                 r'"hd_src"\s*:\s*"([^"]+)"',
                 r'"sd_src"\s*:\s*"([^"]+)"',
-                r'<source[^>]+src="([^"]+\.mp4[^"]*)"',
-                r'"src"\s*:\s*"(https?://[^"]+\.mp4[^"]*)"',
-                r'"url"\s*:\s*"(https?://[^"]+\.mp4[^"]*)"',
+                r'<source[^>]{0,2000}?src="([^"]{1,4096}?\.mp4[^"]{0,4096})"',
+                r'"src"\s*:\s*"(https?://[^"]{1,4096}?\.mp4[^"]{0,4096})"',
+                r'"url"\s*:\s*"(https?://[^"]{1,4096}?\.mp4[^"]{0,4096})"',
             ]
         else:
             # Tìm image URLs
             patterns = [
-                r'"image"\s*:\s*\{[^}]*"uri"\s*:\s*"([^"]+)"',
+                r'"image"\s*:\s*\{[^}]{0,2000}?"uri"\s*:\s*"([^"]+)"',
                 r'"full_size_url"\s*:\s*"([^"]+)"',
                 r'"large_src"\s*:\s*"([^"]+)"',
-                r'"previewImage"\s*:\s*\{[^}]*"uri"\s*:\s*"([^"]+)"',
-                r'"url"\s*:\s*"(https?://[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"',
+                r'"previewImage"\s*:\s*\{[^}]{0,2000}?"uri"\s*:\s*"([^"]+)"',
+                r'"url"\s*:\s*"(https?://[^"]{1,4096}?\.(?:jpg|jpeg|png|webp)[^"]{0,4096})"',
             ]
 
         seen = set()
@@ -752,21 +755,37 @@ class StoryExtractor(BaseExtractor):
         video_urls: List[str] = []
         image_urls: List[str] = []
 
-        # Tìm tất cả JSON objects lớn trong script tags
-        for match in re.finditer(r'<script[^>]*>(\{.{100,}?\})</script>', html, re.DOTALL):
-            try:
-                data = json.loads(match.group(1))
-                StoryExtractor._deep_extract_urls(data, video_urls, image_urls)
-            except json.JSONDecodeError:
+        # Tìm tất cả JSON objects lớn trong script tags.
+        #
+        # Trước đây dùng `<script[^>]*>(\{.{100,}?\})</script>` (DOTALL) cùng một regex
+        # dò lời gọi `require([...],function...{...})` với ba `.*?` lồng nhau: thẻ
+        # script mở bằng "{" mà không đóng đúng mẫu khiến regex quét lại tới cuối
+        # trang cho mỗi thẻ — 1 MB HTML mất 30 giây tới hơn 60 giây, khoá cả engine.
+        # Nay cắt từng khối <script> bằng str.find (tuyến tính). Phần dò require()
+        # được bỏ: nó chỉ chạy lại đúng các mẫu `_extract_urls_from_html` trên một
+        # đoạn con của trang mà bên gọi đã chạy trên cả trang (không thể ra thêm gì).
+        pos = 0
+        blocks = 0
+        while blocks < 500:
+            start = html.find("<script", pos)
+            if start < 0:
+                break
+            tag_end = html.find(">", start)
+            if tag_end < 0:
+                break
+            end = html.find("</script>", tag_end)
+            if end < 0:
+                break
+            pos = end + len("</script>")
+            blocks += 1
+            body = html[tag_end + 1:end].strip()
+            if len(body) < 102 or len(body) > 5_000_000 or not (body.startswith("{") and body.endswith("}")):
                 continue
-
-        # Tìm trong các require() calls (Facebook pattern)
-        for match in re.finditer(r'require\(\[.*?\],function.*?\{(.*?)\}\)', html, re.DOTALL):
-            content = match.group(1)
-            v_urls = StoryExtractor._extract_urls_from_html(content, is_video=True)
-            i_urls = StoryExtractor._extract_urls_from_html(content, is_video=False)
-            video_urls.extend(v_urls)
-            image_urls.extend(i_urls)
+            try:
+                data = json.loads(body)
+            except (ValueError, RecursionError):
+                continue
+            StoryExtractor._deep_extract_urls(data, video_urls, image_urls)
 
         return video_urls, image_urls
 

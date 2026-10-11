@@ -1,4 +1,6 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use serde_json::Value;
 use tauri::{AppHandle, State};
 
@@ -379,6 +381,73 @@ pub async fn save_app_settings(
 // Native Album & Direct File Download Commands (thay thế NestJS proxyService)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Tệp cookie tạm của một lượt tải: bị xoá khi lượt tải kết thúc, kể cả khi lỗi / huỷ.
+struct TempCookieFile(Option<PathBuf>);
+
+impl TempCookieFile {
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for TempCookieFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Cookie đăng nhập cho bước tải bằng curl, lấy qua engine Python (nơi đọc được kho
+/// cookie của trình duyệt). Không lấy được thì vẫn tải, chỉ là không kèm cookie.
+async fn cookies_for_download(state: &AppState, browser: Option<&str>, urls: Vec<String>) -> TempCookieFile {
+    if browser.map(str::trim) == Some("none") {
+        return TempCookieFile(None);
+    }
+    let mut hosts: Vec<String> = Vec::new();
+    for raw in &urls {
+        let host = url::Url::parse(raw)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+        if let Some(h) = host {
+            if !hosts.contains(&h) {
+                hosts.push(h);
+            }
+        }
+        if hosts.len() >= 8 {
+            break;
+        }
+    }
+    if hosts.is_empty() {
+        return TempCookieFile(None);
+    }
+    match tokio::time::timeout(Duration::from_secs(50), state.sidecar.export_cookies(&hosts, browser)).await {
+        // Chỉ nhận đúng loại tệp do engine tạo cho việc này
+        Ok(Ok(Some(path)))
+            if path.is_file()
+                && path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().starts_with("cookies_dl_"))
+                    .unwrap_or(false) =>
+        {
+            TempCookieFile(Some(path))
+        }
+        Ok(Ok(Some(path))) => {
+            let _ = std::fs::remove_file(path);
+            TempCookieFile(None)
+        }
+        Ok(Ok(None)) => TempCookieFile(None),
+        Ok(Err(e)) => {
+            log::warn!("Không lấy được cookie cho bước tải: {e}");
+            TempCookieFile(None)
+        }
+        Err(_) => {
+            log::warn!("Lấy cookie cho bước tải quá lâu — tải không kèm cookie");
+            TempCookieFile(None)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn download_direct_file(
     state: State<'_, AppState>,
@@ -390,8 +459,15 @@ pub async fn download_direct_file(
     task_id: Option<String>,
     client_ip: Option<String>,
     platform: Option<String>,
+    browser: Option<String>,
 ) -> Result<DownloadResult, String> {
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
+    let cookies = cookies_for_download(
+        &state,
+        browser.as_deref(),
+        std::iter::once(url.clone()).chain(referer.clone()).collect(),
+    )
+    .await;
     DownloaderService::download_direct_file(
         &url,
         filename.as_deref(),
@@ -402,6 +478,7 @@ pub async fn download_direct_file(
         platform.as_deref(),
         task_id,
         Arc::clone(&state.db),
+        cookies.path(),
     ).await
 }
 
@@ -418,8 +495,19 @@ pub async fn download_album_batch(
     task_id: Option<String>,
     client_ip: Option<String>,
     platform: Option<String>,
+    browser: Option<String>,
 ) -> Result<DownloadResult, String> {
     let dev_id = device_id.unwrap_or_else(|| "desktop_default".to_string());
+    // Lượt chỉ tạo thư mục / chỉ nén ZIP (không có tệp nào để tải) thì không cần cookie
+    let cookies = if items.is_empty() {
+        TempCookieFile(None)
+    } else {
+        let urls: Vec<String> = items
+            .iter()
+            .flat_map(|i| std::iter::once(i.url.clone()).chain(i.referer.clone()))
+            .collect();
+        cookies_for_download(&state, browser.as_deref(), urls).await
+    };
     DownloaderService::download_album_batch(
         app,
         items,
@@ -432,6 +520,7 @@ pub async fn download_album_batch(
         client_ip.as_deref(),
         platform.as_deref(),
         Arc::clone(&state.db),
+        cookies.path().map(Path::to_path_buf),
     ).await
 }
 

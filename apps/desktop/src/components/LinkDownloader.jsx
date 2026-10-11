@@ -43,7 +43,12 @@ import {
   normalizeLink,
 } from '../utils/links'
 import { describeError, errorText, shortenMiddle } from '../utils/messages'
-import { hasDownloadableContent, noDownloadableContentReason } from '../utils/media'
+import {
+  hasDownloadableContent,
+  needsYtdlpDownload,
+  noDownloadableContentReason,
+  splitByDownloader,
+} from '../utils/media'
 import { errorToast, openFolderAction, savedToast } from '../utils/toasts'
 import { insertTextAtCursor } from '../utils/textInput'
 
@@ -232,6 +237,63 @@ const AlbumGridItem = memo(function AlbumGridItem({ img, isSelected, videoBadge,
         <IconDownload className="w-3 h-3" />
       </button>
     </div>
+  )
+})
+
+// Số ô album vẽ thêm mỗi lần (bội số của 3 cột)
+const ALBUM_PAGE_SIZE = 120
+
+/**
+ * Lưới album của kết quả tải đơn, vẽ dần từng trang như lưới "Tải theo tài khoản".
+ *
+ * Bài viết trên trang web bất kỳ có thể trả về hàng trăm ảnh: trước đây mọi ô được
+ * vẽ cùng lúc, mỗi ô một <img> lazy-load mà webview phải theo dõi ở mọi khung hình.
+ * "Chọn tất cả" / tải vẫn áp dụng cho toàn bộ album, kể cả phần chưa vẽ.
+ * Mỗi kết quả mới phải gắn `key` mới để lưới bắt đầu lại từ trang đầu.
+ */
+const AlbumGrid = memo(function AlbumGrid({ images, selected, videoOrder, onToggle, onDownload }) {
+  const [limit, setLimit] = useState(ALBUM_PAGE_SIZE)
+  const sentinelRef = useRef(null)
+  const shown = images.length > limit ? images.slice(0, limit) : images
+  const remaining = images.length - shown.length
+
+  const showMore = useCallback(() => setLimit((current) => current + ALBUM_PAGE_SIZE), [])
+
+  useEffect(() => {
+    const el = sentinelRef.current
+    if (!remaining || !el || typeof IntersectionObserver === 'undefined') return undefined
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) showMore()
+      },
+      { root: el.closest('.pane-results-container'), rootMargin: '0px 0px 800px 0px' }
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [remaining, limit, showMore])
+
+  return (
+    <>
+      <div className="album-grid">
+        {shown.map((img) => (
+          <AlbumGridItem
+            key={img.id}
+            img={img}
+            isSelected={Boolean(selected[img.id])}
+            videoBadge={videoOrder.total > 1 ? `${videoOrder.indexOf.get(img.id)}/${videoOrder.total}` : 'Video'}
+            onToggle={onToggle}
+            onDownload={onDownload}
+          />
+        ))}
+      </div>
+      {remaining > 0 && (
+        <div className="profile-grid-more" ref={sentinelRef}>
+          <button type="button" className="minimal-small-btn" onClick={showMore}>
+            Hiện thêm {Math.min(ALBUM_PAGE_SIZE, remaining)} tệp (còn {remaining})
+          </button>
+        </div>
+      )}
+    </>
   )
 })
 
@@ -956,17 +1018,37 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
         console.warn('Cannot attach progress listener:', e)
       }
 
-      const generated = generateBatchMediaFilenames([img], singleMedia?.originalUrl)
-      const filename = generated[0]?.filename || `${sanitizeFilenamePart(img.title || 'photo')}.${img.ext || 'jpg'}`
-      const res = await downloadDirectFile({
-        url: img.url,
-        filename,
-        destDir: targetDir,
-        referer: singleMedia?.originalUrl,
-        platform: singleMedia?.platform,
-        taskId,
-      })
-      if (res?.file_name) {
+      const pageReferer = singleMedia?.referer || singleMedia?.originalUrl
+      let res
+      if (needsYtdlpDownload(img)) {
+        // Video nhúng (YouTube, Vimeo...) / luồng HLS: curl chỉ tải được TỆP, trước đây
+        // bấm tải luôn nhận lỗi "nội dung là trang web HTML".
+        res = await startNativeDownload({
+          url: img.url,
+          title: img.title || singleMedia?.title,
+          destDir: targetDir,
+          referer: pageReferer || undefined,
+          embedMetadata,
+          embedThumbnail,
+          useAria2c,
+          concurrentFragments,
+          videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
+          taskId,
+          platform: singleMedia?.platform,
+        })
+      } else {
+        const generated = generateBatchMediaFilenames([img], pageReferer)
+        const filename = generated[0]?.filename || `${sanitizeFilenamePart(img.title || 'photo')}.${img.ext || 'jpg'}`
+        res = await downloadDirectFile({
+          url: img.url,
+          filename,
+          destDir: targetDir,
+          referer: pageReferer,
+          platform: singleMedia?.platform,
+          taskId,
+        })
+      }
+      if (res?.file_name || res?.success) {
         updateTask(taskId, {
           percent: 100,
           speed: '',
@@ -1029,6 +1111,151 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
     }
   }
 
+  // Tải nhiều tệp vào CÙNG một thư mục album qua nhiều bước: tệp tải thẳng bằng curl
+  // (một lượt), các mục cần yt-dlp (video nhúng, luồng HLS, video của bài) lần lượt
+  // từng mục, rồi nén ZIP nếu cần. Một mục lỗi (link hết hạn, video bị chặn...) không
+  // làm hỏng cả lượt: lỗi được gom lại để báo ở cuối. Trả về null nếu đã bị huỷ.
+  const downloadIntoAlbum = async ({ taskId, albumName, targetDir, fileItems, ytdlpItems, asZip, platform }) => {
+    const failures = []
+    let failedCount = 0
+    const totalUnits = fileItems.length + ytdlpItems.length
+    const share = asZip ? 90 : 100
+    let completed = 0
+
+    // Tạo thư mục album trước: mọi bước sau cùng ghi vào đó (backend nhớ theo taskId)
+    const prepRes = await downloadAlbumBatch({ items: [], albumName, destDir: targetDir, asZip: false, taskId, platform })
+    const albumFolder = prepRes?.file_path
+    if (!albumFolder) throw new Error('Không tạo được thư mục album để tải')
+
+    if (fileItems.length > 0) {
+      // "completed"/"error" của riêng bước này chưa phải kết cục của cả lượt
+      const stepUnlisten = await onDownloadProgress((payload) => {
+        const stepPercent = Math.min(100, Math.max(0, Number(payload?.percent) || 0))
+        const stepDone = payload?.status === 'completed' || payload?.status === 'error'
+        updateTask(taskId, {
+          ...payload,
+          percent: (stepPercent / 100) * (fileItems.length / totalUnits) * share,
+          status: stepDone ? 'downloading' : payload?.status,
+          filePath: undefined,
+        })
+      }, taskId)
+      try {
+        const fileRes = await downloadAlbumBatch({
+          items: fileItems,
+          albumName,
+          destDir: targetDir,
+          albumDir: albumFolder,
+          asZip: false,
+          taskId,
+          platform,
+        })
+        const failedFiles = failedCountOf(fileRes?.message)
+        if (failedFiles > 0) {
+          failedCount += failedFiles
+          failures.push({ label: `${failedFiles} tệp`, err: 'Liên kết có thể đã hết hạn hoặc bị chặn.' })
+        }
+      } catch (err) {
+        if (isCancelError(taskId, errorText(err, ''))) throw err
+        failedCount += fileItems.length
+        failures.push({ label: `${fileItems.length} tệp`, err })
+      } finally {
+        stepUnlisten()
+      }
+      completed = fileItems.length
+    }
+
+    for (let index = 0; index < ytdlpItems.length; index++) {
+      if (isCancelled(taskId)) return null
+      const item = ytdlpItems[index]
+      const subTaskId = `${taskId}_video_${index}`
+      let subUnlisten = null
+      try {
+        subUnlisten = await onDownloadProgress((payload) => {
+          // Quy về phần trăm của cả lượt và không để "completed"/"error" của một video
+          // làm thẻ báo xong (ẩn nút Huỷ) khi các video sau vẫn đang tải.
+          const videoPercent = Math.min(100, Math.max(0, Number(payload?.percent) || 0))
+          const finishedOne = payload?.status === 'completed' || payload?.status === 'error'
+          updateTask(taskId, {
+            ...payload,
+            percent: ((completed + videoPercent / 100) / totalUnits) * share,
+            // ETA của riêng một video không phải ETA của cả lượt: để trống cho
+            // useDownloadTasks ước tính theo phần trăm tổng.
+            eta: '',
+            status: finishedOne || payload?.status === 'processing' ? 'downloading' : payload?.status,
+            filePath: undefined,
+            isIndeterminate: false,
+            phase: `Đang tải video [${index + 1}/${ytdlpItems.length}]...`,
+          })
+        }, subTaskId)
+        if (!item.url) throw new Error(`Mục ${index + 1} không có URL gốc để tải`)
+        const videoRes = await startNativeDownload({
+          url: item.url,
+          title: item.title || `media_${index + 1}`,
+          destDir: albumFolder,
+          referer: item.referer || undefined,
+          embedMetadata,
+          embedThumbnail,
+          useAria2c,
+          concurrentFragments,
+          videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
+          taskId: subTaskId,
+          platform: item.platform || platform,
+        })
+        if (!videoRes?.success) {
+          throw new Error(videoRes?.message || `Không tải được video thứ ${index + 1}`)
+        }
+      } catch (err) {
+        if (isCancelError(taskId, errorText(err, ''))) throw err
+        failedCount++
+        failures.push({ label: item.title || `Video ${index + 1}`, err })
+      } finally {
+        if (typeof subUnlisten === 'function') subUnlisten()
+        completed++
+        updateTask(taskId, (prev) => ({
+          ...(prev || {}),
+          percent: Math.round((completed / totalUnits) * share),
+          status: 'downloading',
+          phase: `Đã xử lý ${completed}/${totalUnits} tệp`,
+        }))
+      }
+    }
+
+    if (isCancelled(taskId)) return null
+    if (!asZip) {
+      if (totalUnits > 0 && failedCount >= totalUnits) {
+        throw new Error(`Không tải được tệp nào. (Chi tiết: ${errorText(failures[0]?.err)})`)
+      }
+      const ok = totalUnits - failedCount
+      return {
+        res: {
+          success: true,
+          file_path: albumFolder,
+          file_name: albumFolder.split(/[\\/]/).pop() || albumName,
+          message:
+            failedCount > 0
+              ? `Đã tải ${ok} tệp vào thư mục album, ${failedCount} tệp thất bại.`
+              : `Đã tải thành công ${ok} tệp vào thư mục album!`,
+        },
+        failures,
+        failedCount,
+      }
+    }
+
+    updateTask(taskId, { percent: 92, speed: '', eta: '', status: 'processing', phase: 'Đang nén các tệp đã tải...' })
+    let res
+    try {
+      res = await downloadAlbumBatch({ items: [], albumName, destDir: targetDir, albumDir: albumFolder, asZip: true, taskId, platform })
+    } catch (err) {
+      // Không mục nào tải được: báo nguyên nhân thật của mục đầu tiên
+      if (failures.length > 0 && !isCancelError(taskId, errorText(err, ''))) {
+        throw new Error(`Không tải được mục nào để nén ZIP. (Chi tiết: ${errorText(failures[0].err)})`, { cause: err })
+      }
+      throw err
+    }
+    if (res?.success === false) throw new Error(res.message || 'Nén ZIP thất bại')
+    return { res, failures, failedCount }
+  }
+
   // Tải trực tiếp các tệp ảnh/video của MỘT bài đăng vào thư mục riêng (hoặc nén ZIP)
   const downloadMediaFiles = async ({ media, items: itemsToDownload, asZip, albumName: customAlbumName, sourceKey }) => {
     const targetDir = await pickTargetDir('Đã huỷ vì chưa chọn thư mục lưu')
@@ -1047,8 +1274,57 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
       },
     })
 
+    // Trang chứa bài viết: máy chủ ảnh hay chặn tải khi thiếu Referer đúng trang
+    const pageReferer = media?.referer || media?.originalUrl
+    const { direct, viaYtdlp } = splitByDownloader(itemsToDownload)
     let unlisten = null
     try {
+      if (viaYtdlp.length > 0) {
+        // Album có video nhúng / luồng HLS: trước đây CẢ album đi qua curl và các mục
+        // đó luôn hỏng. Nay tệp thẳng đi curl, phần còn lại đi yt-dlp, chung một thư mục.
+        const outcome = await downloadIntoAlbum({
+          taskId,
+          albumName: customAlbumName,
+          targetDir,
+          fileItems: generateBatchMediaFilenames(
+            direct.map((img) => ({ ...img, referer: pageReferer })),
+            pageReferer
+          ),
+          ytdlpItems: viaYtdlp.map((img, i) => ({
+            url: img.url,
+            title: img.title || (viaYtdlp.length > 1 ? `${media?.title || 'video'} (video ${i + 1})` : media?.title),
+            referer: pageReferer,
+          })),
+          asZip,
+          platform: media?.platform,
+        })
+        if (!outcome) return
+        const { res, failures, failedCount } = outcome
+        const total = itemsToDownload.length
+        const failureDetail = failedCount > 0 ? formatFailures(failures) : ''
+        updateTask(taskId, {
+          percent: 100,
+          speed: '',
+          eta: '',
+          status: 'completed',
+          phase: 'Hoàn tất',
+          filePath: res?.file_path,
+          fileName: res?.file_name,
+          message: res?.message,
+          detail: failureDetail,
+        })
+        onShowToast?.({
+          ...savedToast(res?.file_path, {
+            type: failedCount > 0 ? 'warning' : 'success',
+            title: failedCount > 0 ? `Đã tải ${total - failedCount}/${total} tệp` : asZip ? 'Đã nén ZIP xong' : `Đã tải xong ${total} tệp`,
+            name: res?.file_name,
+            message: failedCount > 0 ? `${describeError(failures[0].err).title}. Bấm "Chi tiết" để xem từng tệp lỗi.` : undefined,
+          }),
+          detail: failureDetail,
+        })
+        return
+      }
+
       try {
         unlisten = await onDownloadProgress((payload) => updateTask(taskId, payload), taskId)
       } catch (e) {
@@ -1058,9 +1334,9 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
       const itemsPayload = generateBatchMediaFilenames(
         itemsToDownload.map((img) => ({
           ...img,
-          referer: media?.originalUrl,
+          referer: pageReferer,
         })),
-        media?.originalUrl
+        pageReferer
       )
       const res = await downloadAlbumBatch({
         items: itemsPayload,
@@ -1230,168 +1506,44 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
     // Một mục lỗi (link hết hạn, video bị chặn...) không được làm hỏng cả gói ZIP:
     // ghi lại rồi tải tiếp, cuối cùng nén những gì đã tải được.
-    const failures = []
-    let failedCount = 0
-    let unlisten = null
     try {
-      // Tạo thư mục trước. Video phải đi qua yt-dlp với URL gốc vì stream URL
-      // của YouTube là URL ký tạm thời và thường là HLS playlist.
-      const prepRes = await downloadAlbumBatch({
-        items: [],
-        albumName,
-        destDir: targetDir,
-        asZip: false,
-        taskId,
-        platform: itemsToDownload[0]?.platform,
-      })
-      const albumFolder = prepRes?.file_path
-      if (!albumFolder) {
-        throw new Error('Không tạo được thư mục tạm để tải ZIP')
-      }
-
       const imageItems = itemsToDownload.flatMap((media) =>
         (media.images || [])
           .filter((image) => image.type === 'image' || image.type === 'gif')
           .map((image) => ({
             ...image,
-            referer: media.originalUrl,
+            referer: media.referer || media.originalUrl,
             title: image.title || media.title || 'image',
           }))
       )
       // Mỗi video của bài đăng là một mục tải riêng. Trước đây chỉ lấy video ĐẦU
-      // TIÊN (find) nên bài có 3 video chỉ tải về 1.
+      // TIÊN (find) nên bài có 3 video chỉ tải về 1. Video đi qua yt-dlp với URL gốc vì
+      // stream URL của YouTube là URL ký tạm thời và thường là HLS playlist.
       const videoItems = itemsToDownload.flatMap((media) => {
         const videos = (media.images || []).filter((image) => image.type === 'video')
         if (videos.length > 0) {
           return videos.map((image, i) => ({
-            media,
             url: image.url,
             title: videos.length > 1 ? `${media.title || 'media'} (video ${i + 1})` : media.title,
+            referer: media.referer || media.originalUrl,
+            platform: media.platform,
           }))
         }
         if (media.images?.length > 0) return []
-        return [{ media, url: media.originalUrl || media.url, title: media.title }]
+        return [{ url: media.originalUrl || media.url, title: media.title, platform: media.platform }]
       })
-      const totalUnits = imageItems.length + videoItems.length
-      let completed = 0
 
-      if (imageItems.length > 0) {
-        // Bước ảnh "completed"/"error" chưa phải kết cục của cả lượt ZIP
-        unlisten = await onDownloadProgress((payload) => {
-          const stepDone = payload?.status === 'completed' || payload?.status === 'error'
-          updateTask(taskId, stepDone ? { ...payload, status: 'processing', filePath: undefined } : payload)
-        }, taskId)
-        try {
-          const imageRes = await downloadAlbumBatch({
-            items: generateBatchMediaFilenames(imageItems, null),
-            albumName,
-            destDir: targetDir,
-            albumDir: albumFolder,
-            asZip: false,
-            taskId,
-            platform: itemsToDownload[0]?.platform,
-          })
-          const failedImages = failedCountOf(imageRes?.message)
-          if (failedImages > 0) {
-            failedCount += failedImages
-            failures.push({ label: `${failedImages} ảnh`, err: 'Liên kết ảnh có thể đã hết hạn hoặc bị chặn.' })
-          }
-        } catch (err) {
-          if (isCancelError(taskId, errorText(err, ''))) throw err
-          failedCount += imageItems.length
-          failures.push({ label: `${imageItems.length} ảnh`, err })
-        } finally {
-          unlisten()
-          unlisten = null
-        }
-        completed = imageItems.length
-      }
-
-      for (let index = 0; index < videoItems.length; index++) {
-        if (isCancelled(taskId)) return
-        const { media, url: videoUrl, title: videoTitle } = videoItems[index]
-        const videoTaskId = `${taskId}_video_${index}`
-        let videoUnlisten = null
-        try {
-          videoUnlisten = await onDownloadProgress((payload) => {
-            // Quy về phần trăm của cả lượt ZIP và không để "completed"/"error" của
-            // một video làm thẻ báo xong (ẩn nút Huỷ) khi các video sau vẫn đang tải.
-            const videoPercent = Math.min(100, Math.max(0, Number(payload?.percent) || 0))
-            const finishedOne = payload?.status === 'completed' || payload?.status === 'error'
-            updateTask(taskId, {
-              ...payload,
-              percent: ((completed + videoPercent / 100) / totalUnits) * 90,
-              // ETA của riêng một video không phải ETA của cả gói ZIP: để trống cho
-              // useDownloadTasks ước tính theo phần trăm tổng. Video đang ghép tệp
-              // cũng vẫn là "đang tải" xét trên cả gói.
-              eta: '',
-              status: finishedOne || payload?.status === 'processing' ? 'downloading' : payload?.status,
-              filePath: undefined,
-              isIndeterminate: false,
-              phase: `Đang tải video [${index + 1}/${videoItems.length}]...`,
-            })
-          }, videoTaskId)
-          if (!videoUrl) throw new Error(`Mục ${index + 1} không có URL gốc để tải`)
-          const videoRes = await startNativeDownload({
-            url: videoUrl,
-            title: videoTitle || `media_${index + 1}`,
-            destDir: albumFolder,
-            embedMetadata,
-            embedThumbnail,
-            useAria2c,
-            concurrentFragments,
-            videoFormat: videoContainer !== 'auto' ? videoContainer : undefined,
-            taskId: videoTaskId,
-            platform: media.platform,
-          })
-          if (!videoRes?.success) {
-            throw new Error(videoRes?.message || `Không tải được video thứ ${index + 1}`)
-          }
-        } catch (err) {
-          if (isCancelError(taskId, errorText(err, ''))) throw err
-          failedCount++
-          failures.push({ label: videoTitle || `Video ${index + 1}`, err })
-        } finally {
-          if (typeof videoUnlisten === 'function') videoUnlisten()
-          completed++
-          updateTask(taskId, (prev) => ({
-            ...(prev || {}),
-            percent: Math.round((completed / totalUnits) * 90),
-            status: 'downloading',
-            phase: `Đã xử lý ${completed}/${totalUnits} tệp`,
-          }))
-        }
-      }
-
-      if (isCancelled(taskId)) return
-      updateTask(taskId, {
-        percent: 92,
-        speed: '',
-        eta: '',
-        status: 'processing',
-        phase: 'Đang nén các tệp đã tải...',
+      const outcome = await downloadIntoAlbum({
+        taskId,
+        albumName,
+        targetDir,
+        fileItems: generateBatchMediaFilenames(imageItems, null),
+        ytdlpItems: videoItems,
+        asZip: true,
+        platform: itemsToDownload[0]?.platform,
       })
-      let res
-      try {
-        res = await downloadAlbumBatch({
-          items: [],
-          albumName,
-          destDir: targetDir,
-          albumDir: albumFolder,
-          asZip: true,
-          taskId,
-          platform: itemsToDownload[0]?.platform,
-        })
-      } catch (err) {
-        // Không mục nào tải được: báo nguyên nhân thật của mục đầu tiên
-        if (failures.length > 0 && !isCancelError(taskId, errorText(err, ''))) {
-          throw new Error(`Không tải được mục nào để nén ZIP. (Chi tiết: ${errorText(failures[0].err)})`, {
-            cause: err,
-          })
-        }
-        throw err
-      }
-      if (res?.success === false) throw new Error(res.message || 'Nén ZIP thất bại')
+      if (!outcome) return
+      const { res, failures, failedCount } = outcome
 
       const summary = failedCount > 0 ? `Đã nén ZIP · ${failedCount} tệp lỗi` : res?.message
       const failureDetail = failedCount > 0 ? formatFailures(failures) : ''
@@ -1420,8 +1572,6 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
       })
     } catch (err) {
       reportTaskError(taskId, err, 'Nén ZIP thất bại')
-    } finally {
-      if (typeof unlisten === 'function') unlisten()
     }
   }
 
@@ -2096,22 +2246,14 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   </div>
                 </div>
 
-                <div className="album-grid">
-                  {albumImages.map((img) => (
-                    <AlbumGridItem
-                      key={img.id}
-                      img={img}
-                      isSelected={Boolean(selectedImages[img.id])}
-                      videoBadge={
-                        albumVideoOrder.total > 1
-                          ? `${albumVideoOrder.indexOf.get(img.id)}/${albumVideoOrder.total}`
-                          : 'Video'
-                      }
-                      onToggle={handleToggleImage}
-                      onDownload={handleImageDownload}
-                    />
-                  ))}
-                </div>
+                <AlbumGrid
+                  key={singleMedia.id || singleMedia.originalUrl}
+                  images={albumImages}
+                  selected={selectedImages}
+                  videoOrder={albumVideoOrder}
+                  onToggle={handleToggleImage}
+                  onDownload={handleImageDownload}
+                />
               </div>
             )}
 

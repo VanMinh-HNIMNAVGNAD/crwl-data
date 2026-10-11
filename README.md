@@ -105,6 +105,12 @@ flowchart TD
 - [x] **Link Downloader (Đơn & Đa liên kết):** Dán link video/ảnh bất kỳ, tự động nhận diện nền tảng, cho phép chọn chất lượng (4K, 1080p, 720p, chỉ Audio MP3, Thumbnail, Subtitle).
   - Dán nhiều link (hoặc cả một đoạn tin nhắn chứa link) vào ô **1 Liên kết** sẽ tự chuyển sang **Nhiều link**, mỗi link một dòng.
   - Khung **Nhiều link** tự giãn theo số dòng và đánh số thứ tự ở lề trái (số không chèn vào nội dung nên không làm hỏng link); dòng trùng / không phải link / vượt quá 10 link được tô màu, nút **Dọn dẹp** bỏ chúng đi (Ctrl+Z để hoàn tác). Sau khi phân tích, lề trái hiện ✓ / ✕ kèm lý do cho từng link. `Ctrl+Enter` để phân tích.
+- [x] **Bài viết trên trang web bất kỳ:** Dán link một bài viết (blog, báo điện tử, diễn đàn, trang dựng bằng JavaScript...) — app lấy **toàn bộ** ảnh và video của bài: ảnh lazy-load, `srcset` / `<picture>` (tự chọn bản lớn nhất để tải, bản nhỏ để xem trước), link "xem ảnh gốc", khung so sánh trước/sau, thẻ `<video>`, video nhúng YouTube / Vimeo / Dailymotion / Facebook, luồng HLS/DASH, ảnh trong JSON-LD.
+  - Tự nhận ra vùng **bài viết** và bỏ logo, menu, quảng cáo, bài liên quan, bình luận, emoji, avatar. Trang nhiều bài (thread diễn đàn, trang chuyên mục) lấy media của mọi bài.
+  - **Có hoặc không đăng nhập đều được:** app dùng cookie của trình duyệt bạn đang đăng nhập (hoặc cookie dán trong Cookie Manager 🍪) cho **đúng tên miền** của trang — cả khi đọc bài lẫn khi tải từng tệp. Chọn "không dùng cookie" thì không đọc cookie nào.
+  - Trang dựng bằng JavaScript, cần đăng nhập, ảnh nạp khi cuộn, player video ẩn: app mở trang bằng Chromium chạy ngầm (cần Playwright, xem bên dưới), cuộn hết trang rồi đọc lại. Chromium tự đóng sau 3 phút không dùng.
+  - Video nhúng / luồng HLS trong album được tải qua yt-dlp, ảnh và tệp video thường tải thẳng — **cùng một thư mục** (hoặc một tệp ZIP).
+  - Mỗi trang lấy tối đa 500 tệp (`CRWL_PAGE_MAX_ITEMS`); lưới album vẽ dần 120 ô một lần để giao diện không đứng với bài nhiều ảnh.
 - [x] **Account / Profile Crawler:** Cào toàn bộ video hoặc bài viết từ trang cá nhân (@username), tải danh sách hoặc nén gói ZIP tiện lợi.
 - [x] **Cookie Manager Thông Minh:** Tự động đọc cookie sạch từ các trình duyệt đã cài đặt (Chrome, Brave, Firefox, Edge, Chromium) hoặc nhập file `cookies.txt` để tải nội dung riêng tư / giới hạn độ tuổi.
 - [x] **Quản Lý Bộ Công Cụ (Tools Manager):** Kiểm tra phiên bản và **cập nhật `yt-dlp` chỉ bằng 1 cú click** ngay trong giao diện ứng dụng.
@@ -172,6 +178,9 @@ pnpm install
 
 # 3. Cài đặt các thư viện Python cho lõi engine
 pip install --upgrade yt-dlp curl_cffi requests gallery-dl
+
+# 4. (Khuyên dùng) Chromium chạy ngầm cho trang dựng bằng JavaScript / cần đăng nhập
+pip install --upgrade playwright && playwright install chromium
 ```
 
 ---
@@ -312,6 +321,8 @@ Quá trình build tự động thực hiện:
 | `pnpm lint` | Kiểm tra cú pháp và định dạng mã nguồn ESLint |
 | `pnpm test:ui` | Unit test phần giao diện không cần trình duyệt (tách / đánh số link, rút gọn thông báo lỗi) |
 | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | Chạy unit test của tầng Rust |
+| `python3 -m pytest scripts/test_page_media.py scripts/test_any_site_post.py` | Kiểm thử lấy hết ảnh/video của bài viết trên trang bất kỳ (offline, máy chủ cục bộ; ca cần Chromium tự bỏ qua nếu chưa cài Playwright) |
+| `python3 -m pytest scripts/test_hang_crash_leak_guards.py` | Kiểm thử treo / crash / rò rỉ: regex quay lui trên trang lớn, IPC sai định dạng, chạy engine thật nhiều vòng (RAM, file descriptor, luồng, tiến trình con, tệp tạm), huỷ giữa chừng, Chromium không để lại tiến trình / tệp tạm |
 
 ---
 

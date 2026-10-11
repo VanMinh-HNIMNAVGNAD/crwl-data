@@ -622,3 +622,54 @@ def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str]
         sys.stderr.write(f"[Cookies] Export warning: {e}\n")
         return None
 
+
+
+def export_cookies_for_domains(domains, browser: Optional[str] = None) -> Tuple[Optional[str], int]:
+    """Gộp cookie của vài tên miền vào MỘT tệp Netscape tạm (quyền 0600) cho `curl -b`.
+
+    Bước tải ảnh/tệp của album (Rust + curl) trước đây không gửi cookie nào: bài
+    viết cần đăng nhập bóc tách được (Python dùng cookie trình duyệt) nhưng tệp nằm
+    sau đăng nhập (tệp đính kèm diễn đàn, CDN dùng cookie ký) tải về đều hỏng.
+    curl chỉ gửi mỗi cookie cho đúng tên miền / đường dẫn của nó. Bên gọi phải xoá
+    tệp sau khi dùng. Trả về (đường dẫn hoặc None, số cookie).
+    """
+    if browser == "none":
+        return None, 0
+    wanted = []
+    for raw in domains or []:
+        base = registrable_domain(str(raw or "").strip().lower().split(":")[0])
+        if base and base not in wanted:
+            wanted.append(base)
+    lines: List[str] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    for base in wanted[:5]:
+        src = get_browser_cookies_txt(browser or "auto", domain=base)
+        if not src:
+            continue
+        try:
+            with open(src, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.rstrip("\r\n")
+                    if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) < 7 or not parts[5]:
+                        continue
+                    key = (parts[0].lower(), parts[2], parts[5])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(line)
+        except OSError:
+            continue
+        finally:
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+    if not lines:
+        return None, 0
+    fd, path = tempfile.mkstemp(prefix="cookies_dl_", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(_NETSCAPE_HEADER + "\n" + "\n".join(lines) + "\n")
+    return path, len(lines)

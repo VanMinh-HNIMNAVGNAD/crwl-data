@@ -94,6 +94,9 @@ class MediaImage:
     ext: Optional[str] = None
     thumb: Optional[str] = None
     duration: Optional[str] = None
+    # "ytdlp": tệp không tải thẳng được bằng curl (trang video nhúng YouTube/Vimeo,
+    # luồng HLS/DASH) — giao diện phải tải qua yt-dlp. Bỏ trống = tệp tải thẳng.
+    via: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = {
@@ -102,6 +105,8 @@ class MediaImage:
             "title": self.title,
             "type": self.type or "image",
         }
+        if self.via:
+            res["via"] = self.via
         if self.resolution:
             res["resolution"] = self.resolution
         if self.size:
@@ -212,6 +217,13 @@ class MediaMetadata:
     # Trang chứa media khi `original_url` là luồng phát tìm được bên trong trang đó
     # (trang phim): máy chủ luồng thường chỉ phục vụ khi có Referer là trang này.
     referer: Optional[str] = None
+    # Chỉ dùng nội bộ trong engine (KHÔNG gửi lên giao diện): extractor của yt-dlp đã
+    # xử lý liên kết và trang gốc của video — để dispatcher nhận ra video chỉ là MỘT
+    # phần của một bài viết (trang nhúng video từ nơi khác) và lấy nốt phần còn lại.
+    extractor_key: Optional[str] = None
+    webpage_url: Optional[str] = None
+    # Số video yt-dlp thấy trên trang (trang nhiều <video> chỉ trả về video đầu tiên)
+    page_video_count: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = {

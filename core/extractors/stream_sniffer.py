@@ -17,11 +17,12 @@ Không hỗ trợ (hardware DRM):
 """
 
 import atexit
-import http.cookiejar
 import os
 import queue
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from typing import Optional, List, Dict, Any, Tuple, Callable
@@ -74,6 +75,31 @@ EMBED_PLAYER_PATTERNS = [
     r'vidcloud',
 ]
 
+# Đoạn "https:..." liền mạch tới ký tự phân cách. Không có phần bắt buộc nào phía
+# sau nên không bao giờ phải quay lui: thời gian tuyến tính theo độ dài trang.
+_URL_TOKEN_RE = re.compile(r'https:[^"\'<>\s]+')
+_SOCIAL_IMAGE_CDNS = ("fbcdn.net", "cdninstagram.com", "twimg.com", "pinimg.com", "scontent")
+
+
+def social_cdn_images(page_html: str) -> List[str]:
+    r"""Ảnh CDN của Facebook/Instagram/X/Pinterest xuất hiện trong mã trang (theo thứ tự, không trùng).
+
+    Trước đây dùng một regex `https:[^"'<>\s]+(?:fbcdn...)[^"'<>\s]+`: với trang
+    React/Next.js (JSON nằm trong thuộc tính, dấu nháy bị mã hoá &quot;) mỗi chuỗi
+    "https:" quét lại tới cuối đoạn → hàng phút trên trang 1-2 MB, và regex giữ GIL
+    nên CẢ engine đứng (kể cả lệnh Huỷ). Nay tách đoạn URL bằng regex không quay lui
+    rồi lọc bằng phép so chuỗi.
+    """
+    cleaned: List[str] = []
+    for token in _URL_TOKEN_RE.findall(page_html or ""):
+        if not any(cdn in token for cdn in _SOCIAL_IMAGE_CDNS):
+            continue
+        u = token.replace(r"\u0025", "%").replace(r"\/", "/").replace("&amp;", "&").replace(r"\\", "")
+        if any(ext in u.lower() for ext in (".jpg", ".png", ".webp", ".jpeg")):
+            if not any(skip in u for skip in ("rsrc.php", "p50x50", "s150x150", "emoji")):
+                cleaned.append(u)
+    return list(dict.fromkeys(cleaned))
+
 # JSON response keys thường chứa stream URL
 STREAM_JSON_KEYS = [
     'file', 'src', 'url', 'source', 'stream', 'video', 'hls', 'dash',
@@ -103,11 +129,17 @@ class _PlaywrightWorkerThread(threading.Thread):
     # (lần dò sau tự khởi động lại). <= 0 = không tự đóng.
     IDLE_SHUTDOWN_SEC = _env_seconds("CRWL_SNIFFER_IDLE_SEC", 180.0)
 
+    # Thư mục tạm riêng của mỗi lần khởi động Chromium (xem _ensure_browser)
+    TMP_PREFIX = "crwl-chromium-"
+    # Thư mục tạm cũ hơn chừng này giây là của lần chạy đã chết (app bị tắt ngang)
+    STALE_TMP_SEC = 6 * 60 * 60
+
     def __init__(self):
         super().__init__(daemon=True, name="pw_sniffer_worker")
         self._tasks: queue.Queue = queue.Queue()
         self._pw = None
         self._browser = None
+        self._tmpdir: Optional[str] = None
         self._started_event = threading.Event()
         self.start()
 
@@ -202,15 +234,24 @@ class _PlaywrightWorkerThread(threading.Thread):
         if proxy:
             # Chromium không tự đọc HTTP(S)_PROXY như yt-dlp/gallery-dl
             launch_kwargs["proxy"] = {"server": proxy}
+        # Với --disable-dev-shm-usage, Chromium tạo tệp bộ nhớ chia sẻ trong TMPDIR và
+        # không phải lúc nào cũng xoá: /tmp tích dần các ".org.chromium.Chromium.*".
+        # Cho mỗi lần khởi động một thư mục tạm riêng rồi xoá nguyên thư mục khi đóng.
+        self._remove_stale_tmpdirs()
+        self._tmpdir = tempfile.mkdtemp(prefix=self.TMP_PREFIX)
+        launch_kwargs["env"] = {**os.environ, "TMPDIR": self._tmpdir}
         self._browser = self._pw.chromium.launch(
             **launch_kwargs,
             headless=True,
+            # KHÔNG dùng --disable-web-security: trình duyệt này mở trang BẤT KỲ người
+            # dùng dán vào, kèm cookie đăng nhập. Tắt same-origin cho phép script của
+            # trang đó đọc phản hồi từ trang khác và từ mạng nội bộ (router, NAS...).
+            # Playwright vẫn đọc được iframe khác nguồn mà không cần cờ này.
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-web-security",  # cho phép cross-origin iframe
                 "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
@@ -229,6 +270,27 @@ class _PlaywrightWorkerThread(threading.Thread):
             except Exception:
                 pass
             self._pw = None
+        if self._tmpdir:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
+
+    def _remove_stale_tmpdirs(self) -> None:
+        """Dọn thư mục tạm của các lần chạy trước bị tắt ngang (không kịp _cleanup)."""
+        base = tempfile.gettempdir()
+        now = time.time()
+        try:
+            names = os.listdir(base)
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith(self.TMP_PREFIX):
+                continue
+            path = os.path.join(base, name)
+            try:
+                if now - os.path.getmtime(path) > self.STALE_TMP_SEC:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
 
     def close(self):
         if self.is_alive():
@@ -306,6 +368,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
         page_url: str,
         wait_ms: int = 5000,
         follow_iframes: bool = True,
+        browser: Optional[str] = "auto",
     ) -> Dict[str, Any]:
         """
         Mở trang bằng Playwright qua instance Chromium ngầm, bắt tất cả network requests liên quan đến media.
@@ -346,6 +409,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
                 page_url,
                 wait_ms,
                 follow_iframes,
+                browser,
                 timeout=timeout_sec,
                 stop_when=(lambda: is_cancelled(req_id)) if req_id else None,
             )
@@ -368,13 +432,16 @@ class PlaywrightStreamSniffer(BaseExtractor):
         page_url: str,
         wait_ms: int = 5000,
         follow_iframes: bool = True,
+        cookie_browser: Optional[str] = "auto",
         should_stop: Callable[[], bool] = lambda: False,
     ) -> Dict[str, Any]:
         """Thực thi sniffing trên luồng chuyên biệt của Playwright worker"""
         worker = self._get_worker()
         browser = worker._ensure_browser()
 
-        captured_urls, iframe_urls, captured_images = self._sniff_page(browser, page_url, wait_ms, should_stop)
+        captured_urls, iframe_urls, captured_images = self._sniff_page(
+            browser, page_url, wait_ms, should_stop, cookie_browser
+        )
 
         # Nếu chưa tìm được stream từ main page, thử navigate từng iframe embed
         if not captured_urls and iframe_urls and follow_iframes:
@@ -383,7 +450,9 @@ class PlaywrightStreamSniffer(BaseExtractor):
                     break
                 self.log(f"[Sniffer] Thử sniff iframe: {iframe_url[:100]}")
                 try:
-                    i_urls, _, _ = self._sniff_page(browser, iframe_url, min(wait_ms, 8000), should_stop)
+                    i_urls, _, _ = self._sniff_page(
+                        browser, iframe_url, min(wait_ms, 8000), should_stop, cookie_browser
+                    )
                     if i_urls:
                         captured_urls.extend(i_urls)
                         break
@@ -410,6 +479,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
         target_url: str,
         wait_ms: int,
         should_stop: Callable[[], bool] = lambda: False,
+        cookie_browser: Optional[str] = "auto",
     ) -> Tuple[List[str], List[str], List[MediaImage]]:
         """Mở một context/page mới trên instance browser hiện có, sniff và đóng context khi xong"""
         captured_urls: List[str] = []
@@ -428,38 +498,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
 
         try:
             # Nạp cookies từ trình duyệt nếu có
-            cfile = None
-            try:
-                import urllib.parse
-                domain = urllib.parse.urlparse(target_url).netloc
-                cfile = get_browser_cookies_txt("auto", domain=domain)
-                if cfile and os.path.exists(cfile):
-                    cj = http.cookiejar.MozillaCookieJar(cfile)
-                    cj.load(ignore_discard=True, ignore_expires=True)
-                    pw_cookies = []
-                    for c in cj:
-                        d = c.domain
-                        if not d.startswith(".") and domain in d:
-                            d = "." + d
-                        pw_cookies.append({
-                            "name": c.name,
-                            "value": c.value,
-                            "domain": d,
-                            "path": c.path,
-                        })
-                    if pw_cookies:
-                        context.add_cookies(pw_cookies)
-            except Exception:
-                pass
-            finally:
-                # get_browser_cookies_txt() luôn tạo một tệp tạm MỚI chứa cookie đăng
-                # nhập. Trước đây tệp này không bao giờ bị xoá: mỗi lần dò (trang chính
-                # + tối đa 3 iframe) lại để lại một bản sao phiên đăng nhập trong /tmp.
-                if cfile and os.path.exists(cfile):
-                    try:
-                        os.remove(cfile)
-                    except OSError:
-                        pass
+            self._apply_cookies(context, target_url, cookie_browser)
 
             # Bắt tất cả requests
             page = context.new_page()
@@ -567,15 +606,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
 
             # Bóc tách ảnh từ nội dung trang (ảnh chất lượng cao bài viết)
             try:
-                page_html = page.content()
-                raw_imgs = re.findall(r'https:[^"\'<>\s]+(?:fbcdn\.net|cdninstagram\.com|twimg\.com|pinimg\.com|scontent)[^"\'<>\s]+', page_html)
-                cleaned_imgs = []
-                for m in raw_imgs:
-                    u = m.replace(r"\u0025", "%").replace(r"\/", "/").replace("&amp;", "&").replace(r"\\", "")
-                    if any(ext in u.lower() for ext in (".jpg", ".png", ".webp", ".jpeg")):
-                        if not any(skip in u for skip in ("rsrc.php", "p50x50", "s150x150", "emoji")):
-                            cleaned_imgs.append(u)
-                deduped_imgs = list(dict.fromkeys(cleaned_imgs))
+                deduped_imgs = social_cdn_images(page.content())
                 for idx, img_u in enumerate(deduped_imgs[:60], 1):
                     captured_images.append(
                         MediaImage(
@@ -600,6 +631,218 @@ class PlaywrightStreamSniffer(BaseExtractor):
                 pass
 
         return captured_urls, iframe_urls, captured_images
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cookie đăng nhập
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _apply_cookies(self, context, target_url: str, cookie_browser: Optional[str]) -> int:
+        """Nạp cookie của ĐÚNG tên miền trang vào phiên trình duyệt; trả về số cookie.
+
+        Trước đây luôn lấy cookie ("auto") kể cả khi người dùng chọn không dùng cookie.
+        """
+        if cookie_browser == "none":
+            return 0
+        from .page_media import load_cookie_jar
+
+        cfile = None
+        try:
+            import urllib.parse
+            host = urllib.parse.urlparse(target_url).hostname or ""
+            cfile = get_browser_cookies_txt(cookie_browser or "auto", domain=host)
+            jar = load_cookie_jar(cfile) if cfile and os.path.exists(cfile) else None
+            pw_cookies = []
+            for c in (jar or []):
+                domain = c.domain
+                if not domain.startswith(".") and c.domain_specified:
+                    domain = "." + domain
+                cookie = {
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": domain,
+                    "path": c.path or "/",
+                    "secure": bool(c.secure),
+                }
+                if c.expires:
+                    cookie["expires"] = float(c.expires)
+                pw_cookies.append(cookie)
+            if pw_cookies:
+                context.add_cookies(pw_cookies)
+            return len(pw_cookies)
+        except Exception as err:
+            self.warn(f"[Sniffer] Không nạp được cookie: {err}")
+            return 0
+        finally:
+            # get_browser_cookies_txt() luôn tạo một tệp tạm MỚI chứa cookie đăng
+            # nhập. Trước đây tệp này không bao giờ bị xoá: mỗi lần dò (trang chính
+            # + tối đa 3 iframe) lại để lại một bản sao phiên đăng nhập trong /tmp.
+            if cfile and os.path.exists(cfile):
+                try:
+                    os.remove(cfile)
+                except OSError:
+                    pass
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Thu thập TOÀN BỘ media của một bài viết đã dựng xong (page_media dùng)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Số bước cuộn tối đa để nạp ảnh lazy-load; trang cuộn vô tận dừng ở đây
+    COLLECT_MAX_SCROLL_STEPS = 40
+    COLLECT_MAX_ITEMS = 3000
+
+    def collect_page_media(self, page_url: str, browser: Optional[str] = "auto") -> Dict[str, Any]:
+        """Mở trang bằng Chromium (kèm cookie), cuộn hết trang rồi đọc mọi ảnh/video.
+
+        Trả về dữ liệu thô {"dom", "frames", "network", "error"} để page_media chọn
+        đúng phần của bài viết.
+        """
+        if not self._playwright_available:
+            return {"dom": None, "frames": [], "network": [], "error": "Playwright chưa được cài đặt"}
+        try:
+            worker = self._get_worker()
+            timeout_sec = cap_timeout(
+                self.PLAYWRIGHT_TIMEOUT / 1000.0 + 45.0,
+                minimum=5.0,
+            )
+            req_id = current_request_id()
+            result = worker.submit(
+                self._do_collect_page_media,
+                page_url,
+                browser,
+                timeout=timeout_sec,
+                stop_when=(lambda: is_cancelled(req_id)) if req_id else None,
+            )
+            raise_if_cancelled()
+            return result
+        except Exception as e:
+            if type(e).__name__ in ("RequestCancelled", "RequestTimedOut"):
+                raise
+            self.warn(f"[Sniffer] Không đọc được trang bằng trình duyệt: {e}")
+            return {"dom": None, "frames": [], "network": [], "error": str(e)}
+
+    def _do_collect_page_media(
+        self,
+        page_url: str,
+        cookie_browser: Optional[str] = "auto",
+        should_stop: Callable[[], bool] = lambda: False,
+    ) -> Dict[str, Any]:
+        from .page_media import DOM_IMG_ATTRS, _ARTICLE_ITEMTYPES, _CHROME_WORDS, _MAIN_TOKENS
+
+        worker = self._get_worker()
+        browser = worker._ensure_browser()
+        network: List[Dict[str, Any]] = []
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 900},
+            ignore_https_errors=True,
+            java_script_enabled=True,
+            locale="vi-VN",
+        )
+        try:
+            used = self._apply_cookies(context, page_url, cookie_browser)
+            if used:
+                self.log(f"[Sniffer] Mở trang kèm {used} cookie đăng nhập")
+            page = context.new_page()
+
+            def on_response(response):
+                # Chỉ ghi URL + loại nội dung, KHÔNG đọc thân phản hồi (video vài GB)
+                if len(network) >= 800:
+                    return
+                try:
+                    url = response.url
+                    ctype = (response.headers.get("content-type") or "").lower()
+                    length = response.headers.get("content-length") or 0
+                except Exception:
+                    return
+                if (
+                    ctype.startswith(("video/", "audio/"))
+                    or "mpegurl" in ctype
+                    or "dash+xml" in ctype
+                    or _COLLECT_MEDIA_URL_RE.search(url.lower())
+                ):
+                    network.append({"url": url, "ctype": ctype, "length": length})
+
+            page.on("response", on_response)
+            try:
+                page.goto(page_url, timeout=self.PLAYWRIGHT_TIMEOUT, wait_until="domcontentloaded")
+            except Exception as nav_err:
+                self.warn(f"[Sniffer] Lỗi mở trang: {nav_err}")
+            if should_stop():
+                return {"dom": None, "frames": [], "network": network, "error": "Đã dừng"}
+            try:
+                page.wait_for_load_state("load", timeout=6000)
+            except Exception:
+                pass
+
+            self._auto_scroll(page, should_stop)
+            if should_stop():
+                return {"dom": None, "frames": [], "network": network, "error": "Đã dừng"}
+
+            # Video phát bằng blob: (MSE) chỉ tải manifest khi bắt đầu phát
+            try:
+                started = page.evaluate(_PLAY_HIDDEN_VIDEOS_JS) or 0
+            except Exception:
+                started = 0
+            if started:
+                self._wait(page, 2500, should_stop)
+
+            opts = {
+                "max": self.COLLECT_MAX_ITEMS,
+                "chromeWords": sorted(_CHROME_WORDS),
+                "mainTokens": sorted(_MAIN_TOKENS),
+                "articleItemtypes": list(_ARTICLE_ITEMTYPES),
+                "imgAttrs": list(DOM_IMG_ATTRS),
+            }
+            dom = page.evaluate(_COLLECT_PAGE_MEDIA_JS, opts)
+            frames: List[Dict[str, Any]] = []
+            for frame in page.frames[1:21]:
+                if should_stop():
+                    break
+                try:
+                    if not frame.url or frame.url == "about:blank":
+                        continue
+                    frames.append({"url": frame.url, "items": frame.evaluate(_COLLECT_FRAME_VIDEOS_JS)})
+                except Exception:
+                    continue
+            return {"dom": dom, "frames": frames, "network": network, "error": None}
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+    def _wait(self, page, ms: int, should_stop: Callable[[], bool]) -> None:
+        waited = 0
+        while waited < ms and not should_stop():
+            step = min(250, ms - waited)
+            page.wait_for_timeout(step)
+            waited += step
+
+    def _auto_scroll(self, page, should_stop: Callable[[], bool]) -> None:
+        """Cuộn tới cuối trang theo từng màn hình để ảnh lazy-load được nạp."""
+        at_bottom = 0
+        for _ in range(self.COLLECT_MAX_SCROLL_STEPS):
+            if should_stop():
+                return
+            try:
+                done = page.evaluate(_SCROLL_STEP_JS)
+            except Exception:
+                return
+            self._wait(page, 300, should_stop)
+            if done:
+                at_bottom += 1
+                if at_bottom >= 2:
+                    break
+            else:
+                at_bottom = 0
+        try:
+            page.evaluate("() => window.scrollTo(0, 0)")
+        except Exception:
+            pass
+        self._wait(page, 300, should_stop)
 
     def _is_media_url(self, url: str) -> bool:
         """Kiểm tra URL có phải media stream không"""
@@ -681,6 +924,182 @@ class PlaywrightStreamSniffer(BaseExtractor):
             )
 
         return streams
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Script chạy trong trang (collect_page_media)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_COLLECT_MEDIA_URL_RE = re.compile(r"\.(?:m3u8|mpd|mp4|webm|m4v|mov)(?:[?#]|$)")
+
+_SCROLL_STEP_JS = """() => {
+  window.scrollBy(0, Math.max(400, Math.floor(window.innerHeight * 0.85)));
+  const el = document.scrollingElement || document.documentElement;
+  return (window.innerHeight + window.scrollY) >= (el.scrollHeight - 4);
+}"""
+
+_PLAY_HIDDEN_VIDEOS_JS = """() => {
+  let started = 0;
+  for (const v of document.querySelectorAll('video')) {
+    if (started >= 5) break;
+    const src = v.currentSrc || v.getAttribute('src') || '';
+    if (src && !src.startsWith('blob:')) continue;
+    try {
+      v.muted = true;
+      const p = v.play();
+      if (p && p.catch) p.catch(() => {});
+      started++;
+    } catch (e) {}
+  }
+  return started;
+}"""
+
+_COLLECT_FRAME_VIDEOS_JS = """() => Array.from(document.querySelectorAll('video')).slice(0, 50).map((v) => ({
+  kind: 'video',
+  src: v.currentSrc || v.getAttribute('src') || v.getAttribute('data-src') || '',
+  sources: Array.from(v.querySelectorAll('source')).slice(0, 10).map((s) => ({ src: s.src || s.getAttribute('data-src') || '', type: s.type || '' })),
+  poster: v.poster || v.getAttribute('data-poster') || '',
+}))"""
+
+# Cùng quy tắc phân vùng với page_media.container_level (bài viết / khung chính /
+# vùng viền), để HTML tĩnh và DOM đã dựng được chọn bằng một thuật toán duy nhất.
+_COLLECT_PAGE_MEDIA_JS = """(opts) => {
+  const MAX = opts.max;
+  const CHROME = new Set(opts.chromeWords);
+  const MAIN = new Set(opts.mainTokens);
+  const ITEMTYPES = opts.articleItemtypes;
+  const IMG_ATTRS = opts.imgAttrs;
+  const ids = new Map();
+  const containers = [];
+  const levelOf = (el) => {
+    const tag = el.tagName.toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const itemprop = (el.getAttribute('itemprop') || '').toLowerCase();
+    const itemtype = (el.getAttribute('itemtype') || '').toLowerCase();
+    if (tag === 'article' || role === 'article' || itemprop === 'blogpost' || itemprop === 'articlebody'
+        || (itemtype && ITEMTYPES.some((t) => itemtype.includes(t)))) return 'article';
+    if (tag === 'aside' || tag === 'nav' || tag === 'footer' || role === 'navigation'
+        || role === 'complementary' || role === 'contentinfo') return 'chrome';
+    const cls = typeof el.className === 'string' ? el.className : (el.getAttribute('class') || '');
+    const tokens = (cls + ' ' + (el.id || '')).toLowerCase().split(/\\s+/).filter(Boolean).slice(0, 40)
+      .map((t) => t.replace(/_/g, '-'));
+    if (tag !== 'body' && tag !== 'html' && tag !== 'main') {
+      for (const t of tokens) {
+        if (CHROME.has(t)) return 'hint';
+        for (const w of t.split('-')) if (w && CHROME.has(w)) return 'hint';
+      }
+    }
+    if (tag === 'main' || role === 'main') return 'main';
+    for (const t of tokens) if (MAIN.has(t)) return 'body';
+    if (tag === 'header' || role === 'banner') return 'header';
+    return null;
+  };
+  const pathOf = (el) => {
+    const chain = [];
+    for (let p = el.parentElement; p && chain.length < 400; p = p.parentElement) chain.push(p);
+    chain.reverse();
+    const path = [];
+    let parent = null;
+    for (const p of chain) {
+      let id = ids.get(p);
+      if (id === undefined) {
+        const level = path.length < 64 ? levelOf(p) : null;
+        if (level) {
+          id = containers.length;
+          containers.push({ id, level, parent, tag: p.tagName.toLowerCase(), text: (p.textContent || '').length });
+        } else {
+          id = null;
+        }
+        ids.set(p, id);
+      }
+      if (id !== null) { path.push(id); parent = id; }
+    }
+    return path;
+  };
+  const items = [];
+  const push = (o) => { if (items.length < MAX) items.push(o); };
+  const attrsOf = (el) => {
+    const r = {};
+    for (const n of IMG_ATTRS) {
+      const v = el.getAttribute(n);
+      if (v) r[n] = v.slice(0, 8192);
+    }
+    return r;
+  };
+  for (const img of Array.from(document.images).slice(0, MAX)) {
+    const r = img.getBoundingClientRect();
+    const a = img.closest('a[href]');
+    const pic = img.parentElement && img.parentElement.tagName === 'PICTURE' ? img.parentElement : null;
+    push({
+      kind: 'img',
+      src: img.currentSrc || img.getAttribute('src') || '',
+      attrs: attrsOf(img),
+      pictureSrcsets: pic ? Array.from(pic.querySelectorAll('source')).slice(0, 10)
+        .map((s) => s.getAttribute('srcset') || s.getAttribute('data-srcset') || '').filter(Boolean) : [],
+      link: a ? a.href : '',
+      nw: img.naturalWidth || 0, nh: img.naturalHeight || 0,
+      rw: Math.round(r.width), rh: Math.round(r.height),
+      path: pathOf(img),
+    });
+  }
+  for (const v of Array.from(document.querySelectorAll('video')).slice(0, 200)) {
+    push({
+      kind: 'video',
+      src: v.currentSrc || v.getAttribute('src') || v.getAttribute('data-src') || '',
+      sources: Array.from(v.querySelectorAll('source')).slice(0, 10)
+        .map((s) => ({ src: s.src || s.getAttribute('data-src') || '', type: s.type || '' })),
+      poster: v.poster || v.getAttribute('data-poster') || '',
+      path: pathOf(v),
+    });
+  }
+  for (const f of Array.from(document.querySelectorAll('iframe')).slice(0, 200)) {
+    push({ kind: 'iframe', src: f.src || f.getAttribute('data-src') || '', path: pathOf(f) });
+  }
+  for (const a of Array.from(document.querySelectorAll('a[href]')).slice(0, 5000)) {
+    if (items.length >= MAX) break;
+    if (a.querySelector('img,video,picture')) continue;
+    if (/\\.(jpe?g|png|gif|webp|avif|mp4|webm|mov|m4v|m3u8)$/i.test(a.pathname || '')) {
+      push({ kind: 'a', src: a.href, path: pathOf(a) });
+    }
+  }
+  let scanned = 0;
+  const SKIP = new Set(['IMG', 'VIDEO', 'AUDIO', 'SOURCE', 'SCRIPT', 'STYLE', 'IFRAME', 'LINK', 'META', 'INPUT', 'svg']);
+  if (document.body) {
+    for (const el of document.body.getElementsByTagName('*')) {
+      if (++scanned > 8000 || items.length >= MAX) break;
+      const tag = el.tagName;
+      if (SKIP.has(tag)) continue;
+      // Ảnh nằm trong thuộc tính data-* (khung so sánh trước/sau, slider, nền lazy)
+      let dataAttrs = null;
+      for (const a of el.attributes) {
+        if (!a.name.startsWith('data-') || !a.value || a.value.length > 4096) continue;
+        if (!/\\.(jpe?g|png|gif|webp|avif|bmp|heic|jfif)(\\?|#|\\s|,|$)/i.test(a.value)) continue;
+        (dataAttrs = dataAttrs || {})[a.name] = a.value;
+      }
+      if (dataAttrs) push({ kind: 'data', attrs: dataAttrs, path: pathOf(el) });
+      const r = el.getBoundingClientRect();
+      if (r.width < 200 || r.height < 150) continue;
+      const bg = getComputedStyle(el).backgroundImage;
+      if (!bg || bg === 'none' || bg.indexOf('url(') < 0) continue;
+      const m = /url\\(\\s*["']?([^"')]+)["']?\\s*\\)/.exec(bg);
+      if (m) push({ kind: 'bg', src: m[1], rw: Math.round(r.width), rh: Math.round(r.height), path: pathOf(el) });
+    }
+  }
+  const meta = {};
+  for (const m of document.querySelectorAll('meta[property],meta[name]')) {
+    const k = (m.getAttribute('property') || m.getAttribute('name') || '').toLowerCase();
+    if (k && !(k in meta)) meta[k] = (m.getAttribute('content') || '').slice(0, 2000);
+  }
+  const ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).slice(0, 20)
+    .map((s) => (s.textContent || '').slice(0, 500000));
+  return {
+    url: location.href,
+    title: document.title || '',
+    containers, items, meta, ld,
+    hasPassword: !!document.querySelector('input[type="password"]'),
+    textLen: document.body ? (document.body.textContent || '').length : 0,
+  };
+}"""
 
 
 # Singleton lazy-loaded
