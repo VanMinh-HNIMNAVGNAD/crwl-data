@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { memo, useCallback, useState, useEffect, useMemo, useRef } from 'react'
 import {
   IconDownload,
   IconClose,
@@ -11,7 +11,7 @@ import {
   IconCopy,
   IconSettings,
 } from './Icons'
-import { VIDEO_CONTAINER_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform, isGenericShortenerUrl, safeThumbSrc } from '../constants'
+import { VIDEO_CONTAINER_OPTIONS, detectPlatform, validatePlatformUrl, getPlatform, isGenericShortenerUrl, safeThumbSrc, previewSrcOf } from '../constants'
 import {
   extractMedia,
   cancelExtraction,
@@ -30,6 +30,7 @@ import {
 import { DownloadTaskList } from './DownloadProgressCard'
 import LinkListEditor from './LinkListEditor'
 import { useDownloadTasks } from '../hooks/useDownloadTasks'
+import { useStableCallback } from '../hooks/useStableCallback'
 import {
   MAX_BATCH_LINKS,
   analyzeLinkLines,
@@ -42,6 +43,7 @@ import {
   normalizeLink,
 } from '../utils/links'
 import { describeError, errorText, shortenMiddle } from '../utils/messages'
+import { hasDownloadableContent, noDownloadableContentReason } from '../utils/media'
 import { errorToast, openFolderAction, savedToast } from '../utils/toasts'
 import { insertTextAtCursor } from '../utils/textInput'
 
@@ -131,7 +133,168 @@ function generateBatchMediaFilenames(items, defaultReferer = null) {
   })
 }
 
-export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
+// Các dòng/ô dưới đây được `memo`: trước đây mỗi sự kiện tiến trình tải vẽ lại toàn
+// bộ khung kết quả (lưới album, danh sách nhiều link, danh sách định dạng) dù chúng
+// không đổi — tải nhiều tệp cùng lúc là giao diện giật và CPU tăng vọt.
+
+/** Một dòng định dạng (video / âm thanh) của kết quả tải đơn. */
+const StreamRow = memo(function StreamRow({ stream, isBusy, onDownload }) {
+  const isAudio = stream.streamType === 'audio'
+  return (
+    <div className="stream-row-item">
+      <div className="stream-left-info">
+        {isAudio ? (
+          <IconAudio className="w-4 h-4 text-emerald-400" />
+        ) : (
+          <IconVideo className="w-4 h-4 text-blue-400" />
+        )}
+        <div className="stream-title-group">
+          <span className="stream-quality-title">
+            {stream.quality || (isAudio ? 'MP3 Audio' : 'Video Stream')}
+          </span>
+          <span className="stream-details-sub">
+            {stream.format || (isAudio ? 'Âm thanh' : 'Video')}
+            {stream.size ? ` • ${stream.size}` : ''}
+            {stream.fps ? ` • ${stream.fps}` : ''}
+            {stream.bitrate ? ` • ${stream.bitrate}` : ''}
+          </span>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        className="stream-download-btn btn-success"
+        onClick={() => onDownload(stream)}
+        disabled={isBusy}
+      >
+        {isBusy ? (
+          <>
+            <span className="minimal-spinner" />
+            <span>Đang tải...</span>
+          </>
+        ) : (
+          <>
+            <IconDownload className="w-3.5 h-3.5" />
+            <span>Tải về</span>
+          </>
+        )}
+      </button>
+    </div>
+  )
+})
+
+/** Một ô trong lưới album của kết quả tải đơn. */
+const AlbumGridItem = memo(function AlbumGridItem({ img, isSelected, videoBadge, onToggle, onDownload }) {
+  const thumbSrc = previewSrcOf(img)
+  return (
+    <div
+      className={`album-item ${isSelected ? 'is-selected' : ''}`}
+      onClick={() => onToggle(img.id)}
+    >
+      {thumbSrc ? (
+        <img
+          src={thumbSrc}
+          alt=""
+          className="album-img"
+          loading="lazy"
+          decoding="async"
+          onError={(e) => {
+            e.target.style.display = 'none'
+          }}
+        />
+      ) : (
+        <div className="album-img thumb-placeholder">
+          <IconVideo className="w-5 h-5" />
+        </div>
+      )}
+      {img.type === 'video' && (
+        <span className="album-video-badge">
+          <IconVideo className="w-3 h-3" />
+          {videoBadge}
+          {img.duration ? ` · ${img.duration}` : ''}
+        </span>
+      )}
+      <input
+        type="checkbox"
+        className="album-checkbox"
+        checked={isSelected}
+        readOnly
+      />
+      <button
+        type="button"
+        className="album-download-btn"
+        onClick={(e) => {
+          e.stopPropagation()
+          onDownload(img)
+        }}
+        title={img.type === 'video' ? 'Tải video này' : 'Tải ảnh này'}
+      >
+        <IconDownload className="w-3 h-3" />
+      </button>
+    </div>
+  )
+})
+
+/** Một dòng trong danh sách kết quả "Nhiều link". */
+const BatchResultRow = memo(function BatchResultRow({ media, index, isSelected, isBusy, onToggle, onDownload }) {
+  const thumbSrc = safeThumbSrc(media.thumbnail, media.highResThumbnail)
+  return (
+    <div
+      className={`batch-row-item ${isSelected ? 'is-selected' : ''}`}
+      onClick={() => onToggle(index)}
+    >
+      <input
+        type="checkbox"
+        checked={isSelected}
+        onChange={() => onToggle(index)}
+        onClick={(e) => e.stopPropagation()}
+        aria-label={`Chọn ${media.title || 'liên kết'}`}
+      />
+      {thumbSrc ? (
+        <img
+          src={thumbSrc}
+          alt=""
+          className="batch-item-thumb"
+          loading="lazy"
+          decoding="async"
+          onError={(e) => {
+            e.target.style.display = 'none'
+          }}
+        />
+      ) : (
+        <div className="batch-item-thumb thumb-placeholder">
+          <IconVideo className="w-3.5 h-3.5" />
+        </div>
+      )}
+      <div className="batch-item-info">
+        <span className="batch-item-title" title={media.title}>
+          {media.title || 'Liên kết'}
+        </span>
+        <span className="batch-item-sub">
+          {media.platform?.toUpperCase()}
+          {media.duration ? ` • ${media.duration}` : ''}
+        </span>
+      </div>
+      <button
+        type="button"
+        className="minimal-small-btn btn-success"
+        onClick={(e) => {
+          e.stopPropagation()
+          onDownload(media)
+        }}
+        disabled={isBusy}
+        title={media.streams?.length ? 'Tải định dạng tốt nhất' : 'Tải toàn bộ ảnh/video của bài vào một thư mục'}
+      >
+        <IconDownload className="w-3.5 h-3.5" />
+        <span>{isBusy ? 'Đang tải...' : 'Tải về'}</span>
+      </button>
+    </div>
+  )
+})
+
+const BATCH_PLACEHOLDER = `Dán một hoặc nhiều liên kết, mỗi link một dòng (tối đa ${MAX_BATCH_LINKS}).\nDán cả đoạn tin nhắn cũng được — link sẽ tự được tách và đánh số.`
+
+function LinkDownloader({ onShowToast, dlOptions = {} }) {
   // Shared download options từ App level (persist qua localStorage)
   const {
     videoContainer = 'auto',
@@ -175,6 +338,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     markCancelled,
     isCancelled,
     isSourceBusy,
+    busyKeys,
   } = useDownloadTasks()
   const [userSelectedSubLang, setUserSelectedSubLang] = useState('')
   const selectedSubLang = userSelectedSubLang || singleMedia?.subtitles?.[0]?.lang || ''
@@ -403,11 +567,16 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         setSelectedImages({})
         setUserSelectedSubLang('')
         resetTrimmer()
-        onShowToast?.({
-          type: 'success',
-          title: 'Đã phân tích xong',
-          message: shortenMiddle(data.title || 'Chọn định dạng bên dưới để tải về', 72),
-        })
+        onShowToast?.(
+          hasDownloadableContent(data)
+            ? {
+                type: 'success',
+                title: 'Đã phân tích xong',
+                message: shortenMiddle(data.title || 'Chọn định dạng bên dưới để tải về', 72),
+              }
+            : // Trang DRM / player mã hoá: trước đây vẫn báo "Đã phân tích xong" màu xanh
+              { type: 'warning', title: 'Không tìm được nguồn tải', message: noDownloadableContentReason(data) }
+        )
       }
     } catch (err) {
       if (!cancelRef.current) {
@@ -461,6 +630,9 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
         if (cancelRef.current) break
         // Không có dữ liệu cũng là lỗi — trước đây link đó lặng lẽ biến mất khỏi kết quả
         if (!item) throw new Error('Không tìm thấy dữ liệu phương tiện từ liên kết này')
+        // Có kết quả nhưng không có luồng / tệp nào (trang DRM...): trước đây được đánh ✓
+        // kèm nút "Tải về" mà bấm vào chỉ nhận lỗi.
+        if (!hasDownloadableContent(item)) throw new Error(noDownloadableContentReason(item))
         results.push(item)
         markLink(key, { state: 'ok', note: item.title || '' })
       } catch (err) {
@@ -541,7 +713,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
   }
 
   // Hủy một tác vụ tải và xoá sạch tệp dở dang của nó
-  const handleCancelDownload = async (taskId) => {
+  const handleCancelDownload = useStableCallback(async (taskId) => {
     if (!taskId) return
     markCancelled(taskId)
     try {
@@ -558,7 +730,7 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     } catch (err) {
       console.error('Cancel download error:', err)
     }
-  }
+  })
 
   const isCancelError = (taskId, msg) =>
     isCancelled(taskId) || msg.includes('cancelled') || msg.includes('hủy') || msg.includes('huỷ') || msg.includes('abort')
@@ -838,6 +1010,13 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const isAlbumBusy = isSourceBusy('album')
   const isBatchZipBusy = isSourceBusy('batch-zip')
 
+  // Danh tính cố định cho các ô / dòng đã memo
+  const handleStreamDownload = useStableCallback((stream) => handleDownloadStream(stream))
+  const handleImageDownload = useStableCallback(handleDownloadImage)
+  const handleToggleImage = useCallback((id) => {
+    setSelectedImages((prev) => ({ ...prev, [id]: !prev[id] }))
+  }, [])
+
   const handleToggleSelectAllImages = () => {
     if (selectedImageCount === albumImages.length) {
       setSelectedImages({})
@@ -993,6 +1172,11 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     }
     handleDownloadStream({ quality: 'Tự động' }, media)
   }
+
+  const handleBatchItemDownload = useStableCallback((media) => handleDownloadBatchItem(media))
+  const handleToggleBatchItem = useCallback((index) => {
+    setSelectedBatchIds((prev) => ({ ...prev, [index]: !prev[index] }))
+  }, [])
 
   const selectedBatchCount = useMemo(
     () => Object.values(selectedBatchIds).filter(Boolean).length,
@@ -1283,6 +1467,21 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     setBatchText(cleaned)
   }
 
+  // Khung "Nhiều link" (đã memo) chỉ vẽ lại khi nội dung / trạng thái link đổi
+  const handleBatchTextChange = useStableCallback((val) => {
+    setBatchText(val)
+    if (!val.trim()) {
+      setLinkStatus({})
+      setBatchMedias([])
+      setSelectedImages({})
+      clearFinishedTasks()
+    }
+  })
+  const handleLinksPasted = useStableCallback(notifyLinksAdded)
+  const handleBatchSubmit = useStableCallback(() => {
+    if (!isLoading) handleBatchExtract()
+  })
+
   const handleCopy = async (text) => {
     if (!text) return
     try {
@@ -1417,25 +1616,15 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
             <div className="batch-textarea-wrap">
               <LinkListEditor
                 value={batchText}
-                onChange={(val) => {
-                  setBatchText(val)
-                  if (!val.trim()) {
-                    setLinkStatus({})
-                    setBatchMedias([])
-                    setSelectedImages({})
-                    clearFinishedTasks()
-                  }
-                }}
+                onChange={handleBatchTextChange}
                 analysis={batchAnalysis}
                 statusByKey={linkStatus}
                 maxLinks={MAX_BATCH_LINKS}
                 disabled={isLoading}
                 inputRef={batchInputRef}
-                placeholder={`Dán một hoặc nhiều liên kết, mỗi link một dòng (tối đa ${MAX_BATCH_LINKS}).\nDán cả đoạn tin nhắn cũng được — link sẽ tự được tách và đánh số.`}
-                onLinksPasted={notifyLinksAdded}
-                onSubmit={() => {
-                  if (!isLoading) handleBatchExtract()
-                }}
+                placeholder={BATCH_PLACEHOLDER}
+                onLinksPasted={handleLinksPasted}
+                onSubmit={handleBatchSubmit}
               />
               <div className="textarea-footer-bar">
                 <span className="textarea-footer-stats">
@@ -1909,59 +2098,18 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
                 <div className="album-grid">
                   {albumImages.map((img) => (
-                    <div
+                    <AlbumGridItem
                       key={img.id}
-                      className={`album-item ${selectedImages[img.id] ? 'is-selected' : ''}`}
-                      onClick={() =>
-                        setSelectedImages((prev) => ({
-                          ...prev,
-                          [img.id]: !prev[img.id],
-                        }))
+                      img={img}
+                      isSelected={Boolean(selectedImages[img.id])}
+                      videoBadge={
+                        albumVideoOrder.total > 1
+                          ? `${albumVideoOrder.indexOf.get(img.id)}/${albumVideoOrder.total}`
+                          : 'Video'
                       }
-                    >
-                      {safeThumbSrc(img.thumb, img.url) ? (
-                        <img
-                          src={safeThumbSrc(img.thumb, img.url)}
-                          alt=""
-                          className="album-img"
-                          loading="lazy"
-                          decoding="async"
-                          onError={(e) => {
-                            e.target.style.display = 'none'
-                          }}
-                        />
-                      ) : (
-                        <div className="album-img thumb-placeholder">
-                          <IconVideo className="w-5 h-5" />
-                        </div>
-                      )}
-                      {img.type === 'video' && (
-                        <span className="album-video-badge">
-                          <IconVideo className="w-3 h-3" />
-                          {albumVideoOrder.total > 1
-                            ? `${albumVideoOrder.indexOf.get(img.id)}/${albumVideoOrder.total}`
-                            : 'Video'}
-                          {img.duration ? ` · ${img.duration}` : ''}
-                        </span>
-                      )}
-                      <input
-                        type="checkbox"
-                        className="album-checkbox"
-                        checked={Boolean(selectedImages[img.id])}
-                        readOnly
-                      />
-                      <button
-                        type="button"
-                        className="album-download-btn"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          handleDownloadImage(img)
-                        }}
-                        title={img.type === 'video' ? 'Tải video này' : 'Tải ảnh này'}
-                      >
-                        <IconDownload className="w-3 h-3" />
-                      </button>
-                    </div>
+                      onToggle={handleToggleImage}
+                      onDownload={handleImageDownload}
+                    />
                   ))}
                 </div>
               </div>
@@ -2029,53 +2177,14 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   {filteredStreams.length === 0 && (
                     <p className="empty-subtle-hint">Không có định dạng nào thuộc nhóm này.</p>
                   )}
-                  {filteredStreams.map((stream, sIdx) => {
-                    const isAudio = stream.streamType === 'audio'
-                    const streamId = stream.formatId || stream.quality || sIdx
-                    const isCurrentDownloading = isSourceBusy(streamSourceKey(singleMedia, stream))
-
-                    return (
-                      <div key={streamId} className="stream-row-item">
-                        <div className="stream-left-info">
-                          {isAudio ? (
-                            <IconAudio className="w-4 h-4 text-emerald-400" />
-                          ) : (
-                            <IconVideo className="w-4 h-4 text-blue-400" />
-                          )}
-                          <div className="stream-title-group">
-                            <span className="stream-quality-title">
-                              {stream.quality || (isAudio ? 'MP3 Audio' : 'Video Stream')}
-                            </span>
-                            <span className="stream-details-sub">
-                              {stream.format || (isAudio ? 'Âm thanh' : 'Video')}
-                              {stream.size ? ` • ${stream.size}` : ''}
-                              {stream.fps ? ` • ${stream.fps}` : ''}
-                              {stream.bitrate ? ` • ${stream.bitrate}` : ''}
-                            </span>
-                          </div>
-                        </div>
-
-                        <button
-                          type="button"
-                          className="stream-download-btn btn-success"
-                          onClick={() => handleDownloadStream(stream)}
-                          disabled={isCurrentDownloading}
-                        >
-                          {isCurrentDownloading ? (
-                            <>
-                              <span className="minimal-spinner" />
-                              <span>Đang tải...</span>
-                            </>
-                          ) : (
-                            <>
-                              <IconDownload className="w-3.5 h-3.5" />
-                              <span>Tải về</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
-                    )
-                  })}
+                  {filteredStreams.map((stream, sIdx) => (
+                    <StreamRow
+                      key={stream.formatId || stream.quality || sIdx}
+                      stream={stream}
+                      isBusy={busyKeys.has(streamSourceKey(singleMedia, stream))}
+                      onDownload={handleStreamDownload}
+                    />
+                  ))}
                 </div>
               </div>
             )}
@@ -2122,57 +2231,15 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
             <div className="batch-items-stack">
               {batchMedias.map((m, idx) => (
-                <div
+                <BatchResultRow
                   key={idx}
-                  className={`batch-row-item ${selectedBatchIds[idx] ? 'is-selected' : ''}`}
-                  onClick={() => setSelectedBatchIds((prev) => ({ ...prev, [idx]: !prev[idx] }))}
-                >
-                  <input
-                    type="checkbox"
-                    checked={Boolean(selectedBatchIds[idx])}
-                    onChange={() => setSelectedBatchIds((prev) => ({ ...prev, [idx]: !prev[idx] }))}
-                    onClick={(e) => e.stopPropagation()}
-                    aria-label={`Chọn ${m.title || 'liên kết'}`}
-                  />
-                  {safeThumbSrc(m.thumbnail, m.highResThumbnail) ? (
-                    <img
-                      src={safeThumbSrc(m.thumbnail, m.highResThumbnail)}
-                      alt=""
-                      className="batch-item-thumb"
-                      loading="lazy"
-                      decoding="async"
-                      onError={(e) => {
-                        e.target.style.display = 'none'
-                      }}
-                    />
-                  ) : (
-                    <div className="batch-item-thumb thumb-placeholder">
-                      <IconVideo className="w-3.5 h-3.5" />
-                    </div>
-                  )}
-                  <div className="batch-item-info">
-                    <span className="batch-item-title" title={m.title}>
-                      {m.title || 'Liên kết'}
-                    </span>
-                    <span className="batch-item-sub">
-                      {m.platform?.toUpperCase()}
-                      {m.duration ? ` • ${m.duration}` : ''}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    className="minimal-small-btn btn-success"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      handleDownloadBatchItem(m)
-                    }}
-                    disabled={isSourceBusy(batchItemSourceKey(m))}
-                    title={m.streams?.length ? 'Tải định dạng tốt nhất' : 'Tải toàn bộ ảnh/video của bài vào một thư mục'}
-                  >
-                    <IconDownload className="w-3.5 h-3.5" />
-                    <span>{isSourceBusy(batchItemSourceKey(m)) ? 'Đang tải...' : 'Tải về'}</span>
-                  </button>
-                </div>
+                  media={m}
+                  index={idx}
+                  isSelected={Boolean(selectedBatchIds[idx])}
+                  isBusy={busyKeys.has(batchItemSourceKey(m))}
+                  onToggle={handleToggleBatchItem}
+                  onDownload={handleBatchItemDownload}
+                />
               ))}
             </div>
           </div>
@@ -2190,3 +2257,6 @@ export default function LinkDownloader({ onShowToast, dlOptions = {} }) {
     </div>
   )
 }
+
+// Khung chỉ vẽ lại khi props đổi (xem chú thích cuối AccountDownloader)
+export default memo(LinkDownloader)

@@ -109,6 +109,8 @@ flowchart TD
 - [x] **Cookie Manager Thông Minh:** Tự động đọc cookie sạch từ các trình duyệt đã cài đặt (Chrome, Brave, Firefox, Edge, Chromium) hoặc nhập file `cookies.txt` để tải nội dung riêng tư / giới hạn độ tuổi.
 - [x] **Quản Lý Bộ Công Cụ (Tools Manager):** Kiểm tra phiên bản và **cập nhật `yt-dlp` chỉ bằng 1 cú click** ngay trong giao diện ứng dụng.
 - [x] **Quản Lý Tiến Trình Thời Gian Thực:** Mỗi lượt tải có thẻ riêng hiển thị phần trăm, tốc độ, thời gian đã chạy và thời gian còn lại; hủy tải (xoá sạch tệp dở dang) và mở thư mục lưu file ngay trên thẻ.
+  - Tối đa **3 lượt tải video / âm thanh (yt-dlp) chạy cùng lúc** trên toàn ứng dụng để máy không cạn RAM khi bấm tải hàng loạt; lượt bấm thêm hiện *"Đang chờ lượt..."* và tự bắt đầu khi có lượt xong (vẫn hủy được trong lúc chờ). Tải ảnh bìa / phụ đề không phải xếp hàng.
+  - Mỗi khung giữ tối đa 20 thẻ đã xong gần nhất (thẻ đang chạy luôn được giữ), nên dùng lâu hay tải hàng trăm tệp giao diện vẫn nhẹ.
 - [x] **Thông Báo Dễ Hiểu:** Lỗi được rút gọn thành một câu tiếng Việt kèm cách xử lý (vd. *"Nội dung YouTube cần đăng nhập — mở Cookie 🍪..."*) thay vì in nguyên log của yt-dlp; log gốc vẫn xem / sao chép được qua nút **Chi tiết**. Thông báo thành công chỉ hiện tên tệp kèm nút **Mở thư mục**.
 - [x] **Lịch Sử Tải:** Lưu 50 lượt tải gần nhất (thành công / lỗi / đã hủy) trong SQLite cục bộ, kèm nền tảng, dung lượng, thời gian và nút xoá toàn bộ lịch sử.
   - **Tự động xoá lịch sử cũ hơn N ngày** (bật ở chân hộp thoại Lịch sử, N từ 1 đến 3650): app dọn khi khởi động và mỗi 6 giờ, xoá cả danh sách liên kết đã phân tích cùng thời hạn. Khi bật / đổi số ngày mà có mục sẽ bị xoá ngay, app hỏi xác nhận trước. Cấu hình lưu ở `historyRetentionDays` trong `~/.config/crwl/settings.json`.

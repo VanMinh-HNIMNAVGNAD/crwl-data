@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from 'react'
+import { memo, useLayoutEffect, useRef } from 'react'
 import { extractLinks, newLinksOnly } from '../utils/links'
 import { insertTextAtCursor } from '../utils/textInput'
 
@@ -35,7 +35,7 @@ function gutterInfo(row, status, maxLinks) {
  *   chung nên không cần đồng bộ vị trí cuộn).
  * - Dán một đoạn văn bản chứa link: tự tách thành mỗi link một dòng, bỏ link trùng.
  */
-export default function LinkListEditor({
+function LinkListEditor({
   value,
   onChange,
   analysis,
@@ -148,3 +148,7 @@ export default function LinkListEditor({
     </div>
   )
 }
+
+// Lớp gương vẽ lại MỌI dòng: memo để sự kiện tiến trình tải ở khung cha không kéo
+// theo việc vẽ lại danh sách link (LinkDownloader truyền callback ổn định).
+export default memo(LinkListEditor)

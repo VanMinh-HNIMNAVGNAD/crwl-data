@@ -189,6 +189,17 @@ export function safeThumbSrc(...candidates) {
   return candidates.find((u) => u && typeof u === 'string' && !isVideoFileUrl(u)) || undefined
 }
 
+/**
+ * Ảnh xem trước của một ô trong lưới album / tài khoản.
+ *
+ * Ô VIDEO không bao giờ lấy chính URL tệp làm ảnh: URL video không có đuôi (CDN
+ * TikTok, v.redd.it...) lọt qua `isVideoFileUrl`, và WebKitGTK giải mã video đặt
+ * trong <img> thành toàn bộ khung hình thô trong RAM — vài GB, treo cả máy.
+ */
+export function previewSrcOf(item) {
+  return safeThumbSrc(item?.thumb, item?.type === 'video' ? undefined : item?.url)
+}
+
 export function isDirectStreamUrl(url = '') {
   if (!url || typeof url !== 'string') return false
   if (/\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url)) return true

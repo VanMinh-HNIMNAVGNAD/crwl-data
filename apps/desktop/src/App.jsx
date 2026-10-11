@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useMemo } from 'react'
 import SystemHeader from './components/SystemHeader'
 import LinkDownloader from './components/LinkDownloader'
 import AccountDownloader from './components/AccountDownloader'
@@ -6,6 +6,7 @@ import DownloadHistoryModal from './components/DownloadHistoryModal'
 import CookieManager from './components/CookieManager'
 import ToolsManagerModal from './components/ToolsManagerModal'
 import ToastStack from './components/ToastStack'
+import ErrorBoundary from './components/ErrorBoundary'
 import { normalizeToast } from './utils/toasts'
 import './App.css'
 
@@ -42,24 +43,40 @@ function App() {
   const [embedThumbnail, setEmbedThumbnail] = useState(() => getLS('dl_embed_thumbnail', false))
   const [useAria2c, setUseAria2c] = useState(() => getLS('dl_use_aria2c', false))
 
-  const handleSetVideoContainer = (v) => { setVideoContainer(v); setLS('dl_video_container', v) }
-  const handleSetAccelerate = (v) => { setAccelerate(v); setLS('dl_accelerate', v) }
-  const handleSetEmbedMetadata = (v) => { setEmbedMetadata(v); setLS('dl_embed_metadata', v) }
-  const handleSetEmbedThumbnail = (v) => { setEmbedThumbnail(v); setLS('dl_embed_thumbnail', v) }
-  const handleSetUseAria2c = (v) => { setUseAria2c(v); setLS('dl_use_aria2c', v) }
+  const handleSetVideoContainer = useCallback((v) => { setVideoContainer(v); setLS('dl_video_container', v) }, [])
+  const handleSetAccelerate = useCallback((v) => { setAccelerate(v); setLS('dl_accelerate', v) }, [])
+  const handleSetEmbedMetadata = useCallback((v) => { setEmbedMetadata(v); setLS('dl_embed_metadata', v) }, [])
+  const handleSetEmbedThumbnail = useCallback((v) => { setEmbedThumbnail(v); setLS('dl_embed_thumbnail', v) }, [])
+  const handleSetUseAria2c = useCallback((v) => { setUseAria2c(v); setLS('dl_use_aria2c', v) }, [])
 
-  const sharedDlOptions = {
-    videoContainer,
-    accelerate,
-    embedMetadata,
-    embedThumbnail,
-    useAria2c,
-    onVideoContainerChange: handleSetVideoContainer,
-    onAccelerateChange: handleSetAccelerate,
-    onEmbedMetadataChange: handleSetEmbedMetadata,
-    onEmbedThumbnailChange: handleSetEmbedThumbnail,
-    onUseAria2cChange: handleSetUseAria2c,
-  }
+  // Giữ nguyên object khi không có tuỳ chọn nào đổi: hai khung tải đã `memo`, nên mỗi
+  // thông báo (toast) bật/tắt không còn kéo theo việc vẽ lại toàn bộ lưới kết quả.
+  const sharedDlOptions = useMemo(
+    () => ({
+      videoContainer,
+      accelerate,
+      embedMetadata,
+      embedThumbnail,
+      useAria2c,
+      onVideoContainerChange: handleSetVideoContainer,
+      onAccelerateChange: handleSetAccelerate,
+      onEmbedMetadataChange: handleSetEmbedMetadata,
+      onEmbedThumbnailChange: handleSetEmbedThumbnail,
+      onUseAria2cChange: handleSetUseAria2c,
+    }),
+    [
+      videoContainer,
+      accelerate,
+      embedMetadata,
+      embedThumbnail,
+      useAria2c,
+      handleSetVideoContainer,
+      handleSetAccelerate,
+      handleSetEmbedMetadata,
+      handleSetEmbedThumbnail,
+      handleSetUseAria2c,
+    ]
+  )
   // ──────────────────────────────────────────────────────────────────────────
 
   // Trước đây chỉ có MỘT toast dạng chuỗi: thông báo sau đè mất thông báo trước
@@ -100,7 +117,9 @@ function App() {
       <main className="desktop-workspace-split">
         {/* Nửa trái: Tải theo liên kết */}
         <section className="workspace-column column-left">
-          <LinkDownloader onShowToast={showToast} dlOptions={sharedDlOptions} />
+          <ErrorBoundary name="LinkDownloader" title="Khung “Tải theo liên kết” gặp lỗi hiển thị">
+            <LinkDownloader onShowToast={showToast} dlOptions={sharedDlOptions} />
+          </ErrorBoundary>
         </section>
 
         {/* Thanh dọc | phân chia chính giữa */}
@@ -108,7 +127,9 @@ function App() {
 
         {/* Nửa phải: Tải theo tài khoản */}
         <section className="workspace-column column-right">
-          <AccountDownloader onShowToast={showToast} dlOptions={sharedDlOptions} />
+          <ErrorBoundary name="AccountDownloader" title="Khung “Tải theo tài khoản” gặp lỗi hiển thị">
+            <AccountDownloader onShowToast={showToast} dlOptions={sharedDlOptions} />
+          </ErrorBoundary>
         </section>
       </main>
 

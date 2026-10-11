@@ -117,7 +117,6 @@ impl DownloadProgressPayload {
         }
     }
 
-    #[allow(dead_code)]
     pub fn indeterminate(id: &str, status: &str, phase: &str) -> Self {
         Self {
             id: id.to_string(),
@@ -184,6 +183,39 @@ static APPROVED_DIRS: OnceLock<std::sync::Mutex<HashSet<PathBuf>>> = OnceLock::n
 const CANCEL_FLAG_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// Thư mục album được nhớ cho các bước nối tiếp (ảnh → video → nén) tối đa chừng này.
 const ALBUM_DIR_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Số lượt tải yt-dlp được chạy CÙNG LÚC trên toàn ứng dụng (cả hai khung tải).
+///
+/// Mỗi lượt là một tiến trình yt-dlp (Python, ~100 MB RAM) kèm ffmpeg khi ghép tệp.
+/// Trước đây không có giới hạn: bấm "Tải về" liên tục ở danh sách nhiều link / lưới
+/// tài khoản là vài chục tiến trình chạy song song, máy cạn RAM, giao diện đứng và
+/// hệ điều hành có thể giết luôn ứng dụng. Lượt vượt mức nay xếp hàng (huỷ được).
+const MAX_CONCURRENT_YTDLP_DOWNLOADS: usize = 3;
+
+static YTDLP_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+fn ytdlp_slots() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(YTDLP_SLOTS.get_or_init(|| {
+        Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_YTDLP_DOWNLOADS))
+    }))
+}
+
+/// Chờ tới lượt chạy. `on_queued` chỉ được gọi khi phải xếp hàng (để báo UI).
+/// Trả về None nếu tác vụ bị huỷ trong lúc chờ.
+async fn wait_for_download_slot(
+    slots: Arc<tokio::sync::Semaphore>,
+    cancel_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    on_queued: impl FnOnce(),
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if let Ok(permit) = Arc::clone(&slots).try_acquire_owned() {
+        return Some(permit);
+    }
+    on_queued();
+    tokio::select! {
+        permit = slots.acquire_owned() => permit.ok(),
+        _ = cancel_rx => None,
+    }
+}
 
 fn get_download_registry() -> &'static AsyncMutex<HashMap<String, ActiveTaskState>> {
     DOWNLOAD_REGISTRY.get_or_init(|| AsyncMutex::new(HashMap::new()))
@@ -1022,17 +1054,45 @@ impl DownloaderService {
         let progress_emit = |payload: DownloadProgressPayload| {
             let _ = app_handle.emit("download-progress", payload);
         };
+        let starting_phase = if opts.use_aria2c {
+            "Đang kết nối qua Aria2c..."
+        } else {
+            "Đang lấy thông tin tệp..."
+        };
 
-        progress_emit(DownloadProgressPayload::new(
-            &task_id,
-            0.0,
-            "preparing",
-            if opts.use_aria2c {
-                "Đang kết nối qua Aria2c..."
-            } else {
-                "Đang lấy thông tin tệp..."
-            },
-        ));
+        // Ảnh bìa / phụ đề (--skip-download) chỉ chạy vài giây: không bắt chúng xếp
+        // hàng sau các video lớn. Mọi lượt tải còn lại giữ một suất tới khi kết thúc.
+        let is_side_file = matches!(
+            opts.format_id.as_deref(),
+            Some(f) if f == "thumbnail" || f.starts_with("subtitle:")
+        );
+        let _download_slot = if is_side_file {
+            None
+        } else {
+            let slot = wait_for_download_slot(ytdlp_slots(), &mut cancel_rx, || {
+                info!("[{task_id}] Đã có {MAX_CONCURRENT_YTDLP_DOWNLOADS} lượt tải đang chạy — xếp hàng chờ");
+                progress_emit(DownloadProgressPayload::indeterminate(
+                    &task_id,
+                    "preparing",
+                    &format!(
+                        "Đang chờ lượt — {MAX_CONCURRENT_YTDLP_DOWNLOADS} tệp khác đang tải, tệp này sẽ tự bắt đầu ngay sau đó..."
+                    ),
+                ));
+            })
+            .await;
+            if slot.is_none() {
+                info!("Hủy tác vụ tải [{task_id}] khi đang xếp hàng chờ lượt");
+                progress_emit(DownloadProgressPayload {
+                    message: Some("Đã hủy trước khi bắt đầu tải".to_string()),
+                    ..DownloadProgressPayload::new(&task_id, 0.0, "cancelled", "Đã hủy tải xuống")
+                });
+                Self::unregister_task(&task_id).await;
+                return Err("Tác vụ tải đã bị hủy".to_string());
+            }
+            slot
+        };
+
+        progress_emit(DownloadProgressPayload::new(&task_id, 0.0, "preparing", starting_phase));
 
         // Tối đa 96% dành cho giai đoạn tải, 4% còn lại cho ghép/hậu xử lý
         const DOWNLOAD_SHARE: f64 = 96.0;
@@ -4711,5 +4771,70 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Lượt tải vượt giới hạn phải XẾP HÀNG (không chạy thêm yt-dlp), được báo cho UI,
+    /// tự chạy khi có suất trống và huỷ được ngay trong lúc chờ.
+    #[tokio::test]
+    async fn downloads_beyond_the_limit_wait_for_a_free_slot() {
+        use super::wait_for_download_slot;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+
+        // Còn suất: chạy ngay, không báo "đang chờ"
+        let (_tx_a, mut rx_a) = tokio::sync::oneshot::channel::<()>();
+        let (_tx_b, mut rx_b) = tokio::sync::oneshot::channel::<()>();
+        let queued = AtomicBool::new(false);
+        let first = wait_for_download_slot(Arc::clone(&slots), &mut rx_a, || queued.store(true, Ordering::SeqCst)).await;
+        let second = wait_for_download_slot(Arc::clone(&slots), &mut rx_b, || queued.store(true, Ordering::SeqCst)).await;
+        assert!(first.is_some() && second.is_some());
+        assert!(!queued.load(Ordering::SeqCst));
+        assert_eq!(slots.available_permits(), 0);
+
+        // Hết suất: lượt thứ ba phải chờ (và báo UI) tới khi một lượt trước kết thúc
+        let queued_third = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&queued_third);
+        let third_slots = Arc::clone(&slots);
+        let (_tx_c, mut rx_c) = tokio::sync::oneshot::channel::<()>();
+        let third = tokio::spawn(async move {
+            wait_for_download_slot(third_slots, &mut rx_c, move || flag.store(true, Ordering::SeqCst))
+                .await
+                .is_some()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!third.is_finished(), "lượt thứ ba không được chạy khi đã đủ suất");
+        assert!(queued_third.load(Ordering::SeqCst), "UI phải được báo là đang chờ lượt");
+        drop(first);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), third)
+            .await
+            .expect("phải có suất ngay khi một lượt tải kết thúc")
+            .unwrap();
+        assert!(got);
+
+        // Huỷ trong lúc chờ: trả về None ngay, không chiếm suất nào
+        let hold = Arc::clone(&slots).try_acquire_owned().expect("lượt thứ ba đã trả lại suất");
+        assert_eq!(slots.available_permits(), 0);
+        let (tx_d, mut rx_d) = tokio::sync::oneshot::channel::<()>();
+        let waiting = tokio::spawn({
+            let slots = Arc::clone(&slots);
+            async move { wait_for_download_slot(slots, &mut rx_d, || {}).await.is_none() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx_d.send(()).unwrap();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("huỷ khi đang chờ phải trả về ngay")
+            .unwrap();
+        assert!(cancelled);
+        drop(second);
+        drop(hold);
+        assert_eq!(slots.available_permits(), 2, "huỷ khi đang chờ không được làm rơi mất suất");
+    }
+
+    #[test]
+    fn the_global_download_limit_is_sane() {
+        assert!((2..=4).contains(&super::MAX_CONCURRENT_YTDLP_DOWNLOADS));
     }
 }

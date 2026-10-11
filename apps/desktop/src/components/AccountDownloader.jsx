@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef } from 'react'
+import { memo, useCallback, useEffect, useState, useMemo, useRef } from 'react'
 import {
   IconClose,
   IconPaste,
@@ -8,7 +8,7 @@ import {
   IconZip,
   IconSettings,
 } from './Icons'
-import { detectPlatform, VIDEO_CONTAINER_OPTIONS, safeThumbSrc } from '../constants'
+import { detectPlatform, VIDEO_CONTAINER_OPTIONS, previewSrcOf } from '../constants'
 import {
   crawlProfile,
   cancelExtraction,
@@ -23,6 +23,7 @@ import {
 } from '../services/api'
 import { DownloadTaskList } from './DownloadProgressCard'
 import { useDownloadTasks, parseSpeed, formatSpeed } from '../hooks/useDownloadTasks'
+import { useStableCallback } from '../hooks/useStableCallback'
 import { describeError, errorText } from '../utils/messages'
 import { errorToast, openFolderAction, savedToast } from '../utils/toasts'
 
@@ -61,7 +62,152 @@ function safeMediaTitle(item, fallback = 'media') {
   return Array.from(cleaned || fallback).slice(0, 80).join('') || fallback
 }
 
-export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
+/**
+ * Một ô trong lưới kết quả quét tài khoản.
+ *
+ * Lưới có thể có hàng nghìn ô ("Tất cả"). Trước đây mỗi sự kiện tiến trình tải (vài
+ * lần mỗi giây cho mỗi video, mỗi tệp của album) vẽ lại TOÀN BỘ lưới: tải nhiều tệp
+ * là giao diện giật, CPU tăng vọt, có lúc đứng hẳn. Nay ô chỉ vẽ lại khi chính nó
+ * đổi (chọn / bỏ chọn / bắt đầu hoặc xong tải).
+ */
+const ProfileGridItem = memo(function ProfileGridItem({ item, isSelected, isDownloading, onToggle, onDownload }) {
+  const thumbSrc = previewSrcOf(item)
+  return (
+    <div
+      className={`profile-grid-item ${isSelected ? 'is-selected' : ''}`}
+      onClick={() => onToggle(item.id)}
+    >
+      <div className="profile-item-thumb-box">
+        {thumbSrc ? (
+          <img
+            src={thumbSrc}
+            alt=""
+            className="profile-item-thumb"
+            loading="lazy"
+            decoding="async"
+            onError={(e) => {
+              e.target.style.display = 'none'
+            }}
+          />
+        ) : (
+          <div className="profile-item-thumb thumb-placeholder">
+            <IconVideo className="w-5 h-5" />
+          </div>
+        )}
+        {item.duration && (
+          <span className="duration-tag">{item.duration}</span>
+        )}
+        <input
+          type="checkbox"
+          className="profile-item-checkbox"
+          checked={isSelected}
+          onChange={(e) => {
+            e.stopPropagation()
+            onToggle(item.id)
+          }}
+          onClick={(e) => e.stopPropagation()}
+        />
+      </div>
+
+      <div className="profile-item-details">
+        <span className="profile-item-title" title={item.title}>
+          {item.title || 'Phương tiện'}
+        </span>
+        <div className="profile-item-footer">
+          <span className="item-quality-pill">
+            {item.totalInPost > 1
+              ? `${item.type === 'video' ? 'Video' : 'Ảnh'} ${item.indexInPost}/${item.totalInPost}${item.quality ? ` • ${item.quality}` : ''}`
+              : item.quality || 'HD'}
+          </span>
+          <button
+            type="button"
+            className="profile-download-btn"
+            onClick={(e) => {
+              e.stopPropagation()
+              onDownload(item)
+            }}
+            disabled={isDownloading}
+            title={item.type === 'video' ? 'Tải video này' : 'Tải ảnh này'}
+          >
+            {isDownloading ? (
+              <span className="minimal-spinner" />
+            ) : (
+              <IconDownload className="w-3 h-3" />
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+})
+
+// Số ô vẽ thêm mỗi lần (bội số của 2 cột)
+const GRID_PAGE_SIZE = 240
+
+/**
+ * Toàn bộ lưới kết quả.
+ *
+ * - `memo` ở cấp LƯỚI: sự kiện tiến trình chỉ đổi danh sách tác vụ chứ không đổi props
+ *   của lưới, nên React bỏ qua cả lưới thay vì so sánh lại từng ô.
+ * - Vẽ dần từng trang, tự nạp thêm khi cuộn gần cuối: quét "Tất cả" có thể ra hàng
+ *   chục nghìn tệp; mỗi ô có ảnh lazy-load mà trình duyệt phải theo dõi ở MỌI khung
+ *   hình, nên 10.000 ô trong DOM tốn ~70 ms mỗi khung khi đang tải — giao diện đứng.
+ *   "Chọn tất cả" / tải vẫn áp dụng cho toàn bộ danh sách, kể cả phần chưa vẽ.
+ * - `busyItemKey`: các khoá "item:<id>" đang tải, nối bằng xuống dòng — là chuỗi nên
+ *   chỉ khác đi khi có ô bắt đầu / kết thúc tải.
+ *
+ * Mỗi kết quả quét mới phải gắn `key` mới để lưới bắt đầu lại từ trang đầu.
+ */
+const ProfileGrid = memo(function ProfileGrid({ items, selectedIds, busyItemKey, onToggle, onDownload }) {
+  const busy = useMemo(() => new Set(busyItemKey ? busyItemKey.split('\n') : []), [busyItemKey])
+  const [limit, setLimit] = useState(GRID_PAGE_SIZE)
+  const sentinelRef = useRef(null)
+  const shown = items.length > limit ? items.slice(0, limit) : items
+  const remaining = items.length - shown.length
+
+  const showMore = useCallback(() => setLimit((current) => current + GRID_PAGE_SIZE), [])
+
+  // Tự vẽ thêm khi mốc cuối lưới tới gần vùng nhìn thấy. Tạo lại observer sau mỗi
+  // trang: nếu mốc VẪN trong vùng (màn hình cao) thì lần quan sát đầu nạp tiếp luôn.
+  useEffect(() => {
+    const el = sentinelRef.current
+    if (!remaining || !el || typeof IntersectionObserver === 'undefined') return undefined
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) showMore()
+      },
+      { root: el.closest('.pane-results-container'), rootMargin: '0px 0px 800px 0px' }
+    )
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [remaining, limit, showMore])
+
+  return (
+    <>
+      <div className="profile-grid">
+        {shown.map((item) => (
+          <ProfileGridItem
+            key={item.id}
+            item={item}
+            isSelected={Boolean(selectedIds[item.id])}
+            isDownloading={busy.has(`item:${item.id}`)}
+            onToggle={onToggle}
+            onDownload={onDownload}
+          />
+        ))}
+      </div>
+      {remaining > 0 && (
+        <div className="profile-grid-more" ref={sentinelRef}>
+          <button type="button" className="minimal-small-btn" onClick={showMore}>
+            Hiện thêm {Math.min(GRID_PAGE_SIZE, remaining)} tệp (còn {remaining})
+          </button>
+        </div>
+      )}
+    </>
+  )
+})
+
+function AccountDownloader({ onShowToast, dlOptions = {} }) {
   // Shared download options từ App level
   const {
     videoContainer = 'auto',
@@ -94,6 +240,8 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
 
   // Kết quả quét tài khoản
   const [profileResult, setProfileResult] = useState(null)
+  // Tăng mỗi lần có kết quả quét mới → lưới (vẽ dần) bắt đầu lại từ trang đầu
+  const [resultSeq, setResultSeq] = useState(0)
   const [selectedBatchIds, setSelectedBatchIds] = useState({})
   const [isCancellingCrawl, setIsCancellingCrawl] = useState(false)
   const crawlTaskRef = useRef(null)
@@ -109,6 +257,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
     markCancelled,
     isCancelled,
     isSourceBusy,
+    busyKeys,
   } = useDownloadTasks()
 
   // Tự động nhận diện platform từ input hoặc dùng platform đã chọn
@@ -205,6 +354,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
         onShowToast?.({ type: 'info', title: 'Đã dừng quét tài khoản' })
       } else if (resultData && resultData.media && resultData.media.length > 0) {
         setProfileResult(resultData)
+        setResultSeq((seq) => seq + 1)
         setSelectedBatchIds({})
         onShowToast?.({
           type: 'success',
@@ -291,7 +441,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
   }
 
   // Hủy một tác vụ tải và xoá sạch tệp dở dang của nó
-  const handleCancelDownload = async (taskId) => {
+  const handleCancelDownload = useStableCallback(async (taskId) => {
     if (!taskId) return
     markCancelled(taskId)
     try {
@@ -301,7 +451,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
     } catch (err) {
       console.error('Cancel download error:', err)
     }
-  }
+  })
 
   // Tải 1 tệp trong profile
   const handleDownloadProfileItem = async (item) => {
@@ -377,6 +527,16 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
       if (typeof unlisten === 'function') unlisten()
     }
   }
+
+  // Danh tính cố định cho các ô lưới đã memo
+  const handleDownloadItem = useStableCallback(handleDownloadProfileItem)
+  const busyItemKey = useMemo(
+    () => [...busyKeys].filter((key) => String(key).startsWith('item:')).sort().join('\n'),
+    [busyKeys]
+  )
+  const handleToggleItem = useCallback((id) => {
+    setSelectedBatchIds((prev) => ({ ...prev, [id]: !prev[id] }))
+  }, [])
 
   // Chọn tất cả
   const handleToggleSelectAllProfile = () => {
@@ -1174,89 +1334,14 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
             </div>
 
             {/* Lưới tệp video/ảnh của tài khoản */}
-            <div className="profile-grid">
-              {profileMediaList.map((item) => {
-                const isSelected = Boolean(selectedBatchIds[item.id])
-                const isItemDownloading = isSourceBusy(`item:${item.id}`)
-
-                return (
-                  <div
-                    key={item.id}
-                    className={`profile-grid-item ${isSelected ? 'is-selected' : ''}`}
-                    onClick={() =>
-                      setSelectedBatchIds((prev) => ({
-                        ...prev,
-                        [item.id]: !prev[item.id],
-                      }))
-                    }
-                  >
-                    <div className="profile-item-thumb-box">
-                      {safeThumbSrc(item.thumb, item.url) ? (
-                        <img
-                          src={safeThumbSrc(item.thumb, item.url)}
-                          alt=""
-                          className="profile-item-thumb"
-                          loading="lazy"
-                          decoding="async"
-                          onError={(e) => {
-                            e.target.style.display = 'none'
-                          }}
-                        />
-                      ) : (
-                        <div className="profile-item-thumb thumb-placeholder">
-                          <IconVideo className="w-5 h-5" />
-                        </div>
-                      )}
-                      {item.duration && (
-                        <span className="duration-tag">{item.duration}</span>
-                      )}
-                      <input
-                        type="checkbox"
-                        className="profile-item-checkbox"
-                        checked={isSelected}
-                        onChange={(e) => {
-                          e.stopPropagation()
-                          setSelectedBatchIds((prev) => ({
-                            ...prev,
-                            [item.id]: !prev[item.id],
-                          }))
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                      />
-                    </div>
-
-                    <div className="profile-item-details">
-                      <span className="profile-item-title" title={item.title}>
-                        {item.title || 'Phương tiện'}
-                      </span>
-                      <div className="profile-item-footer">
-                        <span className="item-quality-pill">
-                          {item.totalInPost > 1
-                            ? `${item.type === 'video' ? 'Video' : 'Ảnh'} ${item.indexInPost}/${item.totalInPost}${item.quality ? ` • ${item.quality}` : ''}`
-                            : item.quality || 'HD'}
-                        </span>
-                        <button
-                          type="button"
-                          className="profile-download-btn"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            handleDownloadProfileItem(item)
-                          }}
-                          disabled={isItemDownloading}
-                          title={item.type === 'video' ? 'Tải video này' : 'Tải ảnh này'}
-                        >
-                          {isItemDownloading ? (
-                            <span className="minimal-spinner" />
-                          ) : (
-                            <IconDownload className="w-3 h-3" />
-                          )}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
+            <ProfileGrid
+              key={resultSeq}
+              items={profileMediaList}
+              selectedIds={selectedBatchIds}
+              busyItemKey={busyItemKey}
+              onToggle={handleToggleItem}
+              onDownload={handleDownloadItem}
+            />
           </div>
         )}
 
@@ -1272,3 +1357,7 @@ export default function AccountDownloader({ onShowToast, dlOptions = {} }) {
     </div>
   )
 }
+
+// Bản thân khung cũng chỉ vẽ lại khi props đổi: trước đây MỖI thông báo (toast) bật/tắt
+// ở App lại vẽ lại cả hai khung kèm toàn bộ lưới kết quả.
+export default memo(AccountDownloader)

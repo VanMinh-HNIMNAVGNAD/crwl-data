@@ -1,8 +1,7 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
+import { busySourceKeys, isTaskFinished, trimFinishedTasks } from '../utils/downloadTasks'
 
-const FINISHED_STATUSES = new Set(['completed', 'error', 'cancelled'])
-
-export const isTaskFinished = (task) => FINISHED_STATUSES.has(task?.progress?.status)
+export { isTaskFinished }
 
 export function formatSeconds(secs) {
   if (!Number.isFinite(secs) || secs < 0) return '00:00'
@@ -54,7 +53,7 @@ const ETA_MIN_SAMPLE_MS = 2000
 function withEstimatedEta(task, progress, now) {
   const percent = Number(progress.percent) || 0
   const measurable =
-    !FINISHED_STATUSES.has(progress.status) &&
+    !isTaskFinished({ progress }) &&
     progress.status !== 'processing' &&
     !progress.isIndeterminate &&
     !progress.is_indeterminate &&
@@ -87,26 +86,32 @@ export function useDownloadTasks() {
   /** Thêm tác vụ mới lên đầu danh sách. `sourceKey` dùng để biết nút nào đang bận. */
   const startTask = useCallback((id, { title, sourceKey = null, progress }) => {
     cancelledRef.current.delete(id)
-    setTasks((prev) => [
-      { id, title, sourceKey, startedAt: Date.now(), progress: { ...progress, id } },
-      ...prev.filter((t) => t.id !== id),
-    ])
+    setTasks((prev) =>
+      trimFinishedTasks([
+        { id, title, sourceKey, startedAt: Date.now(), progress: { ...progress, id } },
+        ...prev.filter((t) => t.id !== id),
+      ])
+    )
   }, [])
 
   /** Cập nhật tiến trình (giá trị mới hoặc hàm `prev => next`). */
   const updateTask = useCallback((id, next) => {
     const now = Date.now()
-    setTasks((prev) =>
-      prev.map((t) => {
+    setTasks((prev) => {
+      let changed = false
+      const updated = prev.map((t) => {
         if (t.id !== id) return t
         const value = typeof next === 'function' ? next(t.progress) : next
         if (!value) return t
         // Sự kiện đến muộn từ backend không được "hồi sinh" tác vụ đã huỷ
         if (t.progress?.status === 'cancelled' && value.status !== 'cancelled') return t
         const { progress, etaBase } = withEstimatedEta(t, value, now)
+        changed = true
         return { ...t, etaBase, progress: { ...progress, id } }
       })
-    )
+      // Sự kiện của thẻ đã bị đóng / đã bị dọn: giữ nguyên mảng cũ để không vẽ lại cả khung
+      return changed ? trimFinishedTasks(updated) : prev
+    })
   }, [])
 
   const dismissTask = useCallback((id) => {
@@ -124,11 +129,14 @@ export function useDownloadTasks() {
 
   const isCancelled = useCallback((id) => cancelledRef.current.has(id), [])
 
-  const isSourceBusy = (sourceKey) =>
-    tasks.some((t) => t.sourceKey === sourceKey && !isTaskFinished(t))
+  // Tra "nút này có đang bận" trong O(1): lưới tài khoản có thể có hàng nghìn ô,
+  // trước đây mỗi ô duyệt lại toàn bộ danh sách tác vụ ở mỗi lần vẽ.
+  const busyKeys = useMemo(() => busySourceKeys(tasks), [tasks])
+  const isSourceBusy = useCallback((sourceKey) => busyKeys.has(sourceKey), [busyKeys])
 
   return {
     tasks,
+    busyKeys,
     startTask,
     updateTask,
     dismissTask,

@@ -82,6 +82,14 @@ STREAM_JSON_KEYS = [
 ]
 
 
+def _env_seconds(name: str, default: float) -> float:
+    """Đọc số giây từ biến môi trường; giá trị sai không được làm engine chết lúc import."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 class _PlaywrightWorkerThread(threading.Thread):
     """
     Dedicated background worker thread for Playwright sync API.
@@ -89,6 +97,11 @@ class _PlaywrightWorkerThread(threading.Thread):
     always execute on the exact same thread, preventing:
     'greenlet.error: Cannot switch to a different thread'.
     """
+
+    # Chromium headless + driver Playwright chiếm vài trăm MB RAM. Trước đây chúng
+    # sống tới khi thoát app chỉ sau MỘT lần dò; nay tự đóng khi rảnh chừng này giây
+    # (lần dò sau tự khởi động lại). <= 0 = không tự đóng.
+    IDLE_SHUTDOWN_SEC = _env_seconds("CRWL_SNIFFER_IDLE_SEC", 180.0)
 
     def __init__(self):
         super().__init__(daemon=True, name="pw_sniffer_worker")
@@ -98,10 +111,24 @@ class _PlaywrightWorkerThread(threading.Thread):
         self._started_event = threading.Event()
         self.start()
 
+    def _idle_timeout(self) -> Optional[float]:
+        """Thời gian chờ việc trước khi đóng Chromium; None = chờ mãi (chưa mở gì)."""
+        if self._browser is None and self._pw is None:
+            return None
+        return self.IDLE_SHUTDOWN_SEC if self.IDLE_SHUTDOWN_SEC > 0 else None
+
     def run(self):
         self._started_event.set()
         while True:
-            item = self._tasks.get()
+            try:
+                item = self._tasks.get(timeout=self._idle_timeout())
+            except queue.Empty:
+                sys.stderr.write(
+                    f"[Sniffer] Đóng Chromium headless sau {self.IDLE_SHUTDOWN_SEC:.0f}s không dùng để giải phóng RAM\n"
+                )
+                sys.stderr.flush()
+                self._cleanup()
+                continue
             if item is None:
                 self._cleanup()
                 self._tasks.task_done()
@@ -401,6 +428,7 @@ class PlaywrightStreamSniffer(BaseExtractor):
 
         try:
             # Nạp cookies từ trình duyệt nếu có
+            cfile = None
             try:
                 import urllib.parse
                 domain = urllib.parse.urlparse(target_url).netloc
@@ -423,6 +451,15 @@ class PlaywrightStreamSniffer(BaseExtractor):
                         context.add_cookies(pw_cookies)
             except Exception:
                 pass
+            finally:
+                # get_browser_cookies_txt() luôn tạo một tệp tạm MỚI chứa cookie đăng
+                # nhập. Trước đây tệp này không bao giờ bị xoá: mỗi lần dò (trang chính
+                # + tối đa 3 iframe) lại để lại một bản sao phiên đăng nhập trong /tmp.
+                if cfile and os.path.exists(cfile):
+                    try:
+                        os.remove(cfile)
+                    except OSError:
+                        pass
 
             # Bắt tất cả requests
             page = context.new_page()
@@ -610,12 +647,22 @@ class PlaywrightStreamSniffer(BaseExtractor):
         seen_types: set = set()
 
         sorted_urls = sorted(urls, key=lambda u: self._classify(u)[4])
+        # .ts / .m4s là MẢNH vài giây của một luồng HLS/DASH. Trước đây mỗi mảnh bắt
+        # được thành một lựa chọn "TS Segment Stream" riêng — tải về chỉ được vài giây
+        # video. Có manifest hoặc tệp video đầy đủ thì bỏ hẳn các mảnh; không có thì
+        # giữ một mảnh mỗi loại như phương án cuối.
+        has_full_source = any(
+            self._classify(u)[0] in ("hls", "dash", "mp4", "webm") for u in sorted_urls
+        )
 
         for url in sorted_urls:
             key, fmt, quality, stype, _ = self._classify(url)
 
-            # Chỉ lấy 1 stream mỗi loại chính (hls, mp4, dash...)
-            if key in seen_types and key not in ("ts", "m4s", "other"):
+            if key in ("ts", "m4s") and has_full_source:
+                continue
+            # Chỉ lấy 1 stream mỗi loại (hls, mp4, dash, mảnh ts...); riêng "other"
+            # có thể là nhiều manifest khác nhau nên giữ cả.
+            if key in seen_types and key != "other":
                 continue
             seen_types.add(key)
 

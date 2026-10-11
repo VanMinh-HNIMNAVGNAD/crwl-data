@@ -955,13 +955,15 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
    RESULTS CONTAINER & MEDIA STREAMS / ALBUM / PROFILES
    ============================================================================== */
 
+/* Khung cuộn kết quả là khối THƯỜNG, không phải flex dọc: với flex dọc, mỗi lần thẻ
+   tiến trình đổi chữ (vài lần mỗi giây khi đang tải) trình duyệt phải đo lại mọi
+   phần tử con — kể cả lưới hàng nghìn ô — mất ~65 ms mỗi khung hình. */
 .pane-results-container {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  display: flex;
-  flex-direction: column;
+  display: block;
   padding: 10px;
   background: var(--bg-well);
   border: 1px solid var(--border-subtle);
@@ -1336,9 +1338,9 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
    ============================================================================== */
 
 /* Nhiều tác vụ tải song song: mỗi tác vụ một thẻ, cuộn khi quá nhiều.
-   Khối này là con của .pane-results-container (flex dọc, cố định chiều cao).
-   Vì có overflow nên min-height mặc định của nó là 0: thiếu flex-shrink: 0 thì
-   khi kết quả dài hơn khung, trình duyệt co nó về 0px và thanh tiến trình biến mất.
+   Khối này là con của .pane-results-container (khối thường, cố định chiều cao).
+   flex-shrink: 0 giữ lại phòng khi khung cha lại thành flex: khi đó min-height mặc
+   định của khối có overflow là 0 và trình duyệt từng co nó về 0px khi kết quả dài.
    Ghim ở đầu khung để cuộn xuống chọn chất lượng vẫn thấy tiến trình. */
 .download-task-list {
   display: flex;
@@ -3653,4 +3655,51 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* Khu vực gặp lỗi hiển thị (components/ErrorBoundary) */
+.ui-crash-box {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px;
+  padding: 14px 16px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-md);
+  box-shadow: var(--elev-1);
+}
+
+.ui-crash-box strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-danger);
+}
+
+.ui-crash-box p {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.ui-crash-box details {
+  width: 100%;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.ui-crash-box pre {
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+}
+
+/* Lưới tài khoản hiển thị dần (xem ProfileGrid trong AccountDownloader) */
+.profile-grid-more {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 4px;
 }

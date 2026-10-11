@@ -21,6 +21,28 @@ fn ensure_config_dir() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Ghi tệp qua một tệp tạm rồi đổi tên đè lên.
+///
+/// Mỗi lượt tải đọc settings.json nhiều lần (thư mục tải, proxy, đường dẫn công cụ).
+/// `fs::write` cắt tệp về 0 byte rồi mới ghi, nên lượt tải đọc đúng lúc đó thấy JSON
+/// hỏng và âm thầm dùng cấu hình MẶC ĐỊNH: mất proxy, thư mục tải đã chọn bị từ chối
+/// ("Thư mục tải chưa được cho phép"). Đổi tên là thao tác nguyên tử: người đọc chỉ
+/// thấy bản cũ hoặc bản mới hoàn chỉnh.
+fn write_atomically(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    match std::fs::write(&tmp, content).and_then(|_| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            // Windows: tệp đích đang bị chương trình khác (antivirus...) giữ nên không
+            // thay được — ghi thẳng như trước còn hơn báo không lưu được cấu hình.
+            warn!("[Settings] Không thay được {:?} bằng tệp tạm ({e}) — ghi trực tiếp", path);
+            std::fs::write(path, content)
+        }
+    }
+}
+
 /// `~/x` → `<home>/x`. Hộp nhập ở màn hình Công cụ là ô chữ tự do, và PathBuf
 /// không tự hiểu dấu `~` nên đường dẫn kiểu đó chưa bao giờ dùng được.
 fn expand_home(raw: &str) -> Option<PathBuf> {
@@ -281,7 +303,7 @@ impl SettingsManager {
         let content = serde_json::to_string_pretty(settings)
             .map_err(|e| format!("Không serialize được settings: {e}"))?;
 
-        std::fs::write(&path, content)
+        write_atomically(&path, content.as_bytes())
             .map_err(|e| format!("Không ghi được settings.json: {e}"))?;
 
         info!("[Settings] Đã lưu settings vào {:?}", path);
@@ -393,6 +415,52 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains("\"historyRetentionDays\":30"), "{json}");
+    }
+
+    /// Lượt tải đọc settings.json trong lúc người dùng đang lưu cấu hình không bao giờ
+    /// được thấy một tệp ghi dở (rỗng / JSON cụt).
+    #[test]
+    fn readers_never_see_a_half_written_settings_file() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("crwl_settings_atomic_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let make = |i: usize| {
+            serde_json::to_string_pretty(&AppSettings {
+                proxy: Some(format!("http://127.0.0.1:{}", 1000 + i)),
+                download_dir: Some("x".repeat(20_000)),
+                ..AppSettings::default()
+            })
+            .unwrap()
+        };
+        write_atomically(&path, make(0).as_bytes()).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut torn = 0usize;
+                while !done.load(Ordering::SeqCst) {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    if serde_json::from_str::<AppSettings>(&text).is_err() {
+                        torn += 1;
+                    }
+                }
+                torn
+            })
+        };
+        for i in 1..400 {
+            write_atomically(&path, make(i).as_bytes()).unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        assert_eq!(reader.join().unwrap(), 0, "có lượt đọc thấy settings.json đang ghi dở");
+
+        // Không để lại tệp tạm nào cạnh settings.json
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("settings.json")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

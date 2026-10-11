@@ -579,8 +579,11 @@ class GalleryDlExtractor(BaseExtractor):
                 media_url = meta.get("video_url") or raw_url
 
                 if isinstance(media_url, str) and media_url.startswith("ytdl:"):
-                    reddit_fb = meta.get("media", {}).get("reddit_video", {}).get("fallback_url") if isinstance(meta.get("media"), dict) else None
-                    media_url = reddit_fb or media_url.replace("ytdl:", "")
+                    # `media.reddit_video` có thể là null trong JSON của Reddit
+                    media = meta.get("media")
+                    reddit_video = media.get("reddit_video") if isinstance(media, dict) else None
+                    reddit_fb = reddit_video.get("fallback_url") if isinstance(reddit_video, dict) else None
+                    media_url = reddit_fb or self._strip_ytdl_prefix(media_url)
 
                 ext = (meta.get("extension") or meta.get("ext") or self._extract_ext(media_url) or "jpg").lower()
                 is_video = ext in ("mp4", "webm", "mov", "m4v", "m3u8", "ts") or bool(meta.get("video_url")) or bool(meta.get("is_video"))
@@ -697,7 +700,10 @@ class GalleryDlExtractor(BaseExtractor):
             for position, item in enumerate(entries, 1):
                 raw_url = item[1]
                 meta = item[2] if len(item) > 2 and isinstance(item[2], dict) else {}
-                media_url = meta.get("video_url") or raw_url
+                # gallery-dl giao video Reddit/Pinterest/Facebook... cho yt-dlp bằng
+                # tiền tố "ytdl:". Trước đây tiền tố này lọt nguyên vào kết quả quét,
+                # nên bấm tải video là yt-dlp báo "Unsupported url scheme: ytdl".
+                media_url = self._strip_ytdl_prefix(meta.get("video_url") or raw_url)
                 ext = (meta.get("extension") or meta.get("ext") or self._extract_ext(media_url) or "").lower()
                 is_video = ext in ("mp4", "webm", "mov", "m4v", "m3u8", "ts") or bool(meta.get("video_url"))
 
@@ -770,6 +776,13 @@ class GalleryDlExtractor(BaseExtractor):
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _strip_ytdl_prefix(url: Any) -> Any:
+        """`ytdl:https://...` → `https://...` (yt-dlp tải thẳng được URL phía sau)."""
+        if isinstance(url, str) and url.startswith("ytdl:"):
+            return url[len("ytdl:"):]
+        return url
 
     @staticmethod
     def _cleanup_cookie(path: Optional[str]) -> None:

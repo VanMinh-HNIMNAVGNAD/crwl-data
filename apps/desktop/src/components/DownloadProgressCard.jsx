@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { memo, useCallback, useState, useEffect, useRef } from 'react'
 import { IconDownload, IconCheck, IconClose } from './Icons'
 import { openDownloadFolder } from '../services/api'
 import { formatSeconds } from '../hooks/useDownloadTasks'
@@ -57,6 +57,9 @@ export default function DownloadProgressCard({
 
   if (!progress && !customStatusText) return null
 
+  // Tiêu đề lấy thẳng từ dữ liệu bóc tách: một giá trị không phải chuỗi (số, object)
+  // từng làm `title.slice` ném lỗi khi vẽ và trắng cả giao diện.
+  const titleText = title == null ? '' : String(title)
   const percent = Math.min(100, Math.max(0, Number(progress?.percent) || 0))
   const savedPath = progress?.filePath || progress?.file_path
   const isPreparing = status === 'preparing'
@@ -114,8 +117,8 @@ export default function DownloadProgressCard({
             )}
           </div>
           <div className="progress-card-text">
-            <h4 className="progress-task-name" title={title || 'Tệp tải xuống'}>
-              {title ? (title.length > 50 ? `${title.slice(0, 48)}...` : title) : 'Đang xử lý tải xuống...'}
+            <h4 className="progress-task-name" title={titleText || 'Tệp tải xuống'}>
+              {titleText ? (titleText.length > 50 ? `${titleText.slice(0, 48)}...` : titleText) : 'Đang xử lý tải xuống...'}
             </h4>
             <span className={`progress-sub-status ${isError ? 'is-error-text' : ''}`}>{statusText}</span>
             {isError && errorInfo.message && <span className="progress-error-hint">{errorInfo.message}</span>}
@@ -224,21 +227,34 @@ export default function DownloadProgressCard({
   )
 }
 
+/**
+ * Thẻ của một tác vụ. Mỗi sự kiện tiến trình chỉ thay object của ĐÚNG tác vụ đó
+ * (xem useDownloadTasks), nên `memo` giúp các thẻ khác không phải vẽ lại. Trước đây
+ * mọi thẻ nhận hàm `onCancel`/`onDismiss` mới ở mỗi lần vẽ nên luôn vẽ lại hết.
+ */
+const TaskCard = memo(function TaskCard({ task, onCancel, onDismiss, onShowToast }) {
+  const { id } = task
+  const handleCancel = useCallback(() => onCancel?.(id), [onCancel, id])
+  const handleDismiss = useCallback(() => onDismiss?.(id), [onDismiss, id])
+  return (
+    <DownloadProgressCard
+      progress={task.progress}
+      title={task.title}
+      startTime={task.startedAt}
+      onCancel={handleCancel}
+      onDismiss={handleDismiss}
+      onShowToast={onShowToast}
+    />
+  )
+})
+
 /** Một thẻ tiến trình cho mỗi tác vụ tải (xem hooks/useDownloadTasks). */
 export function DownloadTaskList({ tasks, onCancel, onDismiss, onShowToast }) {
   if (!tasks?.length) return null
   return (
     <div className="download-task-list">
       {tasks.map((task) => (
-        <DownloadProgressCard
-          key={task.id}
-          progress={task.progress}
-          title={task.title}
-          startTime={task.startedAt}
-          onCancel={() => onCancel?.(task.id)}
-          onDismiss={() => onDismiss?.(task.id)}
-          onShowToast={onShowToast}
-        />
+        <TaskCard key={task.id} task={task} onCancel={onCancel} onDismiss={onDismiss} onShowToast={onShowToast} />
       ))}
     </div>
   )
