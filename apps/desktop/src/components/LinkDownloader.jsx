@@ -44,7 +44,10 @@ import {
 } from '../utils/links'
 import { describeError, errorText, shortenMiddle } from '../utils/messages'
 import {
+  concurrentFragmentsFor,
+  downloadRefererFor,
   hasDownloadableContent,
+  mediaNote,
   needsYtdlpDownload,
   noDownloadableContentReason,
   splitByDownloader,
@@ -425,8 +428,8 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const [sponsorBlock, setSponsorBlock] = useState(false)
   const [splitChapters, setSplitChapters] = useState(false)
 
-  // concurrentFragments: tối ưu CPU — accelerate=false→1 (máy yếu), true→4 (mạng tốt)
-  const concurrentFragments = accelerate ? 4 : 1
+  // Số mảnh HLS/DASH tải song song (xem concurrentFragmentsFor)
+  const concurrentFragments = concurrentFragmentsFor(accelerate)
 
   // Synchronous validation state computed from URL
   const trimmedUrl = url.trim()
@@ -629,6 +632,10 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
         setSelectedImages({})
         setUserSelectedSubLang('')
         resetTrimmer()
+        // Tab lọc của kết quả trước không áp sang kết quả mới: đang ở "Âm thanh" (vừa tải
+        // MP3) mà dán link .m3u8 thì danh sách mới chỉ hiện MP3, trông như app không
+        // nhận ra video.
+        setStreamFilter('all')
         onShowToast?.(
           hasDownloadableContent(data)
             ? {
@@ -889,7 +896,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
         isAudio: isAudioOnly,
         isMute: isMute,
         // Luồng tìm thấy bên trong một trang (trang phim) cần Referer là trang đó
-        referer: media.referer || media.originalUrl || undefined,
+        referer: downloadRefererFor(media),
         startTime: (useTrim && trimStart) || undefined,
         endTime: (useTrim && trimEnd) || undefined,
         title: media.title,
@@ -1575,6 +1582,8 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
     }
   }
 
+  const resultNote = useMemo(() => mediaNote(singleMedia), [singleMedia])
+
   const filteredStreams = useMemo(() => {
     if (!singleMedia?.streams) return []
     if (streamFilter === 'all') return singleMedia.streams
@@ -1851,7 +1860,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
             {/* Options box cho batch mode */}
             {isOptionsOpen && (
               <div className="download-options-inline-box">
-                <label className="checkbox-opt-label" title="Tăng tốc tải bằng đa luồng — tiêu thụ nhiều CPU/RAM hơn">
+                <label className="checkbox-opt-label" title="Tải 8 mảnh HLS/DASH song song thay vì 4 — nhanh hơn trên mạng mạnh, tốn thêm chút RAM">
                   <input
                     type="checkbox"
                     checked={accelerate}
@@ -2071,7 +2080,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
             {/* Advanced download options box (nếu mở) — Tải đơn link */}
             {isOptionsOpen && (
               <div className="download-options-inline-box">
-                <label className="checkbox-opt-label" title="Tăng tốc tải bằng đa luồng — tiêu thụ nhiều CPU/RAM hơn">
+                <label className="checkbox-opt-label" title="Tải 8 mảnh HLS/DASH song song thay vì 4 — nhanh hơn trên mạng mạnh, tốn thêm chút RAM">
                   <input
                     type="checkbox"
                     checked={accelerate}
@@ -2257,16 +2266,27 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
               </div>
             )}
 
-            {/* Cảnh báo khi stream bị ẩn / DRM */}
+            {/* Cảnh báo khi không có gì tải được (DRM, chỉ là một mảnh luồng...) — hiện đúng
+                lý do engine gửi về thay vì luôn nói về DRM. */}
             {singleMedia.streams !== null && singleMedia.streams !== undefined &&
-             singleMedia.streams.length === 0 && singleMedia.description?.startsWith('⚠️') && (
+             singleMedia.streams.length === 0 && resultNote?.kind === 'warning' && (
               <div className="stream-not-found-notice">
                 <div className="stream-not-found-icon">🔒</div>
                 <div className="stream-not-found-text">
-                  <strong>Không tìm được nguồn video</strong>
-                  <p>Player của trang này có thể dùng DRM (Widevine/PlayReady), mã hóa phức tạp, hoặc token đã hết hạn ngay khi load. Không thể tải về.</p>
-                  <p className="stream-not-found-hint">💡 Thử mở trang bằng trình duyệt, chọn chất lượng và sao chép URL stream trực tiếp.</p>
+                  <strong>Không tìm được nguồn video tải được</strong>
+                  <p>{resultNote.text}</p>
+                  {/DRM/.test(resultNote.text) && (
+                    <p className="stream-not-found-hint">💡 Thử mở trang bằng trình duyệt, chọn chất lượng rồi sao chép link luồng (.m3u8) dán vào đây.</p>
+                  )}
                 </div>
+              </div>
+            )}
+
+            {/* Lưu ý cho kết quả vẫn tải được (link chỉ có hình / chỉ có tiếng / chỉ là mảnh luồng) */}
+            {resultNote?.kind === 'info' && (
+              <div className="stream-info-note" role="note">
+                <span aria-hidden="true">ℹ️</span>
+                <span>{resultNote.text}</span>
               </div>
             )}
 

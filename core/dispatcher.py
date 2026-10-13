@@ -17,9 +17,18 @@ from .extractors.movie import MovieExtractor
 from .extractors.direct import DirectImageExtractor
 from .extractors.web_scraper import WebScraperExtractor
 from .extractors.page_media import PageMediaExtractor, NoPostMediaError, describe_media
+from .extractors.media_probe import MANIFEST_EXTS, SEGMENT_EXTS, is_direct_media_url, is_segment_url, path_ext
 from .extractors.stream_sniffer import get_sniffer
 from .extractors.story import StoryExtractor
 from .cookies.browser_cookies import registrable_domain
+
+
+class _LooksLikePage(Exception):
+    """Link có đuôi tệp media nhưng máy chủ trả về trang web (yt-dlp: "Unsupported URL")."""
+
+    def __init__(self, cause: Exception):
+        super().__init__(str(cause))
+        self.cause = cause
 
 
 class MediaDispatcher(BaseExtractor):
@@ -267,10 +276,29 @@ class MediaDispatcher(BaseExtractor):
             except Exception as e:
                 self.warn(f"Direct image failed ({e}), fallback...")
 
+        # 3b. Link thẳng tới tệp / luồng media (.m3u8, .mpd, .mp4, .mp3, mảnh .ts/.m4s...)
+        #     ngoài các nền tảng đã biết (link CDN của v.redd.it, TikTok... vẫn để
+        #     extractor của nền tảng xử lý vì nó ghép được cả hình lẫn tiếng).
+        page_ytdlp_err: Optional[Exception] = None
+        if (
+            is_direct_media_url(target_url)
+            and not self.is_video_audio_platform(target_url)
+            and not self.is_gallery_platform(target_url)
+        ):
+            self.log(f"Link tệp / luồng media trực tiếp: {target_url}")
+            try:
+                res = self._extract_direct_media(target_url, browser)
+                return self._enhance_metadata(res, target_url)
+            except _LooksLikePage as page:
+                # Đuôi tệp media nhưng thực ra là TRANG web (vd. ".../video.mp4" trả HTML
+                # có player): đi tiếp chuỗi đọc trang như mọi liên kết khác.
+                self.log("Link có đuôi tệp media nhưng là trang web → đọc như trang thường")
+                page_ytdlp_err = page.cause
+
         # 4. Trang phim / stream HLS
-        # MovieExtractor luôn kết thúc bằng yt-dlp trên chính URL này; nếu nó đã thất
-        # bại thì bước 7 không chạy yt-dlp lần nữa (trước đây tốn thêm 30-60 giây).
-        movie_err: Optional[Exception] = None
+        # MovieExtractor luôn kết thúc bằng yt-dlp trên chính URL này; nếu nó (hoặc bước
+        # 3b) đã thất bại thì bước 7 không chạy yt-dlp lần nữa (trước đây tốn thêm 30-60 giây).
+        movie_err: Optional[Exception] = page_ytdlp_err
         if self.movie.is_movie_or_stream_url(target_url):
             try:
                 self.log(f"Phim / HLS Stream: {target_url}")
@@ -438,6 +466,106 @@ class MediaDispatcher(BaseExtractor):
                 self.warn(f"Không đọc được bài viết ({page_err}), thử Playwright stream sniffer...")
             # Thử Playwright sniffer (headless browser intercept)
             return self._try_playwright_sniff(target_url, gal_err, yt_err, browser)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Link tệp / luồng media trực tiếp
+    # ─────────────────────────────────────────────────────────────────────────
+
+    _SEGMENT_ONLY_NOTE = (
+        "Đây chỉ là MỘT MẢNH vài giây của luồng phát (.ts / .m4s) và không tìm thấy danh "
+        "sách phát đầy đủ chứa nó. Muốn tải cả video, hãy dán link danh sách phát "
+        "(.m3u8 / .mpd) hoặc link trang chứa video."
+    )
+
+    def _extract_direct_media(self, url: str, browser: Optional[str]) -> MediaMetadata:
+        """Link thẳng tới tệp / luồng media: chỉ yt-dlp (kèm ffprobe) đọc được.
+
+        Trước đây khi yt-dlp thất bại (403 vì thiếu Referer, link ký đã hết hạn),
+        dispatcher còn chạy gallery-dl, đọc "trang" bằng HTML tĩnh rồi mở cả Chromium
+        (thêm 5-40 giây) — và Chromium luôn "thấy" chính link đó trong lưu lượng mạng,
+        nên app báo phân tích xong một video không bao giờ tải được.
+
+        Ném `_LooksLikePage` khi link hoá ra là trang web (yt-dlp: "Unsupported URL")
+        để dispatcher đọc nó như trang thường.
+        """
+        prober = self.ytdlp.prober
+        info = None
+        fragment = False
+        if is_segment_url(url):
+            # Mảnh .m4s / .ts chỉ dài vài giây (mảnh .m4s còn không tự phát được): tìm
+            # danh sách phát chứa nó để tải nguyên video.
+            info = prober.probe(url)
+            fragment = self._is_stream_fragment(url, info)
+            if fragment:
+                manifest = prober.find_manifest(url)
+                if manifest:
+                    self.log(f"Mảnh luồng → danh sách phát đầy đủ: {manifest}")
+                    try:
+                        res = self.ytdlp.extract_metadata(manifest, browser=browser)
+                        res.platform = "movie"
+                        if not res.description:
+                            res.description = (
+                                "ℹ️ Đã tìm thấy danh sách phát đầy đủ chứa mảnh này — tải về được nguyên video."
+                            )
+                        return res
+                    except PlaylistUrlError:
+                        raise
+                    except Exception as err:
+                        self.warn(f"Không đọc được danh sách phát {manifest}: {err}")
+
+        try:
+            res = self.ytdlp.extract_metadata(url, browser=browser)
+        except PlaylistUrlError:
+            raise
+        except Exception as err:
+            # yt-dlp nhận ra mọi tệp / luồng media (kể cả "application/octet-stream");
+            # "Unsupported URL" nghĩa là máy chủ trả về một trang HTML.
+            if "Unsupported URL" in str(err) and path_ext(url) not in (MANIFEST_EXTS | SEGMENT_EXTS):
+                raise _LooksLikePage(err) from err
+            raise RuntimeError(self._direct_media_error(url, err)) from err
+
+        if path_ext(url) in MANIFEST_EXTS:
+            res.platform = "movie"
+        if fragment:
+            if info is None and prober.is_available():
+                # yt-dlp mở được nhưng ffprobe không đọc nổi: mảnh fMP4 thiếu phần đầu
+                # (init) — tải về cũng là một tệp không phát được.
+                res.streams = []
+                res.description = f"⚠️ {self._SEGMENT_ONLY_NOTE}"
+            else:
+                res.description = f"ℹ️ {self._SEGMENT_ONLY_NOTE}"
+        return res
+
+    @staticmethod
+    def _is_stream_fragment(url: str, info) -> bool:
+        """Link .ts / .m4s là MỘT MẢNH của luồng (không phải cả video)?
+
+        Mảnh .m4s của HLS-fMP4 / DASH không chứa phần đầu (moov) nên ffprobe không đọc
+        được; .m4s đọc được là cả một luồng trong một tệp (DASH một tệp, vd. Bilibili).
+        Mảnh .ts thì tự phát được nên xét theo thời lượng.
+        """
+        if path_ext(url) == "ts":
+            return info is None or info.is_short
+        return info is None
+
+    @classmethod
+    def _direct_media_error(cls, url: str, err: Exception) -> str:
+        text = str(err)
+        kind = "luồng phát" if path_ext(url) in (MANIFEST_EXTS | SEGMENT_EXTS) else "tệp media"
+        if re.search(r"HTTP Error 40[13]|Forbidden|Unauthorized", text, re.IGNORECASE):
+            return (
+                f"Máy chủ từ chối mở {kind} này (HTTP 403) — link .m3u8 / .m4s / .mp4 lấy từ trình duyệt "
+                f"thường chỉ dùng được khi mở từ trang gốc, hoặc đã hết hạn sau vài phút. Hãy dán link "
+                f"TRANG chứa video để app tự lấy luồng mới."
+            )
+        if re.search(r"HTTP Error 4(?:04|10)", text, re.IGNORECASE):
+            return (
+                f"Không còn tìm thấy {kind} này trên máy chủ (HTTP 404) — link lấy từ trình duyệt thường "
+                f"hết hạn sau vài phút. Hãy dán link TRANG chứa video để app tự lấy luồng mới."
+            )
+        if "quá thời gian" in text:
+            return text
+        return f"Không đọc được {kind} này. (Chi tiết: {cls._short_reason(err) or text[:160]})"
 
     # ─────────────────────────────────────────────────────────────────────────
     # Crawl Profile
@@ -657,6 +785,9 @@ class MediaDispatcher(BaseExtractor):
         Hai dấu hiệu: yt-dlp dùng bộ đọc trang chung (trang có thẻ <video>), hoặc video
         nằm ở tên miền khác trang (bài viết nhúng video YouTube/Vimeo...).
         """
+        # Link là chính tệp media (không phải trang web): không có "bài viết" nào để đọc.
+        if ytdlp_res.is_direct_media:
+            return None
         key = (ytdlp_res.extractor_key or "").lower()
         generic = key in self._GENERIC_YTDLP_EXTRACTORS
         embedded = bool(ytdlp_res.webpage_url) and not self._same_site(ytdlp_res.webpage_url, target_url)

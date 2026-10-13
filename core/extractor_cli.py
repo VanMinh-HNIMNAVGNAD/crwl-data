@@ -42,6 +42,7 @@ from core.cancellation import (
 )
 from core.cookies.browser_cookies import export_cookies_for_domains
 from core.dispatcher import MediaDispatcher
+from core.extractors import ytdlp_runtime
 from core.resolver.url_resolver import UrlResolver
 
 
@@ -148,6 +149,17 @@ def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict
         end_request(req_id)
 
 
+def _warm_up(dispatcher: MediaDispatcher) -> None:
+    try:
+        ytdlp = dispatcher.ytdlp
+        if ytdlp.is_available():
+            ytdlp_runtime.prepare(ytdlp.binary_path)
+            ytdlp.supports_js_runtimes()
+    except Exception as e:  # chỉ là tối ưu — lỗi ở đây không được ảnh hưởng engine
+        sys.stderr.write(f"[Sidecar] Bỏ qua bước chuẩn bị sẵn: {e}\n")
+        sys.stderr.flush()
+
+
 def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None:
     """Chế độ Sidecar IPC: đọc JSON qua stdin, xử lý SONG SONG, in JSON qua stdout.
 
@@ -164,6 +176,12 @@ def run_stdin_worker(dispatcher: MediaDispatcher, resolver: UrlResolver) -> None
         thread_name_prefix="crwl-req",
     )
     quick_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="crwl-quick")
+
+    # Chuẩn bị sẵn ở nền để lượt phân tích / tải ĐẦU TIÊN không phải chờ: bản giải nén
+    # của yt-dlp zipapp và phép thử `--js-runtimes` (trước đây ~0,75 giây cộng vào lượt
+    # phân tích đầu tiên sau mỗi lần mở app).
+    ytdlp_runtime.enable_background_prepare()
+    threading.Thread(target=_warm_up, args=(dispatcher,), name="crwl-warmup", daemon=True).start()
 
     def process(raw_req: dict) -> None:
         # Luôn phải trả lời: một request rơi mất (lỗi ngoài handle_request, dữ liệu

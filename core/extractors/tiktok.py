@@ -11,6 +11,7 @@ import re
 import subprocess
 from typing import Optional, List, Dict, Any
 from .base import BaseExtractor
+from . import ytdlp_runtime
 from ..models import CrawlMediaItem, ProfileCrawlResult
 from ..cancellation import cap_timeout
 
@@ -122,7 +123,7 @@ class TikTokExtractor(BaseExtractor):
                 if not vid_id:
                     continue
                 v_url = f"https://www.tiktok.com/@{username}/video/{vid_id}"
-                cmd = [self.yt_dlp_bin, "--no-warnings", "--ignore-errors", "--dump-json", v_url]
+                cmd = [*ytdlp_runtime.command_for(self.yt_dlp_bin), "--no-warnings", "--ignore-errors", "--dump-json", v_url]
                 code, stdout, _ = self.run_process(cmd, timeout=12)
                 if code == 0 and stdout.strip():
                     try:
@@ -136,7 +137,7 @@ class TikTokExtractor(BaseExtractor):
 
             if sec_uid:
                 cmd = [
-                    self.yt_dlp_bin,
+                    *ytdlp_runtime.command_for(self.yt_dlp_bin),
                     "--no-warnings",
                     "--ignore-errors",
                     "--flat-playlist",

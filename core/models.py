@@ -224,6 +224,8 @@ class MediaMetadata:
     webpage_url: Optional[str] = None
     # Số video yt-dlp thấy trên trang (trang nhiều <video> chỉ trả về video đầu tiên)
     page_video_count: Optional[int] = None
+    # yt-dlp nhận link là TỆP media trực tiếp (không phải trang web)
+    is_direct_media: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         res = {

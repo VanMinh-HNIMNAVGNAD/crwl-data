@@ -773,13 +773,8 @@ impl DownloaderService {
         let chapter_template =
             "chapter:%(title).50s - %(section_number)03d %(section_title).40s [%(id).50s].%(ext)s";
 
-        let mut cmd = Command::new(ytdlp_path);
-        #[cfg(windows)]
-        {
-            #[allow(unused_imports)]
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
-        }
+        // yt-dlp zipapp chạy từ bản giải nén có bytecode (nhanh hơn 0,5-1,5 giây mỗi lượt)
+        let mut cmd = BinaryManager::ytdlp_command(ytdlp_path);
         cmd.arg(&opts.url);
         cmd.arg("-P").arg(dest_folder);
         cmd.arg("-o").arg(output_template);
@@ -804,9 +799,10 @@ impl DownloaderService {
             cmd.arg("--js-runtimes").arg(runtime);
         }
 
-        // Giữ số kết nối thấp để tránh làm nghẽn CPU, RAM và băng thông trên máy yếu.
-        // Người dùng vẫn có thể tăng explicit qua DownloadOptions khi cần.
-        let frags = opts.concurrent_fragments.unwrap_or(2).clamp(1, 8);
+        // Số mảnh HLS/DASH tải song song. Tải tuần tự từng mảnh (-N 1) chậm theo độ trễ
+        // mạng: đo trên luồng HLS 720p, -N 4 nhanh gấp ~2,9 lần mà CPU trên mỗi MB còn
+        // thấp hơn. Không ảnh hưởng tệp tải một lần (YouTube, MP4 trực tiếp).
+        let frags = opts.concurrent_fragments.unwrap_or(4).clamp(1, 8);
         cmd.arg("-N").arg(frags.to_string());
 
         // aria2c: khi người dùng yêu cầu, cấu hình aria2c xuất tiến trình đều đặn
@@ -944,6 +940,13 @@ impl DownloaderService {
                     cmd.arg("--remux-video").arg(&vf);
                     chosen_container = Some(vf);
                 }
+            }
+            // Tệp fMP4 dán thẳng (.m4s — vd. luồng DASH của Bilibili) được yt-dlp lưu
+            // nguyên đuôi .m4s mà trình phát thông thường không mở. Đổi vỏ sang MP4
+            // (không mã hoá lại) khi người dùng chưa chọn định dạng.
+            if chosen_container.is_none() && Self::is_fmp4_segment_url(&opts.url) {
+                cmd.arg("--remux-video").arg("m4s>mp4");
+                chosen_container = Some("mp4".to_string());
             }
         }
 
@@ -2138,10 +2141,10 @@ impl DownloaderService {
         } else {
             emit(0.0, "downloading", format!("Chuẩn bị tải {total} tệp..."), None);
 
-            // Tải song song có giới hạn. Cấp phát trước đường dẫn độc nhất cho từng tệp
-            // để tránh race condition và ghi đè khi nhiều tệp có cùng tên hoặc chạy concurrent.
-            // Mỗi tác vụ là một process curl riêng; 5 process đồng thời gây giật
-            // mạnh trên các máy 2 nhân khi tải album lớn.
+            // Cấp phát trước đường dẫn độc nhất cho từng tệp để tránh race condition và ghi
+            // đè khi nhiều tệp có cùng tên hoặc chạy concurrent.
+            // Lối dự phòng (curl quá cũ cho chế độ hàng loạt): mỗi tệp một process curl
+            // riêng; 5 process đồng thời gây giật mạnh trên các máy 2 nhân khi tải album lớn.
             const MAX_PARALLEL: usize = 2;
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL));
             let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2180,61 +2183,92 @@ impl DownloaderService {
                 planned_items.push((item, dest_file));
             }
 
-            for (item, dest_file) in planned_items {
-                let permit_src = Arc::clone(&semaphore);
-                let counter = Arc::clone(&completed);
-                let cookie = cookie_file.clone();
-
-                handles.push(tokio::spawn(async move {
-                    let _permit = match permit_src.acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => return None,
-                    };
-
-                    let referer_header = Self::get_referer_for_url(&item.url, item.referer.as_deref());
-
-                    let (ok, content_type) =
-                        Self::curl_to_file_with_cookies(&item.url, &referer_header, &dest_file, cookie.as_deref()).await;
-                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if ok {
-                        Some(Self::add_extension_from_content_type(dest_file, content_type.as_deref()))
-                    } else {
-                        warn!("Không tải được tệp album: {}", item.url);
-                        None
-                    }
-                }));
-            }
-
             let mut is_cancelled = false;
-            for handle in handles.iter_mut() {
+            let share = if as_zip { 90.0 } else { 100.0 };
+            if Self::curl_supports_batch().await {
+                // Một tiến trình curl cho cả album, dùng lại kết nối (xem curl_batch_to_files)
+                let batch: Vec<BatchFileItem> = planned_items
+                    .into_iter()
+                    .map(|(item, dest)| BatchFileItem {
+                        referer: Self::get_referer_for_url(&item.url, item.referer.as_deref()),
+                        url: item.url,
+                        dest,
+                    })
+                    .collect();
+                let on_done = |done: usize| {
+                    emit((done as f64 / total as f64) * share, "downloading", format!("Đã tải {done}/{total} tệp"), None);
+                };
                 tokio::select! {
                     _ = &mut cancel_rx => {
                         is_cancelled = true;
-                        break;
                     }
-                    res = &mut *handle => {
-                        if let Ok(Some(path)) = res {
-                            downloaded_files.push(path);
+                    outcomes = Self::curl_batch_to_files(&batch, cookie_file.as_deref(), on_done) => {
+                        for ((ok, content_type), file) in outcomes.into_iter().zip(batch) {
+                            if ok {
+                                downloaded_files.push(Self::add_extension_from_content_type(file.dest, content_type.as_deref()));
+                            } else {
+                                warn!("Không tải được tệp album: {}", file.url);
+                            }
                         }
-                        let done = completed.load(std::sync::atomic::Ordering::SeqCst);
-                        let percent = (done as f64 / total as f64) * if as_zip { 90.0 } else { 100.0 };
-                        emit(
-                            percent,
-                            "downloading",
-                            format!("Đã tải {done}/{total} tệp"),
-                            None,
-                        );
+                    }
+                }
+            } else {
+                for (item, dest_file) in planned_items {
+                    let permit_src = Arc::clone(&semaphore);
+                    let counter = Arc::clone(&completed);
+                    let cookie = cookie_file.clone();
+
+                    handles.push(tokio::spawn(async move {
+                        let _permit = match permit_src.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => return None,
+                        };
+
+                        let referer_header = Self::get_referer_for_url(&item.url, item.referer.as_deref());
+
+                        let (ok, content_type) =
+                            Self::curl_to_file_with_cookies(&item.url, &referer_header, &dest_file, cookie.as_deref()).await;
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if ok {
+                            Some(Self::add_extension_from_content_type(dest_file, content_type.as_deref()))
+                        } else {
+                            warn!("Không tải được tệp album: {}", item.url);
+                            None
+                        }
+                    }));
+                }
+
+                for handle in handles.iter_mut() {
+                    tokio::select! {
+                        _ = &mut cancel_rx => {
+                            is_cancelled = true;
+                            break;
+                        }
+                        res = &mut *handle => {
+                            if let Ok(Some(path)) = res {
+                                downloaded_files.push(path);
+                            }
+                            let done = completed.load(std::sync::atomic::Ordering::SeqCst);
+                            emit(
+                                (done as f64 / total as f64) * share,
+                                "downloading",
+                                format!("Đã tải {done}/{total} tệp"),
+                                None,
+                            );
+                        }
+                    }
+                }
+                if is_cancelled {
+                    for handle in &mut handles {
+                        handle.abort();
+                    }
+                    for handle in std::mem::take(&mut handles) {
+                        let _ = handle.await;
                     }
                 }
             }
 
             if is_cancelled {
-                for handle in &mut handles {
-                    handle.abort();
-                }
-                for handle in handles {
-                    let _ = handle.await;
-                }
                 Self::forget_album_dir(&task_id).await;
                 info!("Hủy album batch: Xoá sạch thư mục {:?}", target_dir);
                 if target_dir.exists() {
@@ -2674,6 +2708,11 @@ impl DownloaderService {
     ///
     /// Nếu không thể nhận diện được phần mở rộng, trả về "" (không có đuôi).
     /// Tuyệt đối không mặc định ép thành "jpg" để tránh làm sai loại file.
+    /// URL trỏ thẳng tới tệp fMP4 dạng mảnh luồng (.m4s) — cần đổi vỏ sang MP4 sau khi tải.
+    pub(crate) fn is_fmp4_segment_url(url: &str) -> bool {
+        Self::guess_extension(url) == "m4s"
+    }
+
     pub fn guess_extension(url: &str) -> &'static str {
         let lower = url.to_lowercase();
         let without_hash = lower.split('#').next().unwrap_or("");
@@ -3133,6 +3172,9 @@ impl DownloaderService {
             cmd.kill_on_drop(true);
             cmd.arg("-sS")
                 .arg("-f")
+                // URL là địa chỉ thật, không phải mẫu: không tắt glob thì "anh[1].jpg"
+                // báo "bad range" (curl 3), còn "{a,b}" bị nhân thành hai lượt tải.
+                .arg("-g")
                 .arg("--proto").arg("=http,https")
                 .arg("--retry").arg("2")
                 .arg("--retry-delay").arg("1")
@@ -3199,6 +3241,307 @@ impl DownloaderService {
 
             let opt_ct = if content_type.is_empty() { None } else { Some(content_type) };
             return (true, opt_ct);
+        }
+    }
+
+    /// curl đủ mới cho chế độ tải hàng loạt: `--parallel` (7.66), `%{urlnum}` và
+    /// `%{exitcode}` (7.75). Bản cũ hơn (vd. curl đi kèm Windows 10 đời đầu) dùng lối
+    /// tải từng tệp như trước.
+    async fn curl_supports_batch() -> bool {
+        static SUPPORT: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+        *SUPPORT
+            .get_or_init(|| async {
+                let mut cmd = Command::new("curl");
+                #[cfg(windows)]
+                {
+                    #[allow(unused_imports)]
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000);
+                }
+                cmd.arg("--version").kill_on_drop(true);
+                match tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output()).await {
+                    Ok(Ok(out)) if out.status.success() => {
+                        Self::curl_version_at_least(&String::from_utf8_lossy(&out.stdout), (7, 75, 0))
+                    }
+                    _ => false,
+                }
+            })
+            .await
+    }
+
+    /// "curl 8.18.0 (x86_64-pc-linux-gnu) libcurl/8.18.0 ..." ≥ `min`?
+    fn curl_version_at_least(version_text: &str, min: (u32, u32, u32)) -> bool {
+        let Some(version) = version_text.split_whitespace().nth(1) else {
+            return false;
+        };
+        let mut parts = version
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u32>().unwrap_or(0));
+        let found = (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        );
+        found >= min
+    }
+
+    /// Giá trị trong tệp cấu hình curl (`-K`): đặt trong ngoặc kép, thoát `\` `"` và ký tự điều khiển.
+    fn curl_config_quote(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Khoá "scheme://host:port" để chỉ phân giải DNS / kiểm tra mạng nội bộ một lần mỗi máy chủ.
+    fn origin_key(raw_url: &str) -> String {
+        match url::Url::parse(raw_url) {
+            Ok(u) => format!(
+                "{}://{}:{}",
+                u.scheme(),
+                u.host_str().unwrap_or(""),
+                u.port_or_known_default().unwrap_or(0)
+            ),
+            Err(_) => raw_url.to_string(),
+        }
+    }
+
+    /// Tải nhiều tệp bằng MỘT tiến trình curl (`--parallel`), trả về (thành công,
+    /// Content-Type) theo đúng thứ tự `items`. `on_done(n)` báo số tệp đã xong.
+    ///
+    /// Trước đây mỗi tệp một tiến trình curl, tối đa 2 cùng lúc: mỗi ảnh tốn một lần bắt
+    /// tay TCP+TLS mới. Đo với 40 ảnh từ một CDN: 8,8 s → 1,0 s khi dùng lại kết nối
+    /// (HTTP/2 ghép nhiều tệp trên một kết nối). Giữ nguyên các bảo vệ của lối tải từng
+    /// tệp: chỉ địa chỉ công khai, chuyển hướng đi theo thủ công và kiểm tra lại đích ở
+    /// MỖI bước (tối đa 5 bước), tệp HTML/JSON giả làm ảnh bị loại.
+    pub(crate) async fn curl_batch_to_files<F>(
+        items: &[BatchFileItem],
+        cookie_file: Option<&Path>,
+        mut on_done: F,
+    ) -> Vec<(bool, Option<String>)>
+    where
+        F: FnMut(usize) + Send,
+    {
+        const MAX_REDIRECTS: usize = 5;
+        let mut results: Vec<Option<(bool, Option<String>)>> = vec![None; items.len()];
+        let mut done = 0usize;
+        let mut public_origins: HashMap<String, bool> = HashMap::new();
+        // (chỉ số mục, URL hiện tại) — URL đổi sau mỗi lần chuyển hướng
+        let mut pending: Vec<(usize, String)> =
+            items.iter().enumerate().map(|(i, it)| (i, it.url.clone())).collect();
+
+        for _hop in 0..=MAX_REDIRECTS {
+            if pending.is_empty() {
+                break;
+            }
+            let mut runnable: Vec<(usize, String)> = Vec::with_capacity(pending.len());
+            for (idx, current) in std::mem::take(&mut pending) {
+                let key = Self::origin_key(&current);
+                let public = match public_origins.get(&key) {
+                    Some(v) => *v,
+                    None => {
+                        let v = Self::is_public_http_url(&current).await;
+                        public_origins.insert(key, v);
+                        v
+                    }
+                };
+                if public && items[idx].dest.to_str().is_some() {
+                    runnable.push((idx, current));
+                } else {
+                    warn!("Từ chối URL tải không hợp lệ hoặc trỏ vào mạng nội bộ");
+                    let _ = std::fs::remove_file(&items[idx].dest);
+                    results[idx] = Some((false, None));
+                    done += 1;
+                    on_done(done);
+                }
+            }
+            if runnable.is_empty() {
+                break;
+            }
+
+            // Xử lý từng tệp NGAY khi curl báo xong (không đợi cả lượt): thanh tiến trình
+            // của album phải chạy dần chứ không đứng ở 0% rồi nhảy lên 100%.
+            let mut on_outcome = |pos: usize, outcome: BatchOutcome| {
+                let (idx, ref current) = runnable[pos];
+                let dest = &items[idx].dest;
+                match outcome {
+                    BatchOutcome::Redirect(next) => {
+                        // Thân phản hồi 3xx không phải tệp: đi tiếp ở lượt sau (kiểm tra lại đích)
+                        let _ = std::fs::remove_file(dest);
+                        pending.push((idx, next));
+                        return;
+                    }
+                    BatchOutcome::Finished { exit_code: 0, http_status, content_type } => {
+                        match Self::validate_downloaded_media(dest, http_status, &content_type, current) {
+                            Ok(()) => {
+                                let ct = if content_type.is_empty() { None } else { Some(content_type) };
+                                results[idx] = Some((true, ct));
+                            }
+                            Err(reason) => {
+                                warn!("Tải tệp media không hợp lệ: {reason}");
+                                let _ = std::fs::remove_file(dest);
+                                results[idx] = Some((false, None));
+                            }
+                        }
+                    }
+                    BatchOutcome::Finished { exit_code, http_status, .. } => {
+                        warn!("curl thất bại khi tải {current} (mã {exit_code}, HTTP {http_status})");
+                        let _ = std::fs::remove_file(dest);
+                        results[idx] = Some((false, None));
+                    }
+                    BatchOutcome::Missing => {
+                        let _ = std::fs::remove_file(dest);
+                        results[idx] = Some((false, None));
+                    }
+                }
+                done += 1;
+                on_done(done);
+            };
+            Self::run_curl_batch(&runnable, items, cookie_file, &mut on_outcome).await;
+        }
+
+        // Mục còn chuyển hướng sau MAX_REDIRECTS bước
+        for (idx, _) in pending {
+            warn!("Quá {MAX_REDIRECTS} lần chuyển hướng khi tải {}", items[idx].url);
+            let _ = std::fs::remove_file(&items[idx].dest);
+            results[idx] = Some((false, None));
+            done += 1;
+            on_done(done);
+        }
+        results.into_iter().map(|r| r.unwrap_or((false, None))).collect()
+    }
+
+    /// Chạy một tiến trình curl cho mọi mục `runnable` (chỉ số trong `items`, URL hiện tại),
+    /// gọi `on_outcome(vị trí trong runnable, kết quả)` ngay khi từng tệp xong — và với
+    /// `Missing` cho mọi tệp curl không kịp báo (bị kill, lỗi khởi động).
+    async fn run_curl_batch(
+        runnable: &[(usize, String)],
+        items: &[BatchFileItem],
+        cookie_file: Option<&Path>,
+        on_outcome: &mut (dyn FnMut(usize, BatchOutcome) + Send),
+    ) {
+        const PARALLEL: usize = 6;
+        const MARKER: &str = "@@CRWL";
+        const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+        let mut reported = vec![false; runnable.len()];
+
+        let proxy = SettingsManager::proxy();
+        // `-b` không có dấu "=" mới được curl hiểu là TÊN TỆP (có "=" là chuỗi cookie)
+        let cookie = cookie_file
+            .filter(|c| c.is_file() && !c.to_string_lossy().contains('='))
+            .map(|c| c.to_string_lossy().to_string());
+
+        // Cấu hình qua stdin thay vì tham số dòng lệnh: vài trăm URL vượt giới hạn
+        // 32 767 ký tự của dòng lệnh Windows.
+        // `parallel-immediate`: mặc định curl đợi kết nối đầu tiên tới máy chủ xong để xem có
+        // ghép kênh HTTP/2 được không rồi mới chạy các tệp khác — một ảnh đầu chậm là cả
+        // album đứng chờ. Các tệp sau vẫn dùng lại các kết nối đã mở.
+        let mut config = format!("parallel\nparallel-immediate\nparallel-max = {PARALLEL}\n");
+        for (pos, (idx, current)) in runnable.iter().enumerate() {
+            let item = &items[*idx];
+            if pos > 0 {
+                config.push_str("next\n");
+            }
+            config.push_str(&format!("url = {}\n", Self::curl_config_quote(current)));
+            config.push_str(&format!("output = {}\n", Self::curl_config_quote(&item.dest.to_string_lossy())));
+            config.push_str(&format!("referer = {}\n", Self::curl_config_quote(&item.referer)));
+            config.push_str(&format!("user-agent = {}\n", Self::curl_config_quote(USER_AGENT)));
+            config.push_str(
+                "silent\nshow-error\nfail\ngloboff\nproto = \"=http,https\"\nretry = 2\nretry-delay = 1\n\
+                 connect-timeout = 20\nspeed-limit = 1024\nspeed-time = 60\n",
+            );
+            // `%{stderr}`: stdout của curl được đệm khi là pipe — kết quả từng tệp chỉ
+            // tới lúc cả lượt xong và thanh tiến trình đứng im.
+            config.push_str(&format!(
+                "write-out = \"%{{stderr}}{MARKER}\\t%{{urlnum}}\\t%{{http_code}}\\t%{{content_type}}\\t%{{redirect_url}}\\t%{{exitcode}}\\n\"\n"
+            ));
+            if let Some(ref p) = proxy {
+                config.push_str(&format!("proxy = {}\n", Self::curl_config_quote(p)));
+            }
+            if let Some(ref c) = cookie {
+                config.push_str(&format!("cookie = {}\n", Self::curl_config_quote(c)));
+            }
+        }
+
+        let mut cmd = Command::new("curl");
+        #[cfg(windows)]
+        {
+            #[allow(unused_imports)]
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        // Huỷ tải = drop future này: curl phải chết theo, nếu không nó vẫn tải tiếp và
+        // có thể tạo lại tệp ngay sau khi bước dọn dẹp đã xoá.
+        cmd.arg("-K")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Không thể thực thi curl để tải album: {e}");
+                for pos in 0..runnable.len() {
+                    on_outcome(pos, BatchOutcome::Missing);
+                }
+                return;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            tokio::spawn(async move {
+                let _ = stdin.write_all(config.as_bytes()).await;
+                let _ = stdin.shutdown().await;
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Some(rest) = line.strip_prefix(MARKER).and_then(|r| r.strip_prefix('\t')) else {
+                    if !line.trim().is_empty() {
+                        warn!("curl: {}", line.trim());
+                    }
+                    continue;
+                };
+                let fields: Vec<&str> = rest.split('\t').collect();
+                if fields.len() < 5 {
+                    continue;
+                }
+                let Ok(pos) = fields[0].trim().parse::<usize>() else { continue };
+                if pos >= reported.len() || reported[pos] {
+                    continue;
+                }
+                reported[pos] = true;
+                let http_status = fields[1].trim().parse::<u16>().unwrap_or(0);
+                let redirect = fields[3].trim();
+                let exit_code = fields[4].trim().parse::<i32>().unwrap_or(-1);
+                on_outcome(
+                    pos,
+                    if (300..400).contains(&http_status) && !redirect.is_empty() {
+                        BatchOutcome::Redirect(redirect.to_string())
+                    } else {
+                        BatchOutcome::Finished { exit_code, http_status, content_type: fields[2].trim().to_string() }
+                    },
+                );
+            }
+        }
+        let _ = child.wait().await;
+        for (pos, was_reported) in reported.into_iter().enumerate() {
+            if !was_reported {
+                on_outcome(pos, BatchOutcome::Missing);
+            }
         }
     }
 
@@ -3382,9 +3725,27 @@ pub struct DirectFileItem {
     pub referer: Option<String>,
 }
 
+/// Một tệp trong lượt tải hàng loạt bằng một tiến trình curl.
+pub(crate) struct BatchFileItem {
+    pub url: String,
+    /// Header Referer đã chuẩn hoá (xem `get_referer_for_url`)
+    pub referer: String,
+    pub dest: PathBuf,
+}
+
+/// Kết quả curl báo về cho một tệp của lượt tải hàng loạt.
+enum BatchOutcome {
+    Finished { exit_code: i32, http_status: u16, content_type: String },
+    /// 3xx: đích mới phải được kiểm tra (mạng nội bộ) trước khi tải tiếp
+    Redirect(String),
+    /// curl không báo gì về tệp này (bị kill, lỗi khởi động)
+    Missing,
+}
+
 #[cfg(test)]
 mod tests {
     use super::DownloaderService as D;
+    use super::BatchFileItem;
 
     #[test]
     fn single_pass_maps_to_full_download_share() {
@@ -4169,6 +4530,10 @@ mod tests {
                                 let _ = socket.flush().await;
                                 return;
                             }
+                            // Máy chủ chậm: để kiểm tra tiến trình được báo dần theo từng tệp
+                            if path == "/slow_image.jpg" {
+                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            }
                             // Tệp chỉ dành cho thành viên: thiếu cookie phiên → trang đăng nhập
                             let logged_in = req
                                 .lines()
@@ -4180,7 +4545,7 @@ mod tests {
                             };
 
                             let (status, content_type, body): (&str, &str, Vec<u8>) = match path {
-                                "/valid_image.jpg" => (
+                                "/valid_image.jpg" | "/anh[1].jpg" | "/slow_image.jpg" => (
                                     "200 OK",
                                     "image/jpeg",
                                     vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01, 0x00, 0x60, 0x00, 0x60, 0x00, 0x00, 0xFF, 0xD9],
@@ -4258,6 +4623,102 @@ mod tests {
         assert!(!ok);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tải album bằng MỘT tiến trình curl phải giữ đúng mọi bảo vệ của lối tải từng tệp:
+    /// loại trang HTML/JSON giả làm ảnh, đi theo chuyển hướng nhưng không vô hạn, gửi
+    /// cookie đúng tên miền, ghi đúng tên tệp kể cả khi có dấu nháy / ký tự Unicode.
+    #[tokio::test]
+    async fn album_batch_download_keeps_validation_redirects_and_cookies() {
+        let (server_url, _shutdown) = run_mock_server().await;
+        let dir = std::env::temp_dir().join(format!("test_batch_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cookies = dir.join("cookies_batch.txt");
+        std::fs::write(&cookies, "# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tsession\thop-le\n").unwrap();
+
+        let cases: &[(&str, &str, bool)] = &[
+            ("/valid_image.jpg", "anh 1.jpg", true),
+            ("/anh[1].jpg", "ngoac.jpg", true),
+            ("/valid_video.mp4", "clip \"trích\" \\ 2.mp4", true),
+            ("/challenge.html", "gia.jpg", false),
+            ("/error.json", "loi.jpg", false),
+            ("/khong-co.jpg", "mat.jpg", false),
+            ("/redirect_to_image", "chuyen.jpg", true),
+            ("/redirect_twice", "chuyen2.jpg", true),
+            ("/redirect_loop", "vong.jpg", false),
+            ("/members/photo.jpg", "thanh-vien.jpg", true),
+        ];
+        let items: Vec<BatchFileItem> = cases
+            .iter()
+            .map(|(path, name, _)| BatchFileItem {
+                url: format!("{server_url}{path}"),
+                referer: String::new(),
+                dest: dir.join(name),
+            })
+            .collect();
+
+        let mut seen = Vec::new();
+        let results = D::curl_batch_to_files(&items, Some(&cookies), |done| seen.push(done)).await;
+
+        assert_eq!(results.len(), cases.len());
+        for ((path, name, expect_ok), (ok, _)) in cases.iter().zip(&results) {
+            assert_eq!(ok, expect_ok, "{path}");
+            assert_eq!(dir.join(name).is_file(), *expect_ok, "{path}: tệp hỏng không được để lại");
+        }
+        assert_eq!(results[0].1.as_deref(), Some("image/jpeg"));
+        assert_eq!(results[2].1.as_deref(), Some("video/mp4"));
+        assert_eq!(seen, (1..=cases.len()).collect::<Vec<_>>(), "tiến trình phải báo từng tệp, tăng dần");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tiến trình album phải chạy dần theo từng tệp xong, không dồn tới cuối lượt.
+    #[tokio::test]
+    async fn album_batch_reports_each_file_as_soon_as_it_finishes() {
+        let (server_url, _shutdown) = run_mock_server().await;
+        let dir = std::env::temp_dir().join(format!("test_batch_live_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let items: Vec<BatchFileItem> = ["/slow_image.jpg", "/valid_image.jpg"]
+            .iter()
+            .enumerate()
+            .map(|(i, path)| BatchFileItem {
+                url: format!("{server_url}{path}"),
+                referer: String::new(),
+                dest: dir.join(format!("{i}.jpg")),
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let mut reported_at = Vec::new();
+        let results = D::curl_batch_to_files(&items, None, |_| reported_at.push(started.elapsed())).await;
+        let total = started.elapsed();
+
+        assert!(results.iter().all(|(ok, _)| *ok));
+        assert_eq!(reported_at.len(), 2);
+        assert!(
+            total.saturating_sub(reported_at[0]) >= std::time::Duration::from_millis(800),
+            "tệp nhanh phải được báo xong trước khi tệp chậm kết thúc (báo lúc {:?}, cả lượt {:?})",
+            reported_at[0],
+            total
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn curl_version_gate_for_batch_mode() {
+        assert!(D::curl_version_at_least("curl 8.18.0 (x86_64-pc-linux-gnu) libcurl/8.18.0", (7, 75, 0)));
+        assert!(D::curl_version_at_least("curl 7.75.0 (Windows) libcurl/7.75.0", (7, 75, 0)));
+        assert!(!D::curl_version_at_least("curl 7.55.1 (Windows) libcurl/7.55.1 WinSSL", (7, 75, 0)));
+        assert!(!D::curl_version_at_least("", (7, 75, 0)));
+        assert_eq!(D::curl_config_quote(r#"C:\a "b"	c"#), r#""C:\\a \"b\"\tc""#);
+    }
+
+    #[test]
+    fn m4s_files_are_remuxed_to_mp4_when_no_container_is_chosen() {
+        assert!(D::is_fmp4_segment_url("https://upos.example/v/123-1-30080.m4s?e=1&deadline=2"));
+        assert!(!D::is_fmp4_segment_url("https://cdn.example/v/master.m3u8"));
+        assert!(!D::is_fmp4_segment_url("https://cdn.example/v/clip.mp4"));
     }
 
     /// Trước đây `-L --max-redirs 0` làm mọi URL có chuyển hướng thất bại (curl 47).

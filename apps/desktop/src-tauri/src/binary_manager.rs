@@ -80,6 +80,14 @@ impl CmdOutput {
 }
 
 /// Lệnh chạy ngầm: không stdin, gom stdout/stderr, bị kill khi future bị huỷ.
+/// Bản giải nén của yt-dlp zipapp: chạy `<python> <main>` thay cho tệp zipapp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YtdlpRuntime {
+    pub python: PathBuf,
+    pub main: PathBuf,
+    pub js_runtimes: bool,
+}
+
 fn background_command(program: &Path) -> Command {
     let mut cmd = Command::new(program);
     // Ứng dụng GUI trên Windows: thiếu cờ này thì mỗi lần chạy `--version` hay pip
@@ -250,6 +258,56 @@ impl BinaryManager {
         candidates.into_iter().next()
     }
 
+    /// Bản GIẢI NÉN của yt-dlp zipapp mà engine Python đã chuẩn bị (xem
+    /// `core/extractors/ytdlp_runtime.py`), nếu còn khớp đúng tệp `bin` hiện tại.
+    ///
+    /// Zipapp (bản yt-dlp chính thức cài bằng curl / cập nhật bằng `yt-dlp -U`) phải
+    /// biên dịch lại toàn bộ mã Python ở MỖI lần chạy vì bytecode không được lưu
+    /// trong tệp zip: mỗi lượt tải chậm thêm 0,5-1,5 giây trước khi kịp bắt đầu.
+    pub fn ytdlp_runtime(bin: &Path) -> Option<YtdlpRuntime> {
+        if cfg!(windows) {
+            return None;
+        }
+        let root = dirs::cache_dir()?.join("crwl").join("ytdlp-unpacked");
+        Self::ytdlp_runtime_in(&root, bin)
+    }
+
+    /// Như `ytdlp_runtime`, với thư mục gốc chứa các bản giải nén cho trước.
+    pub(crate) fn ytdlp_runtime_in(root: &Path, bin: &Path) -> Option<YtdlpRuntime> {
+        let real = std::fs::canonicalize(bin).ok()?;
+        let meta = std::fs::metadata(&real).ok()?;
+        let mtime_ns = meta.modified().ok()?.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos();
+        let folder = root.join(format!("{}-{mtime_ns}", meta.len()));
+        let text = std::fs::read_to_string(folder.join("crwl-runtime.json")).ok()?;
+        let data: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let matches = data.get("source").and_then(|v| v.as_str()) == Some(real.to_string_lossy().as_ref())
+            && data.get("size").and_then(|v| v.as_u64()) == Some(meta.len())
+            && data.get("mtime_ns").and_then(|v| v.as_u64()).map(u128::from) == Some(mtime_ns);
+        let python = PathBuf::from(data.get("python").and_then(|v| v.as_str())?);
+        let main = folder.join("__main__.py");
+        if !matches || !python.is_file() || !main.is_file() {
+            return None;
+        }
+        Some(YtdlpRuntime {
+            python,
+            main,
+            js_runtimes: data.get("js_runtimes").and_then(|v| v.as_bool()).unwrap_or(false),
+        })
+    }
+
+    /// Lệnh chạy yt-dlp: bản giải nén nếu đã sẵn sàng, nếu không thì chính `bin`.
+    /// Cập nhật (`-U`) luôn phải chạy trên tệp gốc, không qua hàm này.
+    pub fn ytdlp_command(bin: &Path) -> Command {
+        match Self::ytdlp_runtime(bin) {
+            Some(rt) => {
+                let mut cmd = background_command(&rt.python);
+                cmd.arg(&rt.main);
+                cmd
+            }
+            None => background_command(bin),
+        }
+    }
+
     /// Bản yt-dlp này có tuỳ chọn `--js-runtimes` không.
     ///
     /// Tuỳ chọn chỉ có từ các bản yt-dlp cuối 2025; bản cũ (vd. gói apt của
@@ -265,6 +323,13 @@ impl BinaryManager {
         let key = (bin.to_path_buf(), std::fs::metadata(bin).and_then(|m| m.modified()).ok());
         if let Some(known) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
             return known;
+        }
+        // Bản giải nén đã đọc sẵn mã nguồn: khỏi chạy `--help`
+        if let Some(rt) = Self::ytdlp_runtime(bin) {
+            if let Ok(mut c) = cache.lock() {
+                c.insert(key, rt.js_runtimes);
+            }
+            return rt.js_runtimes;
         }
         let mut cmd = background_command(bin);
         cmd.arg("--help");
@@ -716,6 +781,60 @@ impl BinaryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Engine Python giải nén yt-dlp zipapp; bước tải (Rust) phải nhận ra ĐÚNG bản đó
+    /// (cùng khoá "<kích thước>-<mtime ns>", cùng đường dẫn thật), chạy được nó, và bỏ
+    /// bản cũ ngay khi tệp yt-dlp đổi (sau `yt-dlp -U`).
+    #[cfg(unix)]
+    #[test]
+    fn unpacked_ytdlp_prepared_by_python_is_used_by_the_download_step() {
+        let Some(py) = BinaryManager::find_python() else { return };
+        let repo = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")).unwrap();
+        let dir = std::env::temp_dir().join(format!("test_ytdlp_rt_{}", uuid::Uuid::new_v4()));
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("yt_dlp")).unwrap();
+        std::fs::write(src.join("__main__.py"), "import sys\nprint('FAKE-YTDLP', ' '.join(sys.argv[1:]))\n").unwrap();
+        std::fs::write(src.join("yt_dlp").join("__init__.py"), "").unwrap();
+        std::fs::write(src.join("yt_dlp").join("options.py"), "# --js-runtimes RUNTIME[:PATH]\n").unwrap();
+        let app = dir.join("bin").join("yt-dlp");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        let make_zipapp = || {
+            let ok = std::process::Command::new(&py)
+                .args(["-m", "zipapp"])
+                .arg(&src)
+                .args(["-p", "/usr/bin/env python3", "-o"])
+                .arg(&app)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        make_zipapp();
+
+        let cache = dir.join("cache");
+        let prepare = std::process::Command::new(&py)
+            .env("CRWL_CACHE_DIR", &cache)
+            .env("PYTHONPATH", &repo)
+            .args(["-c", "import sys\nfrom core.extractors import ytdlp_runtime as r\nprint(bool(r.prepare(sys.argv[1])))"])
+            .arg(&app)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&prepare.stdout).trim(), "True", "{}", String::from_utf8_lossy(&prepare.stderr));
+
+        let root = cache.join("ytdlp-unpacked");
+        let rt = BinaryManager::ytdlp_runtime_in(&root, &app).expect("Rust phải thấy bản giải nén của Python");
+        assert!(rt.js_runtimes);
+        let run = std::process::Command::new(&rt.python).arg(&rt.main).arg("--version").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "FAKE-YTDLP --version");
+
+        // Đổi tệp yt-dlp (cập nhật): bản giải nén cũ không còn khớp
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(src.join("__main__.py"), "print('BAN-MOI')\n").unwrap();
+        make_zipapp();
+        assert!(BinaryManager::ytdlp_runtime_in(&root, &app).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_evaluate_ytdlp_update_up_to_date() {

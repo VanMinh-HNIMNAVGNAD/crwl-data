@@ -260,6 +260,27 @@ class UrlResolver:
         except Exception:
             return url
 
+    @staticmethod
+    def expand_known_short_url(url: str) -> Optional[str]:
+        """Link rút gọn có quy tắc cố định → URL đầy đủ, KHÔNG cần mạng.
+
+        `youtu.be/<id>` (nút "Chia sẻ" của YouTube luôn tạo dạng này) từng được giải mã
+        bằng một lượt curl tới YouTube — đo 1,1-2,0 giây mỗi lần phân tích — trong khi
+        đích luôn là `youtube.com/watch?v=<id>` (giữ ?t=, ?list=...).
+        """
+        try:
+            parsed = urllib.parse.urlparse(url.strip() if re.match(r"^https?://", url.strip(), re.I) else "https://" + url.strip())
+        except ValueError:
+            return None
+        host = (parsed.hostname or "").lower()
+        if host in ("youtu.be", "www.youtu.be"):
+            video_id = parsed.path.strip("/").split("/")[0]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                return None
+            query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            return "https://www.youtube.com/watch?" + urllib.parse.urlencode([("v", video_id)] + query)
+        return None
+
     @classmethod
     def unshorten_url(cls, url: str, max_hops: int = 5, timeout: int = 10) -> str:
         """Lần theo HTTP Redirect để lấy URL cuối cùng, ưu tiên dùng curl để tránh lỗi 400 Bad Request"""
@@ -392,7 +413,7 @@ class UrlResolver:
 
         resolved_url = original_url
         if is_shortened:
-            resolved_url = cls.unshorten_url(original_url)
+            resolved_url = cls.expand_known_short_url(original_url) or cls.unshorten_url(original_url)
 
         resolved_url = cls.clean_tracking_params(resolved_url)
 

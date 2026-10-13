@@ -555,6 +555,23 @@ def _find_manual_cookie_file(domain: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def browser_store_readable(browser: Optional[str]) -> bool:
+    """Engine đã đọc VÀ giải mã được kho cookie của trình duyệt này (dùng cache ngắn hạn).
+
+    Đúng thì việc không tìm thấy cookie của một tên miền là chắc chắn — yt-dlp tự đọc
+    lại trình duyệt (`--cookies-from-browser`) cũng không thấy gì hơn.
+    """
+    b = (browser or "").strip().lower()
+    if b in ("", "auto", "none"):
+        return False
+    try:
+        rows = BrowserCookieExporter()._raw_cookies_cached(b)
+    except Exception:
+        return False
+    # Cookie rỗng giá trị = giải mã thất bại (keyring khoá, mã hoá kiểu mới...)
+    return any(row[6] for row in rows)
+
+
 def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str] = None, output_path: Optional[str] = None) -> Optional[str]:
     """Helper: lấy cookies file cho browser, trả về đường dẫn file cookies tạm.
 

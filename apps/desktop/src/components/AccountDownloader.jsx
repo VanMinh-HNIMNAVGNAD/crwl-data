@@ -25,6 +25,7 @@ import { DownloadTaskList } from './DownloadProgressCard'
 import { useDownloadTasks, parseSpeed, formatSpeed } from '../hooks/useDownloadTasks'
 import { useStableCallback } from '../hooks/useStableCallback'
 import { describeError, errorText } from '../utils/messages'
+import { concurrentFragmentsFor } from '../utils/media'
 import { errorToast, openFolderAction, savedToast } from '../utils/toasts'
 
 // Số tệp lỗi trong câu tổng kết của backend: "Đã tải 3 tệp ..., 2 tệp thất bại."
@@ -222,8 +223,8 @@ function AccountDownloader({ onShowToast, dlOptions = {} }) {
     onUseAria2cChange,
   } = dlOptions
 
-  // concurrentFragments: accelerate=false→1 (tiết kiệm CPU), true→4 (đa luồng)
-  const concurrentFragments = accelerate ? 4 : 1
+  // Số mảnh HLS/DASH tải song song (xem concurrentFragmentsFor)
+  const concurrentFragments = concurrentFragmentsFor(accelerate)
   // maxParallelVideos: số video tải song song trong batch
   const maxParallelVideos = accelerate ? 2 : 1
 
@@ -1030,13 +1031,13 @@ function AccountDownloader({ onShowToast, dlOptions = {} }) {
               ))}
             </div>
           )}
-          <label className="checkbox-opt-label" title="Tăng tốc tải bằng đa luồng — tiêu thụ nhiều CPU/RAM hơn">
+          <label className="checkbox-opt-label" title="Tải 8 mảnh HLS/DASH song song thay vì 4 — nhanh hơn trên mạng mạnh, tốn thêm chút RAM">
             <input
               type="checkbox"
               checked={accelerate}
               onChange={(e) => onAccelerateChange?.(e.target.checked)}
             />
-            <span>Tăng tốc đa luồng {accelerate ? `(2 video song song, ${concurrentFragments} luồng/video)` : '(1 video, 1 luồng)'}</span>
+            <span>Tăng tốc đa luồng {accelerate ? `(2 video song song, ${concurrentFragments} luồng/video)` : `(1 video, ${concurrentFragments} luồng)`}</span>
           </label>
           {mediaTypeFilter !== 'image' && (
             <>

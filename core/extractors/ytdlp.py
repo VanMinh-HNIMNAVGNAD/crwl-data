@@ -12,6 +12,8 @@ import subprocess
 import threading
 from typing import Optional, List, Dict, Any, Tuple
 from .base import BaseExtractor
+from .media_probe import AUDIO_FILE_EXTS, DIRECT_MEDIA_EXTS, MediaProbe, ProbeInfo, path_ext
+from . import ytdlp_runtime
 from ..models import (
     MediaMetadata,
     StreamFormat,
@@ -20,10 +22,63 @@ from ..models import (
     CrawlMediaItem,
     ProfileCrawlResult,
 )
-from ..cookies.browser_cookies import get_browser_cookies_txt
+from ..cookies.browser_cookies import browser_store_readable, get_browser_cookies_txt
 
 
 YOUTUBE_VIDEO_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+
+# Lỗi không thể do cookie gây ra: chạy lại yt-dlp không cookie chỉ lặp lại đúng lỗi đó
+# (mỗi lần thêm 1-5 giây). Trang web thường không có video → "Unsupported URL" là lỗi
+# gặp nhiều nhất ở bước dò trang bất kỳ.
+_COOKIE_INDEPENDENT_ERROR_RE = re.compile(
+    r"Unsupported URL|is not a valid URL|Name or service not known|Temporary failure in name resolution|"
+    r"No address associated with hostname|nodename nor servname|getaddrinfo failed|Failed to resolve|"
+    r"HTTP Error 404|HTTP Error 410",
+    re.IGNORECASE,
+)
+
+AUDIO_PRESETS = (
+    ("opus_best", "OPUS Chuẩn gốc (160 kbps, không suy hao)", "OPUS"),
+    ("mp3_320k", "MP3 Chất lượng cao (320 kbps)", "MP3"),
+    ("mp3_192k", "MP3 Chuẩn phổ biến (192 kbps)", "MP3"),
+    ("m4a_aac", "M4A / AAC Gốc (256 kbps)", "M4A"),
+    ("ogg_vorbis", "OGG Vorbis (192 kbps)", "OGG"),
+    ("flac_lossless", "FLAC Âm thanh lossless (phòng thu)", "FLAC"),
+    ("wav_lossless", "WAV Bản ghi không nén (Uncompressed)", "WAV"),
+    ("alac_lossless", "ALAC Chuẩn Apple Lossless", "ALAC"),
+)
+
+
+def audio_preset_streams() -> List[StreamFormat]:
+    return [
+        StreamFormat(
+            format_id=fid,
+            quality=label,
+            format=ext,
+            size=None,
+            raw_size=None,
+            stream_type="audio",
+            has_audio=True,
+            has_video=False,
+        )
+        for fid, label, ext in AUDIO_PRESETS
+    ]
+
+
+def height_label(h: int) -> str:
+    if h >= 2160:
+        return "4K (2160p Ultra HD)"
+    if h >= 1440:
+        return "2K (1440p Quad HD)"
+    if h >= 1080:
+        return "Full HD (1080p)"
+    if h >= 720:
+        return "HD (720p)"
+    if h >= 480:
+        return "Chuẩn SD (480p)"
+    if h >= 360:
+        return "Tiết kiệm (360p)"
+    return f"Thấp ({h}p)"
 
 
 class PlaylistUrlError(RuntimeError):
@@ -55,6 +110,7 @@ class YtDlpExtractor(BaseExtractor):
     def __init__(self):
         super().__init__()
         self.binary_path = self.find_binary("yt-dlp", "YT_DLP_PATH")
+        self.prober = MediaProbe()
 
     def supports_js_runtimes(self) -> bool:
         """Bản yt-dlp đang dùng có tuỳ chọn `--js-runtimes` không.
@@ -73,9 +129,15 @@ class YtDlpExtractor(BaseExtractor):
             cached = self._js_runtimes_support.get(key)
         if cached is not None:
             return cached
+        # Bản giải nén đã đọc sẵn mã nguồn: khỏi chạy `--help` (0,25-0,75 giây)
+        runtime = ytdlp_runtime.lookup(path)
+        if runtime is not None:
+            with self._js_runtimes_lock:
+                self._js_runtimes_support[key] = runtime.js_runtimes
+            return runtime.js_runtimes
         try:
             out = subprocess.run(
-                [path, "--help"],
+                [*self.command(), "--help"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -90,6 +152,10 @@ class YtDlpExtractor(BaseExtractor):
         with self._js_runtimes_lock:
             self._js_runtimes_support[key] = supported
         return supported
+
+    def command(self) -> List[str]:
+        """Lệnh chạy yt-dlp (bản zipapp chạy từ bản giải nén — xem ytdlp_runtime)."""
+        return ytdlp_runtime.command_for(self.binary_path) if self.binary_path else [""]
 
     def is_available(self) -> bool:
         # Cài yt-dlp SAU khi engine đã khởi động thì lần dò lúc khởi động không thấy:
@@ -133,21 +199,50 @@ class YtDlpExtractor(BaseExtractor):
             if exported and os.path.exists(exported):
                 args.extend(["--cookies", exported])
                 tmp_cookie_file = exported
-            elif browser and browser not in ("auto", ""):
+            elif browser and browser not in ("auto", "") and not browser_store_readable(browser):
+                # Chỉ nhờ yt-dlp tự đọc trình duyệt khi engine KHÔNG đọc được kho cookie đó
+                # (khoá, mã hoá lạ...). Đọc được mà không có cookie nào của tên miền này thì
+                # yt-dlp cũng chẳng tìm thấy gì — trước đây nó vẫn giải mã lại toàn bộ kho
+                # cookie trong MỖI lần chạy với mọi trang không cần đăng nhập.
                 args.extend(["--cookies-from-browser", browser])
 
         return args, tmp_cookie_file
 
-    def extract_metadata(self, url: str, browser: Optional[str] = None, timeout: int = 30) -> MediaMetadata:
-        """Trích xuất chi tiết metadata của 1 URL video/audio"""
+    @staticmethod
+    def _uses_cookies(args: List[str]) -> bool:
+        return "--cookies" in args or "--cookies-from-browser" in args
+
+    @classmethod
+    def _should_retry_without_cookies(cls, args: List[str], stderr: str) -> bool:
+        """Chạy lại không cookie chỉ khi lần đầu CÓ dùng cookie và lỗi có thể do cookie.
+
+        Trước đây mọi lỗi đều chạy lại yt-dlp thêm một lần — kể cả khi không có cookie
+        nào được gửi (lệnh y hệt) hoặc lỗi là "Unsupported URL" / 404 / sai tên miền.
+        """
+        return cls._uses_cookies(args) and not _COOKIE_INDEPENDENT_ERROR_RE.search(stderr or "")
+
+    def extract_metadata(
+        self,
+        url: str,
+        browser: Optional[str] = None,
+        timeout: int = 30,
+        referer: Optional[str] = None,
+    ) -> MediaMetadata:
+        """Trích xuất chi tiết metadata của 1 URL video/audio.
+
+        `referer`: trang chứa luồng (luồng tìm thấy bên trong trang phim) — máy chủ
+        luồng hay chặn yêu cầu thiếu Referer đúng trang.
+        """
         if not self.is_available():
             raise RuntimeError("yt-dlp binary không được tìm thấy trên hệ thống.")
 
         args, tmp_cookie = self.get_base_args(allow_playlist=False, browser=browser, target_url=url)
+        if referer:
+            args += ["--referer", referer]
         # `--flat-playlist` không đổi gì với một video đơn (vẫn bóc tách đầy đủ), nhưng
         # với playlist/kênh thì chỉ liệt kê nhanh các mục thay vì bóc tách từng video
         # tới khi quá giờ — nhờ đó nhận ra ngay đây là danh sách (PlaylistUrlError).
-        cmd = [self.binary_path] + args + ["--flat-playlist", "--dump-json", url]
+        cmd = self.command() + args + ["--flat-playlist", "--dump-json", url]
 
         self.log(f"yt-dlp extract: {url}")
         try:
@@ -159,13 +254,14 @@ class YtDlpExtractor(BaseExtractor):
                 except Exception:
                     pass
 
+        retry_plain = browser != "none" and self._should_retry_without_cookies(args, stderr)
         if code != 0 or not stdout.strip():
             # Quá giờ thì chạy lại lần nữa (không cookie) chỉ tốn gấp đôi thời gian.
             if self.is_timeout(code, stderr):
                 raise RuntimeError(f"yt-dlp quá thời gian {timeout}s khi đọc thông tin liên kết.")
-            if browser and browser != "none":
+            if retry_plain:
                 self.warn("yt-dlp extract lỗi với cookies, đang thử lại không dùng cookies ('none')...")
-                return self.extract_metadata(url, browser="none", timeout=timeout)
+                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer)
             raise RuntimeError(f"yt-dlp extract thất bại: {stderr.strip() or f'Exit code {code}'}")
 
         # Lấy dòng JSON đầu tiên
@@ -176,17 +272,17 @@ class YtDlpExtractor(BaseExtractor):
                 break
 
         if not json_line:
-            if browser and browser != "none":
+            if retry_plain:
                 self.warn("yt-dlp không trả metadata hợp lệ với cookies, thử lại không cookie...")
-                return self.extract_metadata(url, browser="none", timeout=timeout)
+                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer)
             raise ValueError("Không tìm thấy dữ liệu JSON hợp lệ từ kết quả yt-dlp.")
 
         try:
             raw_data = json.loads(json_line)
         except json.JSONDecodeError as e:
-            if browser and browser != "none":
+            if retry_plain:
                 self.warn("yt-dlp trả JSON lỗi với cookies, thử lại không cookie...")
-                return self.extract_metadata(url, browser="none", timeout=timeout)
+                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer)
             raise ValueError(f"Lỗi parse JSON yt-dlp: {e}")
 
         # Mục "phẳng" (chỉ là liên kết tới video khác) chỉ xuất hiện khi URL là một
@@ -195,11 +291,115 @@ class YtDlpExtractor(BaseExtractor):
             raise PlaylistUrlError(self._playlist_message(raw_data, stdout), self._entry_urls(stdout))
 
         meta = self._normalize_metadata(raw_data, url)
+        probe_target = self._probe_target(raw_data)
+        if probe_target:
+            self._refine_with_probe(meta, raw_data, probe_target, referer)
         meta.extractor_key = str(raw_data.get("extractor_key") or raw_data.get("extractor") or "") or None
         meta.webpage_url = raw_data.get("webpage_url") if isinstance(raw_data.get("webpage_url"), str) else None
+        meta.is_direct_media = bool(raw_data.get("direct"))
         count = raw_data.get("playlist_count") or raw_data.get("n_entries")
         meta.page_video_count = count if isinstance(count, int) and count > 0 else None
         return meta
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Link tệp / luồng không khai báo codec
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _formats_of(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Danh sách định dạng như yt-dlp hiểu (YoutubeDL._get_formats).
+
+        Link tệp trực tiếp ("URL could be a direct video link") chỉ có `url` ở cấp
+        ngoài, KHÔNG có `formats`. Trước đây danh sách rỗng đó khiến kết quả chỉ còn
+        các lựa chọn âm thanh: dán link .mp4/.ts/.m4s mà máy chủ trả
+        "application/octet-stream" là chỉ thấy MP3.
+        """
+        formats = raw.get("formats")
+        if isinstance(formats, list) and formats:
+            return [f for f in formats if isinstance(f, dict)]
+        if isinstance(raw.get("url"), str) and raw.get("url"):
+            return [raw]
+        return []
+
+    @classmethod
+    def _probe_target(cls, raw: Dict[str, Any]) -> Optional[str]:
+        """URL tệp / luồng cần hỏi ffprobe vì yt-dlp không biết nó có hình / tiếng gì
+        (tệp trực tiếp, danh sách phát HLS của một chất lượng), hoặc None.
+
+        Chỉ dò khi đó đúng là tệp media — không bao giờ dò địa chỉ một TRANG web mà
+        extractor của nền tảng trả về một định dạng thiếu thông tin.
+        """
+        if raw.get("is_live") or raw.get("live_status") == "is_live":
+            return None
+        formats = cls._formats_of(raw)
+        if len(formats) != 1:
+            return None
+        f = formats[0]
+        target = f.get("url")
+        if not isinstance(target, str) or not target.startswith(("http://", "https://")):
+            return None
+        if raw.get("direct"):
+            return target
+        if f.get("height") or f.get("width") or f.get("vcodec") or f.get("acodec"):
+            return None
+        is_manifest = str(f.get("protocol") or "").startswith(("m3u8", "http_dash_segments"))
+        return target if is_manifest or path_ext(target) in DIRECT_MEDIA_EXTS else None
+
+    def _refine_with_probe(self, meta: MediaMetadata, raw: Dict[str, Any], target: str, referer: Optional[str]) -> None:
+        """Dựng lại danh sách định dạng theo luồng hình / tiếng THẬT mà ffprobe đọc được."""
+        info = self.prober.probe(target, referer=referer)
+        if info is None:
+            return
+        ext = path_ext(target) or str(raw.get("ext") or "")
+        if not meta.duration and info.duration:
+            meta.duration = self.format_duration(info.duration)
+        streams, note = self.streams_from_probe(info, ext)
+        meta.streams = streams
+        if note and not meta.description:
+            meta.description = note
+
+    @staticmethod
+    def streams_from_probe(info: ProbeInfo, ext: str) -> Tuple[List[StreamFormat], Optional[str]]:
+        """Định dạng tải được của MỘT tệp / luồng theo kết quả ffprobe, kèm ghi chú (ℹ️)."""
+        # Luồng HLS/DASH và mảnh fMP4 được ghép / đổi sang MP4 khi tải
+        container = "MP4" if ext in ("", "m3u8", "mpd", "m4s", "cmfv") else ext.upper()
+        label = height_label(info.height) if info.height else None
+        if info.has_video and info.has_audio:
+            return [
+                StreamFormat(
+                    format_id="bestvideo+bestaudio/best",
+                    quality=f"{label} — Có âm thanh" if label else "Video tốt nhất hiện có — Có âm thanh",
+                    format=container,
+                    stream_type="full",
+                    has_audio=True,
+                    has_video=True,
+                    vcodec=info.vcodec,
+                    acodec=info.acodec,
+                ),
+                *audio_preset_streams(),
+            ], None
+        if info.has_video:
+            # Không có tiếng thì cũng không có gì để tách ra MP3: bỏ các lựa chọn âm thanh.
+            return [
+                StreamFormat(
+                    format_id="best",
+                    quality=f"{info.height}p (Chỉ video / Không tiếng)" if info.height else "Video (Không tiếng)",
+                    format=container,
+                    stream_type="mute",
+                    has_audio=False,
+                    has_video=True,
+                    vcodec=info.vcodec,
+                ),
+            ], (
+                "ℹ️ Liên kết này chỉ có HÌNH, không có tiếng — nhiều trang tách hình và tiếng thành "
+                "hai luồng riêng. Muốn có tiếng, hãy dán link danh sách phát tổng (.m3u8/.mpd) "
+                "hoặc link trang chứa video."
+            )
+        return audio_preset_streams(), (
+            "ℹ️ Liên kết này là luồng ÂM THANH (không có hình) nên chỉ tải được âm thanh. "
+            "Hình thường nằm ở một luồng khác: hãy dán link danh sách phát tổng (.m3u8/.mpd) "
+            "hoặc link trang chứa video."
+        )
 
     @staticmethod
     def _entry_urls(stdout: str, limit: int = 50) -> List[str]:
@@ -241,7 +441,7 @@ class YtDlpExtractor(BaseExtractor):
         if not self.is_available():
             return []
         args, tmp_cookie = self.get_base_args(allow_playlist=True, browser=browser, target_url=url)
-        cmd = [self.binary_path, *args, "--dump-json", url]
+        cmd = [*self.command(), *args, "--dump-json", url]
         try:
             code, stdout, _ = self.run_process(cmd, timeout=timeout)
         finally:
@@ -293,7 +493,7 @@ class YtDlpExtractor(BaseExtractor):
             range_spec = None
 
         cmd = [
-            self.binary_path,
+            *self.command(),
             *args,
             "--flat-playlist",
             "--dump-json",
@@ -318,7 +518,7 @@ class YtDlpExtractor(BaseExtractor):
                 raise RuntimeError(
                     f"Quét quá thời gian {timeout}s. Hãy giảm số lượng cần quét hoặc chọn 'Khoảng' nhỏ hơn."
                 )
-            if browser and browser != "none":
+            if browser != "none" and self._should_retry_without_cookies(args, stderr):
                 self.warn("yt-dlp playlist lỗi với cookies, đang thử lại không dùng cookies ('none')...")
                 return self.extract_playlist(url, limit, browser="none", from_item=from_item, to_item=to_item, timeout=timeout)
             raise RuntimeError(f"yt-dlp playlist thất bại: {stderr.strip() or f'Exit code {code}'}")
@@ -421,7 +621,7 @@ class YtDlpExtractor(BaseExtractor):
 
         # Streams
         streams: List[StreamFormat] = []
-        formats = raw.get("formats") or []
+        formats = self._formats_of(raw)
 
         if is_live:
             streams.append(
@@ -460,21 +660,7 @@ class YtDlpExtractor(BaseExtractor):
                 matched_heights = [available_heights[0]]
 
             for h in matched_heights:
-                if h >= 2160:
-                    label = "4K (2160p Ultra HD)"
-                elif h >= 1440:
-                    label = "2K (1440p Quad HD)"
-                elif h >= 1080:
-                    label = "Full HD (1080p)"
-                elif h >= 720:
-                    label = "HD (720p)"
-                elif h >= 480:
-                    label = "Chuẩn SD (480p)"
-                elif h >= 360:
-                    label = "Tiết kiệm (360p)"
-                else:
-                    label = f"Thấp ({h}p)"
-
+                label = height_label(h)
                 muxed_spec = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
 
                 streams.append(
@@ -554,8 +740,13 @@ class YtDlpExtractor(BaseExtractor):
             # .mp4/.webm trực tiếp...) không lọt vào nhóm nào ở trên, nên trước đây
             # chỉ còn các lựa chọn ÂM THANH — không có cách nào tải video. Chỉ bỏ qua
             # khi mọi định dạng đều khai báo rõ là không có hình (vd. SoundCloud).
+            # Tệp nhạc trực tiếp (.mp3/.m4a...) yt-dlp không gắn vcodec="none" — nhận theo đuôi.
             has_video_option = any(s.stream_type in ("full", "mute") for s in streams)
-            might_have_video = any((f.get("vcodec") or "") != "none" for f in formats)
+            might_have_video = any(
+                (f.get("vcodec") or "") != "none"
+                and not (not f.get("vcodec") and str(f.get("ext") or "").lower() in AUDIO_FILE_EXTS)
+                for f in formats
+            )
             if not has_video_option and might_have_video:
                 best = formats[-1] if formats else {}
                 streams.append(
@@ -572,29 +763,7 @@ class YtDlpExtractor(BaseExtractor):
                 )
 
             # Audio formats chuẩn
-            audio_presets = [
-                ("opus_best", "OPUS Chuẩn gốc (160 kbps, không suy hao)", "OPUS"),
-                ("mp3_320k", "MP3 Chất lượng cao (320 kbps)", "MP3"),
-                ("mp3_192k", "MP3 Chuẩn phổ biến (192 kbps)", "MP3"),
-                ("m4a_aac", "M4A / AAC Gốc (256 kbps)", "M4A"),
-                ("ogg_vorbis", "OGG Vorbis (192 kbps)", "OGG"),
-                ("flac_lossless", "FLAC Âm thanh lossless (phòng thu)", "FLAC"),
-                ("wav_lossless", "WAV Bản ghi không nén (Uncompressed)", "WAV"),
-                ("alac_lossless", "ALAC Chuẩn Apple Lossless", "ALAC"),
-            ]
-            for fid, q_label, ext_label in audio_presets:
-                streams.append(
-                    StreamFormat(
-                        format_id=fid,
-                        quality=q_label,
-                        format=ext_label,
-                        size=None,
-                        raw_size=None,
-                        stream_type="audio",
-                        has_audio=True,
-                        has_video=False,
-                    )
-                )
+            streams.extend(audio_preset_streams())
 
         # Reels / Shorts detection
         url_lower = original_url.lower()

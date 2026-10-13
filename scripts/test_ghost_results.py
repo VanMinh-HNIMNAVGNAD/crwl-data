@@ -175,13 +175,14 @@ def test_movie_page_result_points_at_the_scraped_stream(monkeypatch):
     monkeypatch.setattr(movie, "_scrape_stream_url", lambda url, timeout=15: (stream, []))
     seen = []
 
-    def fake_extract(url, browser=None, timeout=45):
-        seen.append(url)
+    def fake_extract(url, browser=None, timeout=45, referer=None):
+        seen.append((url, referer))
         return MediaMetadata(id="1", platform="generic", original_url=url, streams=[])
 
     monkeypatch.setattr(movie.ytdlp, "extract_metadata", fake_extract)
     meta = movie.extract(page)
-    assert seen == [stream]
+    # Máy chủ luồng hay chặn yêu cầu thiếu Referer của trang phim: đọc luồng kèm Referer
+    assert seen == [(stream, page)]
     assert meta.original_url == stream, "UI tải theo originalUrl — phải là luồng, không phải trang"
     assert meta.referer == page
     assert meta.to_dict()["referer"] == page

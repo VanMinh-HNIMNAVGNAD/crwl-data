@@ -3419,6 +3419,21 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   font-style: italic;
 }
 
+/* Lưu ý cho kết quả vẫn tải được (chỉ có hình / chỉ có tiếng / mảnh luồng) */
+.stream-info-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 14px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: var(--radius-md);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
 /* ── Sniff Success Badge (Playwright stream phát hiện được) ─────────────── */
 
 .sniff-success-badge {

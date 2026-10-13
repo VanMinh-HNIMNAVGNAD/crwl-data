@@ -164,6 +164,11 @@ impl SidecarManager {
         if let Some(dir) = dirs::config_dir() {
             cmd.env("CRWL_CONFIG_DIR", dir.join("crwl"));
         }
+        // Nơi Python giải nén yt-dlp zipapp — bước tải (Rust) đọc lại đúng chỗ này
+        // (BinaryManager::ytdlp_runtime).
+        if let Some(dir) = dirs::cache_dir() {
+            cmd.env("CRWL_CACHE_DIR", dir.join("crwl"));
+        }
         // Đúng binary mà màn hình Công cụ hiển thị và cập nhật (đường dẫn tự chọn được
         // ưu tiên). Python từng tự dò PATH theo thứ tự riêng nên có thể chạy một bản
         // yt-dlp khác hẳn bản vừa được cập nhật.
@@ -172,6 +177,11 @@ impl SidecarManager {
         }
         if let Some(p) = crate::binary_manager::BinaryManager::find_binary("gallery-dl") {
             cmd.env("GALLERY_DL_PATH", p);
+        }
+        // ffprobe đọc link luồng / tệp media dán thẳng (có hình, tiếng gì) — dùng đúng
+        // bản mà bước tải thấy, kể cả bản đặt trong thư mục bin riêng của app.
+        if let Some(p) = crate::binary_manager::BinaryManager::find_binary("ffprobe") {
+            cmd.env("FFPROBE_PATH", p);
         }
         // yt-dlp, gallery-dl (requests), urllib, curl và curl_cffi đều đọc proxy từ môi trường
         if let Some(proxy) = crate::settings::SettingsManager::proxy() {

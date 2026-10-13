@@ -151,7 +151,8 @@ class MovieExtractor(BaseExtractor):
             if stream_url:
                 self.log(f"Tìm thấy luồng stream (HTML tĩnh): {stream_url}")
                 try:
-                    meta = self.ytdlp.extract_metadata(stream_url, browser=browser, timeout=timeout)
+                    # Máy chủ luồng hay chặn yêu cầu thiếu Referer của trang phim
+                    meta = self.ytdlp.extract_metadata(stream_url, browser=browser, timeout=timeout, referer=target_url)
                     return self._stream_result(meta, stream_url, target_url)
                 except Exception as e:
                     self.warn(f"yt-dlp với stream URL thất bại ({e})")
@@ -162,7 +163,7 @@ class MovieExtractor(BaseExtractor):
                 try:
                     sub = self._scrape_stream_url(embed_url)
                     if sub and sub[0]:
-                        meta = self.ytdlp.extract_metadata(sub[0], browser=browser, timeout=timeout)
+                        meta = self.ytdlp.extract_metadata(sub[0], browser=browser, timeout=timeout, referer=embed_url)
                         # Player trong iframe tải luồng với Referer là chính trang nhúng
                         return self._stream_result(meta, sub[0], embed_url)
                 except Exception:
