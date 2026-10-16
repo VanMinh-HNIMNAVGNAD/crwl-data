@@ -4,6 +4,8 @@ import {
   getBinaryStatus,
   updateYtdlp,
   updateGalleryDl,
+  updateYtdlpLatest,
+  updateGalleryDlLatest,
   getSidecarStatus,
   restartSidecar,
   getAppSettings,
@@ -150,6 +152,19 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
   const handleUpdateGalleryDl = () =>
     runUpdate('gallery_dl', 'Đang cập nhật gallery-dl...', updateGalleryDl, 'Không cập nhật được gallery-dl')
 
+  // Bản ổn định trên PyPI có thể chậm vài ngày tới vài tuần sau khi một trang đổi API
+  // (Instagram 10/2026: chỉ bản phát triển của gallery-dl quét được tài khoản).
+  const handleLatestYtdlp = () =>
+    runUpdate('ytdlp', 'Đang cài bản yt-dlp nightly mới nhất...', updateYtdlpLatest, 'Không cài được yt-dlp nightly')
+
+  const handleLatestGalleryDl = () =>
+    runUpdate(
+      'gallery_dl',
+      'Đang cài bản mới nhất của gallery-dl (có thể mất 1-2 phút)...',
+      updateGalleryDlLatest,
+      'Không cài được bản mới nhất của gallery-dl'
+    )
+
   // Python worker chết 3 lần liên tiếp sẽ chuyển sang FAILED và KHÔNG bao giờ tự
   // hồi phục. Nút này là lối thoát duy nhất ngoài việc thoát hẳn ứng dụng.
   const handleRestartSidecar = async () => {
@@ -236,8 +251,27 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
   }
 
   const toolsList = [
-    { id: 'ytdlp', name: 'yt-dlp', role: 'Engine Video & Audio', data: toolsData?.ytdlp, updatable: true, onUpdate: handleUpdateYtdlp },
-    { id: 'gallery_dl', name: 'gallery-dl', role: 'Engine Album & Ảnh', data: toolsData?.gallery_dl, updatable: true, onUpdate: handleUpdateGalleryDl },
+    {
+      id: 'ytdlp',
+      name: 'yt-dlp',
+      role: 'Engine Video & Audio',
+      data: toolsData?.ytdlp,
+      updatable: true,
+      onUpdate: handleUpdateYtdlp,
+      onLatest: handleLatestYtdlp,
+      latestHint: 'Cài bản nightly mới nhất của yt-dlp — dùng khi một trang vừa thay đổi và bản ổn định chưa kịp sửa.',
+    },
+    {
+      id: 'gallery_dl',
+      name: 'gallery-dl',
+      role: 'Engine Album & Ảnh',
+      data: toolsData?.gallery_dl,
+      updatable: true,
+      onUpdate: handleUpdateGalleryDl,
+      onLatest: handleLatestGalleryDl,
+      latestHint:
+        'Cài bản đang phát triển mới nhất của gallery-dl (từ Codeberg) — dùng khi Instagram, X... vừa thay đổi và bản ổn định chưa kịp sửa.',
+    },
     { id: 'ffmpeg', name: 'FFmpeg', role: 'Bộ ghép luồng & Audio', data: toolsData?.ffmpeg },
     { id: 'ffprobe', name: 'FFprobe', role: 'Phân tích Media Stream', data: toolsData?.ffprobe },
     { id: 'aria2c', name: 'aria2c', role: 'Bộ tăng tốc tải đa luồng', data: toolsData?.aria2c },
@@ -352,6 +386,18 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
                   </div>
 
                   <div className="tool-actions-right">
+                    {tool.onLatest && isInstalled && (
+                      <button
+                        type="button"
+                        className="btn-update-tool is-secondary"
+                        onClick={tool.onLatest}
+                        disabled={Boolean(updatingTool) || !toolsData}
+                        title={tool.latestHint}
+                      >
+                        <IconDownload className="w-3 h-3" />
+                        <span>Bản mới nhất</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="btn-update-tool"

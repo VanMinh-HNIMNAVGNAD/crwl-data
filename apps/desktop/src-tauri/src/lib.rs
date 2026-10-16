@@ -98,6 +98,8 @@ pub fn run() {
             commands::get_binary_status,
             commands::update_ytdlp,
             commands::update_gallery_dl,
+            commands::update_ytdlp_latest,
+            commands::update_gallery_dl_latest,
             // ── App Settings ──────────────────────────────────────────────
             commands::get_app_settings,
             commands::save_app_settings,

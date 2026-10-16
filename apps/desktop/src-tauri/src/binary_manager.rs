@@ -24,6 +24,11 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// "Cập nhật" quay mãi và khoá luôn mọi nút khác trong modal Công cụ.
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Mã nguồn BẢN PHÁT TRIỂN của gallery-dl. Tác giả nay phát triển trên Codeberg (kho
+/// GitHub chỉ nhận commit lúc phát hành, PyPI chỉ có bản ổn định), nên khi một nền tảng
+/// vừa đổi API (Instagram 10/2026) thì bản vá chỉ có ở đây trong nhiều ngày.
+const GALLERY_DL_DEV_SOURCE: &str = "https://codeberg.org/mikf/gallery-dl/archive/master.tar.gz";
+
 /// Chỉ một lượt cập nhật chạy tại một thời điểm: hai lượt pip/pipx song song trên
 /// cùng một môi trường có thể làm hỏng môi trường đó.
 fn update_lock() -> &'static tokio::sync::Mutex<()> {
@@ -776,6 +781,137 @@ impl BinaryManager {
         let msg = Self::upgrade_in_place("gallery-dl", &kind).await?;
         Ok(Self::with_version(msg, &gallery_path).await)
     }
+
+    /// Lệnh pip cài BẢN MỚI NHẤT (`spec` kèm `extra`) vào đúng môi trường đang chứa công cụ.
+    pub(crate) fn latest_build_pip_args<'a>(spec: &'a str, extra: &[&'a str], user: bool) -> Vec<&'a str> {
+        let mut args = vec!["install", "-U"];
+        args.extend_from_slice(extra);
+        if user {
+            args.push("--user");
+        }
+        args.push(spec);
+        args
+    }
+
+    /// Diễn giải kết quả cài bản mới nhất (lỗi thì dùng chung cách giải thích của pip).
+    pub(crate) fn latest_build_outcome(pkg: &str, success: bool, output: &str) -> Result<String, String> {
+        if success {
+            return Ok(format!("Đã cài bản mới nhất (bản đang phát triển) của {pkg}."));
+        }
+        Self::pip_outcome(pkg, false, output, "")
+    }
+
+    async fn install_latest_build(pkg: &str, spec: &str, extra: &[&str], kind: &InstallKind) -> Result<String, String> {
+        match kind {
+            InstallKind::Pipx => {
+                let Some(pipx) = Self::find_binary("pipx") else {
+                    return Err(format!(
+                        "{pkg} được cài bằng pipx nhưng không tìm thấy lệnh pipx. Chạy thủ công: \
+                         pipx runpip {pkg} {}",
+                        Self::latest_build_pip_args(spec, extra, false).join(" ")
+                    ));
+                };
+                let mut cmd = background_command(&pipx);
+                cmd.args(["runpip", pkg])
+                    .args(Self::latest_build_pip_args(spec, extra, false))
+                    .args(["--disable-pip-version-check", "--no-input"]);
+                let out = run_with_timeout(cmd, UPDATE_TIMEOUT)
+                    .await
+                    .map_err(|e| format!("pipx runpip {pkg} {e}"))?;
+                Self::latest_build_outcome(pkg, out.success, &out.combined())
+            }
+            InstallKind::Venv(python) => {
+                let out = Self::run_pip(python, &Self::latest_build_pip_args(spec, extra, false)).await?;
+                Self::latest_build_outcome(pkg, out.success, &out.combined())
+            }
+            InstallKind::PipUser(python) => {
+                let args = Self::latest_build_pip_args(spec, extra, true);
+                let out = Self::run_pip(python, &args).await?;
+                if !out.success && out.combined().contains("externally-managed-environment") {
+                    // Như upgrade_in_place: binary vốn do `pip --user` cài, luôn kèm --user
+                    let mut retry = args.clone();
+                    retry.insert(2, "--break-system-packages");
+                    let again = Self::run_pip(python, &retry).await?;
+                    return Self::latest_build_outcome(pkg, again.success, &again.combined());
+                }
+                Self::latest_build_outcome(pkg, out.success, &out.combined())
+            }
+            InstallKind::Unmanaged => Err(format!("{pkg} không do pip/pipx của người dùng quản lý")),
+        }
+    }
+
+    /// Cài bản yt-dlp NIGHTLY mới nhất (yt-dlp khuyên dùng kênh này cho người dùng thường
+    /// xuyên): bản sửa cho trang vừa thay đổi có ở nightly vài ngày tới vài tuần trước khi
+    /// lên bản ổn định. Bấm "Cập nhật" sau đó vẫn giữ kênh nightly; bản ổn định mới hơn
+    /// sẽ tự được nhận khi phát hành.
+    pub async fn update_ytdlp_latest() -> Result<String, String> {
+        let _guard = update_lock().lock().await;
+        let ytdlp_path = Self::find_binary("yt-dlp")
+            .ok_or_else(|| format!("yt-dlp chưa được cài đặt. {}", Self::install_hint("yt-dlp")))?;
+        let kind = Self::classify_install(&ytdlp_path, "yt-dlp");
+        info!("Đang cài yt-dlp nightly tại {:?} ({:?})", ytdlp_path, kind);
+
+        // Bản tự cập nhật được (zipapp chính thức, bản đóng gói sẵn)
+        let mut cmd = background_command(&ytdlp_path);
+        cmd.args(["--update-to", "nightly"]);
+        let self_update_err = match run_with_timeout(cmd, UPDATE_TIMEOUT).await {
+            Ok(out) => {
+                let combined = out.combined();
+                match Self::evaluate_ytdlp_update(&out.stdout, &out.stderr, out.success, out.code) {
+                    Ok(_) if combined.contains("up to date") => {
+                        return Ok(Self::with_version("yt-dlp đã là bản nightly mới nhất.".to_string(), &ytdlp_path).await)
+                    }
+                    Ok(_) => {
+                        return Ok(Self::with_version("Đã cài bản yt-dlp nightly mới nhất.".to_string(), &ytdlp_path).await)
+                    }
+                    Err(e) => e,
+                }
+            }
+            Err(e) => format!("yt-dlp --update-to nightly {e}"),
+        };
+
+        if kind == InstallKind::Unmanaged {
+            return Err(format!(
+                "Không cài được yt-dlp nightly: {self_update_err}. {}",
+                Self::unmanaged_hint("yt-dlp", &ytdlp_path, &self_update_err)
+            ));
+        }
+        // Bản cài qua pip/pipx/venv: nightly được đăng lên PyPI dưới dạng pre-release
+        match Self::install_latest_build("yt-dlp", "yt-dlp", &["--pre"], &kind).await {
+            Ok(msg) => Ok(Self::with_version(msg, &ytdlp_path).await),
+            Err(pip_err) => Err(format!(
+                "Không cài được yt-dlp nightly: {pip_err} (yt-dlp --update-to nightly: {self_update_err})"
+            )),
+        }
+    }
+
+    /// Cài BẢN PHÁT TRIỂN mới nhất của gallery-dl (mã nguồn trên Codeberg) vào đúng môi
+    /// trường đang chứa nó. `--force-reinstall`: các commit mới vẫn mang cùng số phiên bản
+    /// "x.y.z-dev", không ép thì pip coi là đã cài và bỏ qua. `--no-deps`: chỉ thay
+    /// gallery-dl, không đụng tới các gói đi kèm. Khi bản ổn định kế tiếp ra, nút
+    /// "Cập nhật" thường sẽ tự nâng lên bản đó (bản ổn định mới hơn bản -dev).
+    pub async fn update_gallery_dl_latest() -> Result<String, String> {
+        let _guard = update_lock().lock().await;
+        let gallery_path = Self::find_binary("gallery-dl")
+            .ok_or_else(|| format!("gallery-dl chưa được cài đặt. {}", Self::install_hint("gallery-dl")))?;
+        let kind = Self::classify_install(&gallery_path, "gallery-dl");
+        info!("Đang cài gallery-dl bản phát triển tại {:?} ({:?})", gallery_path, kind);
+
+        if kind == InstallKind::Unmanaged {
+            return Err(format!(
+                "Không cài được bản mới nhất của gallery-dl. {}",
+                Self::unmanaged_hint("gallery-dl", &gallery_path, "")
+            ));
+        }
+        let msg = Self::install_latest_build(
+            "gallery-dl",
+            GALLERY_DL_DEV_SOURCE,
+            &["--force-reinstall", "--no-deps"],
+            &kind,
+        )
+        .await?;
+        Ok(Self::with_version(msg, &gallery_path).await)
+    }
 }
 
 #[cfg(test)]
@@ -926,6 +1062,26 @@ mod tests {
 
         let no_pip = BinaryManager::pip_outcome("yt-dlp", false, "/usr/bin/python3: No module named pip", "");
         assert!(no_pip.unwrap_err().contains("chưa có pip"));
+    }
+
+    /// Bản phát triển của gallery-dl giữ nguyên số phiên bản giữa các commit: thiếu
+    /// --force-reinstall thì pip báo "đã cài" và không lấy bản vá mới. Cờ --user chỉ
+    /// dành cho bản cài `pip --user`, và tên gói/nguồn luôn đứng cuối.
+    #[test]
+    fn latest_build_installs_into_the_owning_environment() {
+        let dev = BinaryManager::latest_build_pip_args(GALLERY_DL_DEV_SOURCE, &["--force-reinstall", "--no-deps"], false);
+        assert_eq!(dev, vec!["install", "-U", "--force-reinstall", "--no-deps", GALLERY_DL_DEV_SOURCE]);
+        assert!(GALLERY_DL_DEV_SOURCE.starts_with("https://codeberg.org/mikf/gallery-dl/"));
+
+        let nightly_user = BinaryManager::latest_build_pip_args("yt-dlp", &["--pre"], true);
+        assert_eq!(nightly_user, vec!["install", "-U", "--pre", "--user", "yt-dlp"]);
+
+        let ok = BinaryManager::latest_build_outcome("gallery-dl", true, "Successfully installed gallery-dl-1.33.0.dev0");
+        assert!(ok.unwrap().contains("bản mới nhất"));
+        let no_pip = BinaryManager::latest_build_outcome("gallery-dl", false, "/usr/bin/python3: No module named pip");
+        assert!(no_pip.unwrap_err().contains("chưa có pip"));
+        let failed = BinaryManager::latest_build_outcome("yt-dlp", false, "ERROR: Could not find a version that satisfies the requirement");
+        assert!(failed.unwrap_err().contains("Could not find a version"));
     }
 
     #[test]

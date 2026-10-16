@@ -13,6 +13,7 @@ import hashlib
 import tempfile
 import threading
 import time
+import urllib.parse
 from typing import Dict, List, Optional, Tuple, Set
 
 # Try importing cryptography & secretstorage
@@ -59,24 +60,52 @@ def registrable_domain(host: Optional[str]) -> Optional[str]:
     return ".".join(parts[-2:])
 
 
-# Tên cookie chứng minh phiên đăng nhập của từng nền tảng — dùng để cảnh báo sớm
-# thay vì để extractor chạy rồi thất bại với lỗi khó hiểu.
-_SESSION_COOKIE_NAMES = {
-    "instagram.com": {"sessionid", "ds_user_id"},
-    "facebook.com": {"c_user", "xs"},
-    "threads.net": {"sessionid", "ds_user_id"},
-    "x.com": {"auth_token", "ct0"},
-    "twitter.com": {"auth_token", "ct0"},
-    "reddit.com": {"reddit_session", "token_v2"},
-    "tiktok.com": {"sessionid", "sessionid_ss"},
-    "pinterest.com": {"_pinterest_sess"},
-    "youtube.com": {"SID", "__Secure-3PSID"},
+# Cookie CHỈ tồn tại khi đang đăng nhập nền tảng đó (tên → giá trị bắt buộc, None = giá
+# trị bất kỳ). Trước đây chỉ cần có một trong các tên "gần đúng": Instagram vẫn giữ
+# ds_user_id sau khi đăng xuất, X cấp ct0 cho cả khách, Reddit cấp token_v2 cho mọi
+# người... nên app báo "Dùng cookie đã đăng nhập" trong khi thực ra đang là khách.
+_AUTH_COOKIES: Dict[str, Dict[str, Optional[str]]] = {
+    "instagram.com": {"sessionid": None},
+    "threads.net": {"sessionid": None},
+    "threads.com": {"sessionid": None},
+    "facebook.com": {"c_user": None},
+    "x.com": {"auth_token": None},
+    "twitter.com": {"auth_token": None},
+    "reddit.com": {"reddit_session": None},
+    "tiktok.com": {"sessionid": None, "sessionid_ss": None, "sid_tt": None},
+    "pinterest.com": {"_auth": "1"},
+    "youtube.com": {"SID": None, "__Secure-3PSID": None, "LOGIN_INFO": None},
 }
+
+# Thứ tự dò khi cần tìm trình duyệt đang đăng nhập một trang
+_BROWSER_CANDIDATES = ("firefox", "edge", "chrome", "brave", "chromium", "opera", "vivaldi")
+_BROWSER_LABELS = {
+    "firefox": "Firefox", "edge": "Edge", "chrome": "Chrome", "brave": "Brave",
+    "chromium": "Chromium", "opera": "Opera", "vivaldi": "Vivaldi",
+}
+
+
+def _browser_label(browser: str) -> str:
+    return _BROWSER_LABELS.get(browser, browser)
 
 
 def _host_matches(host: str, base_domain: str) -> bool:
     h = host.strip().lower().lstrip(".")
     return h == base_domain or h.endswith("." + base_domain)
+
+
+def _rows_have_login(rows, base_domain: str) -> bool:
+    """Các cookie này có chứa phiên đăng nhập của `base_domain` không."""
+    wanted = _AUTH_COOKIES.get(base_domain)
+    if not wanted:
+        return False
+    for host, _flag, _path, _sec, _exp, name, value in rows:
+        if name not in wanted or not value or not _host_matches(host, base_domain):
+            continue
+        required = wanted[name]
+        if required is None or value == required:
+            return True
+    return False
 
 
 # Thời gian sống của cache cookie đã xuất (giây)
@@ -366,10 +395,38 @@ class BrowserCookieExporter:
 
         return cookies_out
 
+    def has_login(self, browser: str, domain: Optional[str]) -> bool:
+        """Trình duyệt này đang đăng nhập trang `domain` (theo cookie phiên của nền tảng)."""
+        base = registrable_domain(domain)
+        if not base or base not in _AUTH_COOKIES:
+            return False
+        try:
+            return _rows_have_login(self._raw_cookies_cached(browser.lower()), base)
+        except Exception:
+            return False
+
+    def logged_in_browser(self, domain: Optional[str], exclude: Optional[str] = None) -> Optional[str]:
+        """Trình duyệt (khác `exclude`) đang đăng nhập trang `domain`, nếu có."""
+        base = registrable_domain(domain)
+        if not base or base not in _AUTH_COOKIES:
+            return None
+        skip = (exclude or "").lower()
+        for b in _BROWSER_CANDIDATES:
+            if b != skip and self.has_login(b, base):
+                return b
+        return None
+
     def find_best_browser(self, domain_filter: Optional[str] = None) -> Optional[str]:
         """Tự động tìm trình duyệt phù hợp nhất có chứa cookies cho domain"""
-        candidates = ["firefox", "edge", "chrome", "brave", "chromium", "opera", "vivaldi"]
+        candidates = list(_BROWSER_CANDIDATES)
         clean_d = registrable_domain(domain_filter)
+
+        # 0. Trình duyệt ĐANG ĐĂNG NHẬP trang này. Trước đây chọn trình duyệt đầu tiên
+        #    có cookie bất kỳ của tên miền — Firefox còn sót cookie khách của Instagram
+        #    được chọn thay cho Edge đang đăng nhập.
+        logged_in = self.logged_in_browser(clean_d)
+        if logged_in:
+            return logged_in
 
         # 1. Ưu tiên trình duyệt thực sự có cookies cho domain chỉ định
         if clean_d:
@@ -572,6 +629,70 @@ def browser_store_readable(browser: Optional[str]) -> bool:
     return any(row[6] for row in rows)
 
 
+def _login_fallback(exporter: "BrowserCookieExporter", browser: str, domain: str) -> Optional[str]:
+    """Trình duyệt khác đang đăng nhập `domain` khi `browser` thì chưa, hoặc None."""
+    base = registrable_domain(domain)
+    if not base or base not in _AUTH_COOKIES or exporter.has_login(browser, base):
+        return None
+    alt = exporter.logged_in_browser(base, exclude=browser)
+    if alt:
+        sys.stderr.write(
+            f"[Cookies] {_browser_label(browser.lower())} chưa đăng nhập {base} — "
+            f"dùng phiên đăng nhập trong {_browser_label(alt)}\n"
+        )
+    return alt
+
+
+def _hostname(target: Optional[str]) -> str:
+    raw = (target or "").strip()
+    if raw and not raw.lower().startswith(("http://", "https://")):
+        raw = "https://" + raw
+    try:
+        return (urllib.parse.urlsplit(raw).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def has_login_session(target: str, browser: Optional[str]) -> bool:
+    """App có phiên đăng nhập nào dùng được cho trang này không: tệp cookie thủ công,
+    hoặc một trình duyệt đang đăng nhập (xem _AUTH_COOKIES). "Tắt Cookies" = không."""
+    if (browser or "").strip().lower() == "none":
+        return False
+    host = _hostname(target)
+    if not host:
+        return False
+    if _find_manual_cookie_file(host):
+        return True
+    try:
+        return BrowserCookieExporter().logged_in_browser(host) is not None
+    except Exception:
+        return True  # không đọc được kho cookie: không kết luận là chưa đăng nhập
+
+
+def pick_cookie_browser(target: str, preferred: Optional[str]) -> Optional[str]:
+    """Trình duyệt mà yt-dlp nên đọc cookie (`--cookies-from-browser`) khi TẢI `target`.
+
+    Bước tải (Rust) gọi yt-dlp với trình duyệt người dùng chọn; nếu trình duyệt đó chưa
+    đăng nhập trang này mà trình duyệt khác thì có, bước phân tích (dùng cookie của
+    trình duyệt kia) thành công nhưng bước tải lại thất bại. Giữ nguyên lựa chọn khi:
+    tắt cookie, có tệp cookie thủ công (Rust ưu tiên tệp đó), hoặc không ai đăng nhập.
+    """
+    pref = (preferred or "").strip().lower()
+    if pref == "none":
+        return "none"
+    host = _hostname(target)
+    if not host or _find_manual_cookie_file(host):
+        return preferred
+    exporter = BrowserCookieExporter()
+    try:
+        if pref in ("", "auto"):
+            return exporter.logged_in_browser(host) or preferred
+        return _login_fallback(exporter, pref, host) or preferred
+    except Exception as err:  # đọc kho cookie lỗi: giữ lựa chọn của người dùng
+        sys.stderr.write(f"[Cookies] Không chọn được trình duyệt cho {host}: {err}\n")
+        return preferred
+
+
 def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str] = None, output_path: Optional[str] = None) -> Optional[str]:
     """Helper: lấy cookies file cho browser, trả về đường dẫn file cookies tạm.
 
@@ -600,6 +721,14 @@ def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str]
         # Ưu tiên 2: trích xuất từ trình duyệt hệ thống
         exporter = BrowserCookieExporter()
         target_browser = browser if (browser and browser != "auto") else "auto"
+        if target_browser != "auto" and domain:
+            # Trình duyệt đang chọn chưa đăng nhập trang này nhưng trình duyệt khác thì
+            # có: dùng phiên đăng nhập đó. Trước đây app tự chọn Edge (chỉ đăng nhập
+            # Instagram) nên X, Reddit... luôn bị coi là khách dù Firefox đang đăng nhập —
+            # X chỉ trả ảnh làm mờ, Reddit chặn hẳn.
+            alt = _login_fallback(exporter, target_browser, domain)
+            if alt:
+                target_browser = alt
         content = exporter.export_cookies_netscape(target_browser, domain)
 
         # Chỉ đếm cookie có GIÁ TRỊ thật — cookie rỗng là dấu hiệu giải mã thất bại.
@@ -617,13 +746,12 @@ def get_browser_cookies_txt(browser: Optional[str] = None, domain: Optional[str]
 
         if domain:
             base = registrable_domain(domain)
-            session_names = _SESSION_COOKIE_NAMES.get(base, set())
-            if session_names:
-                found = {l.split("\t")[5] for l in data_lines}
-                if not (found & session_names):
+            if base in _AUTH_COOKIES:
+                rows = [tuple(l.split("\t")[:7]) for l in data_lines]
+                if not _rows_have_login(rows, base):
                     sys.stderr.write(
-                        f"[Cookies] Tìm thấy {len(data_lines)} cookie cho {base} nhưng THIẾU cookie đăng nhập "
-                        f"({', '.join(sorted(session_names))}). Nội dung riêng tư có thể sẽ không tải được.\n"
+                        f"[Cookies] Tìm thấy {len(data_lines)} cookie cho {base} nhưng CHƯA ĐĂNG NHẬP "
+                        f"(thiếu {', '.join(sorted(_AUTH_COOKIES[base]))}). Nội dung cần đăng nhập sẽ không tải được.\n"
                     )
                 else:
                     sys.stderr.write(f"[Cookies] Dùng {len(data_lines)} cookie đã đăng nhập của {base}\n")

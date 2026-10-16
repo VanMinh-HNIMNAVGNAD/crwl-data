@@ -199,6 +199,10 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
                     <IconRefresh className="w-3.5 h-3.5" />
                   </button>
                 </div>
+                <p className="browser-dropdown-note">
+                  Trang nào trình duyệt đã chọn chưa đăng nhập, app tự dùng cookie của trình duyệt khác đang đăng
+                  nhập trang đó.
+                </p>
                 <div className="browser-dropdown-list">
                   {browsersData?.browsers?.map((b) => {
                     const isSelected = selectedBrowser === b.id

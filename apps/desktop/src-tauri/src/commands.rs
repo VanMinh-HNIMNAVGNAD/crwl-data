@@ -91,12 +91,38 @@ pub async fn resolve_short_url(
         .await
 }
 
+/// Trình duyệt yt-dlp đọc cookie khi tải: trình duyệt người dùng chọn chưa đăng nhập
+/// trang này (vd. Edge với x.com) mà trình duyệt khác thì có → dùng trình duyệt đó.
+///
+/// Trước đây bước phân tích (Python) và bước tải (yt-dlp `--cookies-from-browser`) đọc
+/// cookie ở hai nơi khác nhau: phân tích thấy được bài cần đăng nhập, bấm tải lại bị
+/// coi là khách. Không hỏi được engine (đang khởi động lại, quá giờ) thì giữ nguyên.
+/// `None` (UI chọn "Tắt Cookies") giữ nguyên là không dùng cookie.
+async fn effective_download_browser(state: &AppState, url: &str, browser: Option<String>) -> Option<String> {
+    let preferred = browser.as_deref().map(str::trim).unwrap_or("");
+    if preferred.is_empty() || preferred == "none" {
+        return browser;
+    }
+    match tokio::time::timeout(Duration::from_secs(20), state.sidecar.pick_cookie_browser(url, preferred)).await {
+        Ok(Ok(Some(chosen))) if chosen != preferred && chosen != "none" => {
+            log::info!("Tải {url}: {preferred} chưa đăng nhập trang này — đọc cookie từ {chosen}");
+            Some(chosen)
+        }
+        Ok(Err(e)) => {
+            log::warn!("Không chọn được trình duyệt đọc cookie cho bước tải: {e}");
+            browser
+        }
+        _ => browser,
+    }
+}
+
 #[tauri::command]
 pub async fn start_download(
     app: AppHandle,
     state: State<'_, AppState>,
-    options: DownloadOptions,
+    mut options: DownloadOptions,
 ) -> Result<DownloadResult, String> {
+    options.browser = effective_download_browser(&state, &options.url, options.browser.take()).await;
     DownloaderService::start_download(app, Arc::clone(&state.db), options).await
 }
 
@@ -217,6 +243,7 @@ pub async fn download_thumbnail(
     device_id: Option<String>,
     task_id: Option<String>,
 ) -> Result<DownloadResult, String> {
+    let browser = effective_download_browser(&state, &url, browser).await;
     let opts = DownloadOptions {
         url,
         format_id: Some("thumbnail".to_string()),
@@ -247,6 +274,7 @@ pub async fn download_subtitle(
     device_id: Option<String>,
     task_id: Option<String>,
 ) -> Result<DownloadResult, String> {
+    let browser = effective_download_browser(&state, &url, browser).await;
     let opts = DownloadOptions {
         url,
         format_id: Some(format!("subtitle:{}:{}", lang, format.as_deref().unwrap_or("vtt"))),
@@ -277,6 +305,17 @@ pub async fn update_ytdlp() -> Result<String, String> {
 #[tauri::command]
 pub async fn update_gallery_dl() -> Result<String, String> {
     BinaryManager::update_gallery_dl().await
+}
+
+/// Bản mới nhất (nightly / bản phát triển) — khi bản ổn định chưa kịp sửa một trang vừa đổi
+#[tauri::command]
+pub async fn update_ytdlp_latest() -> Result<String, String> {
+    BinaryManager::update_ytdlp_latest().await
+}
+
+#[tauri::command]
+pub async fn update_gallery_dl_latest() -> Result<String, String> {
+    BinaryManager::update_gallery_dl_latest().await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

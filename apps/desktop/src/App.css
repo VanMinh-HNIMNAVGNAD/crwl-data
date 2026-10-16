@@ -256,6 +256,17 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   margin-bottom: 4px;
 }
 
+.browser-dropdown-note {
+  margin: 0 0 6px;
+  padding: 0 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  /* .system-header-inner đặt nowrap cho cả thanh trên cùng: ghi chú phải tự xuống dòng */
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+
 .btn-refresh-browsers {
   background: transparent;
   border: none;
@@ -3374,6 +3385,26 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 .btn-update-tool:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.tool-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* "Bản mới nhất": hành động phụ, nhẹ hơn nút "Cập nhật" */
+.btn-update-tool.is-secondary {
+  background: var(--bg-card);
+  border-color: var(--border-subtle);
+  color: var(--text-muted);
+}
+
+.btn-update-tool.is-secondary:hover:not(:disabled) {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+  color: var(--text-primary);
 }
 
 /* ── Stream Not Found (DRM / Ẩn nguồn) ─────────────────────────────────── */

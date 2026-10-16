@@ -719,7 +719,7 @@ impl SidecarManager {
         match action {
             "resolve" => Duration::from_secs(30),
             // Đọc + giải mã kho cookie của trình duyệt (lần đầu có thể vài giây)
-            "cookies" => Duration::from_secs(45),
+            "cookies" | "cookie_browser" => Duration::from_secs(45),
             "crawl" => {
                 let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(50);
                 // Với "Khoảng", gallery-dl phải đi qua mọi bài trước range_end nên chi
@@ -942,6 +942,20 @@ impl SidecarManager {
             .and_then(|v| v.as_str())
             .filter(|p| !p.is_empty())
             .map(PathBuf::from))
+    }
+
+    /// Trình duyệt mà yt-dlp nên đọc cookie khi TẢI `url`: trình duyệt đang chọn mà chưa
+    /// đăng nhập trang đó thì Python trả về trình duyệt khác đang đăng nhập (cùng logic
+    /// với bước phân tích). Không có gợi ý nào khác thì trả về chính `browser`.
+    pub async fn pick_cookie_browser(&self, url: &str, browser: &str) -> Result<Option<String>, String> {
+        let payload = json!({ "action": "cookie_browser", "url": url, "browser": browser });
+        let data = self.send_request(payload, None).await?;
+        Ok(data
+            .get("browser")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(str::to_string))
     }
 
     /// Quét profile / channel / playlist

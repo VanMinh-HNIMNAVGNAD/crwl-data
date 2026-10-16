@@ -40,7 +40,7 @@ from core.cancellation import (
     cancel_request,
     end_request,
 )
-from core.cookies.browser_cookies import export_cookies_for_domains
+from core.cookies.browser_cookies import export_cookies_for_domains, pick_cookie_browser
 from core.dispatcher import MediaDispatcher
 from core.extractors import ytdlp_runtime
 from core.resolver.url_resolver import UrlResolver
@@ -56,7 +56,7 @@ MAX_CONCURRENT_REQUESTS = int(os.environ.get("CRWL_MAX_WORKERS", "4"))
 # Yêu cầu ngắn mà người dùng đang chờ trực tiếp (giải mã link rút gọn khi gõ, cookie
 # cho lượt tải vừa bấm) chạy ở hàng đợi riêng: nếu xếp chung với 4 lượt bóc tách dài
 # (mỗi lượt tới vài phút), bấm "Tải" phải chờ cả phút mới bắt đầu.
-QUICK_ACTIONS = frozenset({"resolve", "cookies"})
+QUICK_ACTIONS = frozenset({"resolve", "cookies", "cookie_browser"})
 
 
 def output_json(data: dict, pretty: bool = False) -> None:
@@ -121,6 +121,10 @@ def handle_request(dispatcher: MediaDispatcher, resolver: UrlResolver, req: dict
             domains = [d for d in domains if isinstance(d, str)] if isinstance(domains, list) else [url]
             path, count = export_cookies_for_domains(domains, req.get("browser"))
             return {"id": req_id, "success": True, "data": {"path": path, "count": count}}
+
+        if action == "cookie_browser":
+            # Trình duyệt yt-dlp nên đọc cookie khi tải link này (xem pick_cookie_browser)
+            return {"id": req_id, "success": True, "data": {"browser": pick_cookie_browser(url, req.get("browser"))}}
 
         return {"id": req_id, "success": False, "error": f"Unknown action: '{action}'"}
     except RequestTimedOut:

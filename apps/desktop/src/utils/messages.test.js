@@ -118,3 +118,30 @@ test('fileNameOf / shortenMiddle', () => {
   assert.match(long, /…/)
   assert.ok(long.endsWith('.mp4'))
 })
+
+test('bài X nhạy cảm và lỗi quét Instagram có gợi ý riêng, không phải câu chung', () => {
+  // Đúng câu engine Python trả về (page_media.X_SENSITIVE_LOGIN_MESSAGE)
+  const blurred =
+    'Bài đăng X (Twitter) này có nội dung nhạy cảm / giới hạn độ tuổi nên X chỉ hiện bản làm mờ — tải ảnh/video gốc ' +
+    'yêu cầu đăng nhập. Hãy đăng nhập X trên trình duyệt (app tự dùng trình duyệt đang đăng nhập) hoặc dán cookie X ' +
+    'vào Cookie Manager (🍪). Đã đăng nhập mà vẫn gặp: bật "Hiển thị nội dung có thể nhạy cảm" trong Cài đặt X.'
+  const x = describeError(blurred)
+  assert.equal(x.title, 'Bài X có nội dung nhạy cảm — cần đăng nhập')
+  assert.match(x.message, /nhạy cảm/)
+
+  // gallery.GalleryDlExtractor.instagram_outdated_message
+  const ig =
+    'Không quét được tài khoản Instagram này. Nếu tài khoản vẫn mở được trên trình duyệt thì Instagram vừa thay đổi ' +
+    'cách trả dữ liệu và gallery-dl đang cài chưa theo kịp — mở Công cụ (⚙) → gallery-dl → "Bản mới nhất" rồi quét lại. ' +
+    '(Chi tiết: NotFoundError: Requested user could not be found)'
+  const res = describeError(ig)
+  assert.equal(res.title, 'Không quét được tài khoản Instagram')
+  assert.match(res.message, /Bản mới nhất/)
+  assert.ok(!looksRaw(res.title) && !looksRaw(res.message))
+})
+
+test('gợi ý đăng nhập không còn bắt đổi trình duyệt ở mục "Cookies"', () => {
+  const res = describeError('ERROR: [reddit] 6rrwyj: Account authentication is required. Use --cookies-from-browser or --cookies')
+  assert.equal(res.title, 'Nội dung Reddit cần đăng nhập')
+  assert.match(res.message, /Đăng nhập Reddit trên trình duyệt/)
+})

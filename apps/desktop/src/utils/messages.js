@@ -128,6 +128,23 @@ const RULES = [
     message: 'Thử đặt proxy ở khu vực được phép trong "Công cụ" (⚙).',
   },
   {
+    // X chỉ cho khách xem bản làm mờ của bài nhạy cảm (engine Python phát hiện)
+    test: /chỉ hiện bản\s+làm mờ|BlurredMediaTombstone/i,
+    strong: true,
+    title: 'Bài X có nội dung nhạy cảm — cần đăng nhập',
+    message:
+      'Đăng nhập X trên trình duyệt (app tự dùng trình duyệt đang đăng nhập) hoặc dán cookie X vào Cookie (🍪). ' +
+      'Đã đăng nhập mà vẫn lỗi: bật "Hiển thị nội dung có thể nhạy cảm" trong Cài đặt X.',
+  },
+  {
+    // gallery-dl chưa theo kịp thay đổi API của Instagram (engine Python phát hiện)
+    test: /không quét được tài khoản instagram/i,
+    strong: true,
+    title: 'Không quét được tài khoản Instagram',
+    message:
+      'Nếu tài khoản vẫn mở được trên trình duyệt: Instagram vừa thay đổi — mở "Công cụ" (⚙) → gallery-dl → "Bản mới nhất" rồi quét lại.',
+  },
+  {
     test: /yêu cầu đăng nhập|cần đăng nhập|\blog ?in\b|logged[- ]in|sign in|authenticat|not a bot|confirm your age|age[- ]restrict|giới hạn (?:độ )?tuổi|members?[- ]only|\bprivate\b|riêng tư|empty media response|cookies? (?:are |is )?(?:needed|required)|http error 401|unauthori[sz]ed/i,
     title: (raw) => {
       const platform = platformOf(raw)
@@ -135,9 +152,10 @@ const RULES = [
     },
     message: (raw) => {
       const platform = platformOf(raw)
+      // App tự dùng trình duyệt nào đang đăng nhập trang đó (không cần đổi mục "Cookies")
       return platform
-        ? `Mở Cookie (🍪) → tab ${platform} để dán cookie, hoặc chọn trình duyệt đang đăng nhập ${platform} ở mục "Cookies".`
-        : 'Mở Cookie (🍪) để thêm cookie cho nền tảng này, hoặc chọn trình duyệt đang đăng nhập ở mục "Cookies".'
+        ? `Đăng nhập ${platform} trên trình duyệt rồi thử lại, hoặc mở Cookie (🍪) → tab ${platform} để dán cookie.`
+        : 'Đăng nhập trang này trên trình duyệt rồi thử lại, hoặc mở Cookie (🍪) để thêm cookie cho nền tảng này.'
     },
   },
   {

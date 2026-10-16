@@ -128,6 +128,15 @@ class GalleryDlExtractor(BaseExtractor):
         if not raw_entries:
             raise ValueError("Không tìm thấy dữ liệu phương tiện từ liên kết qua gallery-dl.")
 
+        # Không có tệp nào mà gallery-dl có báo lỗi: nêu đúng lỗi đó. Trước đây mọi
+        # trường hợp đều thành "Không thể bóc tách được hình ảnh nào từ album này." —
+        # che mất "'Unavailable'" (bài X nhạy cảm khi chưa đăng nhập) hay "blocked by
+        # network security" (Reddit chặn khách).
+        if not any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in raw_entries):
+            error = self._first_error(raw_entries)
+            if error:
+                raise RuntimeError(f"gallery-dl không lấy được media: {error}")
+
         return self._normalize_gallery(raw_entries, url)
 
     def crawl_profile(
@@ -305,11 +314,45 @@ class GalleryDlExtractor(BaseExtractor):
         auth_reason = self._detect_auth_error(entries, stderr)
         if auth_reason:
             raise RuntimeError(self._login_required_message(url, auth_reason))
-        for x in entries:
-            if isinstance(x, list) and len(x) >= 2 and x[0] == -1 and isinstance(x[1], dict):
-                err = str(x[1].get("error") or "Lỗi")
-                msg = str(x[1].get("message") or "")
-                raise RuntimeError(f"gallery-dl không quét được {url}: {err}: {msg}".strip(": "))
+        error = self._first_error(entries)
+        if error:
+            hint = self.instagram_outdated_message(url, error)
+            raise RuntimeError(hint or f"gallery-dl không quét được {url}: {error}")
+
+    @staticmethod
+    def _first_error(entries: Optional[List[Any]]) -> Optional[str]:
+        """Lỗi đầu tiên gallery-dl báo trong output `-j` (entry [-1, {error, message}])."""
+        for x in entries or []:
+            if isinstance(x, list) and len(x) >= 2 and x[0] == -1:
+                payload = x[1]
+                if isinstance(payload, dict):
+                    err = str(payload.get("error") or "Lỗi")
+                    msg = str(payload.get("message") or "")
+                    return f"{err}: {msg}".strip(": ")
+                return str(payload)
+        return None
+
+    # Dấu hiệu gallery-dl đang dùng API Instagram đã cũ: Instagram đổi truy vấn GraphQL
+    # (10/2026) khiến MỌI tài khoản đều "không tìm thấy" hoặc ra rỗng, trong khi bản
+    # ổn định mới nhất trên PyPI chưa kịp sửa (bản vá chỉ có ở bản phát triển).
+    _INSTAGRAM_API_CHANGED = (
+        "requested user could not be found", "missing_required_variable_value",
+        "polarisprofile", "doc_id",
+    )
+
+    @classmethod
+    def instagram_outdated_message(cls, url: str, error: Optional[str] = None) -> Optional[str]:
+        """Câu hướng dẫn cập nhật gallery-dl khi quét tài khoản Instagram thất bại, hoặc None."""
+        if cls._category_of(url) != "instagram":
+            return None
+        if error is not None and not any(sig in error.lower() for sig in cls._INSTAGRAM_API_CHANGED):
+            return None
+        return (
+            "Không quét được tài khoản Instagram này. Nếu tài khoản vẫn mở được trên trình duyệt "
+            "thì Instagram vừa thay đổi cách trả dữ liệu và gallery-dl đang cài chưa theo kịp — mở "
+            "Công cụ (⚙) → gallery-dl → \"Bản mới nhất\" rồi quét lại."
+            + (f" (Chi tiết: {error})" if error else "")
+        )
 
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -585,7 +628,7 @@ class GalleryDlExtractor(BaseExtractor):
                     reddit_fb = reddit_video.get("fallback_url") if isinstance(reddit_video, dict) else None
                     media_url = reddit_fb or self._strip_ytdl_prefix(media_url)
 
-                ext = (meta.get("extension") or meta.get("ext") or self._extract_ext(media_url) or "jpg").lower()
+                ext = self._display_ext(meta.get("extension") or meta.get("ext") or self._extract_ext(media_url) or "jpg", media_url)
                 is_video = ext in ("mp4", "webm", "mov", "m4v", "m3u8", "ts") or bool(meta.get("video_url")) or bool(meta.get("is_video"))
                 is_gif = ext == "gif"
                 item_type = "video" if is_video else ("gif" if is_gif else "image")
@@ -704,7 +747,7 @@ class GalleryDlExtractor(BaseExtractor):
                 # tiền tố "ytdl:". Trước đây tiền tố này lọt nguyên vào kết quả quét,
                 # nên bấm tải video là yt-dlp báo "Unsupported url scheme: ytdl".
                 media_url = self._strip_ytdl_prefix(meta.get("video_url") or raw_url)
-                ext = (meta.get("extension") or meta.get("ext") or self._extract_ext(media_url) or "").lower()
+                ext = self._display_ext(meta.get("extension") or meta.get("ext") or self._extract_ext(media_url) or "", media_url)
                 is_video = ext in ("mp4", "webm", "mov", "m4v", "m3u8", "ts") or bool(meta.get("video_url"))
 
                 if media_type == "video" and not is_video:
@@ -777,6 +820,19 @@ class GalleryDlExtractor(BaseExtractor):
     # Helpers
     # ─────────────────────────────────────────────────────────────────────────
 
+    _DST_FORMAT_RE = re.compile(r"[?&]stp=[^&]*?dst-(jpg|jpeg|png|webp)", re.I)
+
+    @classmethod
+    def _display_ext(cls, ext: str, url: Any) -> str:
+        """Đuôi tệp THẬT: CDN Instagram/Facebook trả JPEG cho URL ".heic?stp=dst-jpg..."
+        (gallery-dl vẫn khai báo "heic"), nên UI từng gắn nhãn HEIC cho ảnh JPEG."""
+        ext = str(ext or "").lower()
+        if ext in ("heic", "heif") and isinstance(url, str):
+            m = cls._DST_FORMAT_RE.search(url)
+            if m:
+                return "jpg" if m.group(1).lower() == "jpeg" else m.group(1).lower()
+        return ext
+
     @staticmethod
     def _strip_ytdl_prefix(url: Any) -> Any:
         """`ytdl:https://...` → `https://...` (yt-dlp tải thẳng được URL phía sau)."""
@@ -818,6 +874,8 @@ class GalleryDlExtractor(BaseExtractor):
         "401 unauthorized", "403 forbidden", "http 401", "http 403",
         "keyerror: 'username'",
         "account is private", "private account",
+        # Instagram chuyển khách sang /accounts/login/ (bài viết, story, tài khoản)
+        "redirect to login",
     )
 
     @classmethod
@@ -867,7 +925,7 @@ class GalleryDlExtractor(BaseExtractor):
             name, tab = "Trang này", "nền tảng tương ứng"
         return (
             f"{name} yêu cầu đăng nhập để xem nội dung này. "
-            f"Hãy đăng nhập {name} trên Firefox/Edge rồi thử lại, "
+            f"Hãy đăng nhập {name} trên trình duyệt (app tự dùng trình duyệt đang đăng nhập) rồi thử lại, "
             f"hoặc mở Cookie Manager (🍪) → tab {tab} và dán cookie từ trình duyệt. "
             f"(Chi tiết: {reason})"
         )

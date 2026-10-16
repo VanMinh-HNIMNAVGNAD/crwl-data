@@ -16,11 +16,11 @@ from .extractors.tiktok import TikTokExtractor
 from .extractors.movie import MovieExtractor
 from .extractors.direct import DirectImageExtractor
 from .extractors.web_scraper import WebScraperExtractor
-from .extractors.page_media import PageMediaExtractor, NoPostMediaError, describe_media
+from .extractors.page_media import LoginRequiredError, PageMediaExtractor, NoPostMediaError, describe_media
 from .extractors.media_probe import MANIFEST_EXTS, SEGMENT_EXTS, is_direct_media_url, is_segment_url, path_ext
 from .extractors.stream_sniffer import get_sniffer
 from .extractors.story import StoryExtractor
-from .cookies.browser_cookies import registrable_domain
+from .cookies.browser_cookies import has_login_session, registrable_domain
 
 
 class _LooksLikePage(Exception):
@@ -219,7 +219,8 @@ class MediaDispatcher(BaseExtractor):
         detail = cls._short_reason(cause)
         return RuntimeError(
             f"Nội dung {name} yêu cầu đăng nhập. "
-            f"Vui lòng vào Cookie Manager (🍪), chọn tab {name} và dán cookie từ trình duyệt."
+            f"Hãy đăng nhập {name} trên trình duyệt (app tự dùng trình duyệt đang đăng nhập), "
+            f"hoặc vào Cookie Manager (🍪), chọn tab {name} và dán cookie."
             + (f" (Chi tiết: {detail})" if detail else "")
         )
 
@@ -387,9 +388,10 @@ class MediaDispatcher(BaseExtractor):
                     except PlaylistUrlError:
                         raise
                     except Exception as yt_err2:
-                        if self._is_auth_error(yt_err2):
-                            raise self._make_login_error(target_url, gal_err)
-                        raise yt_err2
+                        # gallery-dl đã nói rõ là cần đăng nhập: lỗi khác của yt-dlp (vd.
+                        # "There is no video in this post" với bài ảnh Instagram) chỉ che
+                        # mất nguyên nhân thật.
+                        raise self._make_login_error(target_url, gal_err) from yt_err2
                 self.warn(f"gallery-dl thất bại ({gal_err}), yt-dlp fallback...")
                 try:
                     res = self.ytdlp.extract_metadata(target_url, browser=browser)
@@ -397,6 +399,13 @@ class MediaDispatcher(BaseExtractor):
                 except PlaylistUrlError:
                     raise
                 except Exception as yt_err:
+                    # Reddit / Instagram khi yt-dlp nói rõ cần đăng nhập mà máy không có phiên
+                    # đăng nhập nào: trang của khách chỉ có avatar và ảnh của bài khác (Reddit
+                    # khách từng ra "4 ảnh và 1 video" — 3 ảnh của bài liên quan). Facebook
+                    # thì không: trang ảnh công khai vẫn cho khách thấy chính ảnh đó.
+                    guest_page_is_junk = is_instagram or is_reddit
+                    if guest_page_is_junk and self._is_auth_error(yt_err) and not has_login_session(target_url, browser):
+                        raise self._make_login_error(target_url, yt_err) from gal_err
                     self.warn(f"yt-dlp thất bại ({yt_err}), đọc trực tiếp ảnh/video của bài viết...")
                     # Trước đây chỉ còn web_scraper: với trang mạng xã hội nó chỉ thấy ảnh
                     # og:image (thẻ chia sẻ) nên trả về một "album" 1 ảnh giả. Nay mở trang
@@ -407,6 +416,11 @@ class MediaDispatcher(BaseExtractor):
                         )
                         return self._enhance_metadata(res, target_url)
                     except Exception as page_err:
+                        # Trang chỉ cho khách xem bản thay thế (vd. ảnh mờ của bài X nhạy
+                        # cảm): web_scraper bên dưới sẽ nhặt đúng ảnh đó (og:image) và báo
+                        # "thành công" một album giả.
+                        if self._is_login_wall_error(page_err):
+                            raise
                         self.warn(f"Không đọc được media của bài viết: {page_err}")
                     try:
                         res = self.web_scraper.extract(target_url)
@@ -695,7 +709,10 @@ class MediaDispatcher(BaseExtractor):
                 return res
             # gallery-dl thành công nhưng trả về rỗng (không có exception)
             # → lưu lại để fallback bên dưới xử lý
-            gal_err_saved = RuntimeError(f"gallery-dl không tìm thấy media từ {target_url}")
+            gal_err_saved = RuntimeError(
+                GalleryDlExtractor.instagram_outdated_message(target_url)
+                or f"gallery-dl không tìm thấy media từ {target_url}"
+            )
         except Exception as gal_err:
             gal_err_saved = gal_err
 
@@ -770,7 +787,7 @@ class MediaDispatcher(BaseExtractor):
 
     @staticmethod
     def _is_login_wall_error(err: Exception) -> bool:
-        return "yêu cầu đăng nhập" in str(err)
+        return isinstance(err, LoginRequiredError) or "yêu cầu đăng nhập" in str(err)
 
     def _platform_id(self, url: str) -> str:
         try:

@@ -553,6 +553,24 @@ export async function updateGalleryDl() {
   }
 }
 
+// Bản mới nhất (yt-dlp nightly / gallery-dl bản phát triển): khi một trang vừa đổi và
+// bản ổn định chưa kịp sửa.
+export async function updateYtdlpLatest() {
+  try {
+    return await invoke('update_ytdlp_latest')
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi cài yt-dlp nightly', { cause: err })
+  }
+}
+
+export async function updateGalleryDlLatest() {
+  try {
+    return await invoke('update_gallery_dl_latest')
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi cài bản mới nhất của gallery-dl', { cause: err })
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 9b. Python Sidecar — trạng thái & khởi động lại khi engine bóc tách chết
 // ─────────────────────────────────────────────────────────────────────────────

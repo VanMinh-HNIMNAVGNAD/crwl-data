@@ -107,6 +107,9 @@ _JUNK_URL_PARTS = (
     "amazon-adsystem.com", "taboola.com", "outbrain.com", "criteo.", "gravatar.com",
     "s.w.org/images/core/emoji", "/smilies/", "/emoji/", "twemoji", "emojione", "joypixels",
     "favicon", "sprite", "spinner",
+    # Avatar mặc định của người bình luận trên Reddit: trang bài viết khi chưa đăng nhập
+    # từng ra "7 ảnh và 1 video" — 7 ảnh là avatar_default_0..7.png.
+    "redditstatic.com/avatars/",
 )
 # class của <img> trang trí: emoji / mặt cười chèn trong chữ, avatar người đăng, icon.
 # Emoji của diễn đàn (XenForo "smilie") khai báo 72x72 nên lọt bộ lọc theo kích thước.
@@ -186,6 +189,36 @@ class NoPostMediaError(RuntimeError):
     def __init__(self, message: str, dynamic_ran: bool = False):
         super().__init__(message)
         self.dynamic_ran = dynamic_ran
+
+
+class LoginRequiredError(RuntimeError):
+    """Trang chỉ cho xem bài viết khi đăng nhập.
+
+    Bên gọi KHÔNG được thay bằng ảnh khác trên trang (og:image, ảnh giữ chỗ): đó không
+    phải media của bài viết.
+    """
+
+
+# X (giao diện web mới, 10/2026) trả bài có media nhạy cảm / giới hạn độ tuổi cho khách
+# dưới dạng "BlurredMediaTombstone": trang chỉ có MỘT ảnh làm mờ dùng chung cho mọi
+# bài như vậy. Trước đây ảnh đó được báo là "1 ảnh trong bài viết" — ba bài của ba tài
+# khoản khác nhau cùng ra đúng một ảnh mờ.
+_X_BLURRED_MARKER = "BlurredMediaTombstone"
+X_SENSITIVE_LOGIN_MESSAGE = (
+    "Bài đăng X (Twitter) này có nội dung nhạy cảm / giới hạn độ tuổi nên X chỉ hiện bản "
+    "làm mờ — tải ảnh/video gốc yêu cầu đăng nhập. Hãy đăng nhập X trên trình duyệt "
+    "(app tự dùng trình duyệt đang đăng nhập) hoặc dán cookie X vào Cookie Manager (🍪). "
+    "Đã đăng nhập mà vẫn gặp: bật \"Hiển thị nội dung có thể nhạy cảm\" trong Cài đặt X."
+)
+
+
+def login_only_notice(html_text: str, page_url: str) -> Optional[str]:
+    """Thông báo nếu trang chỉ cho khách xem bản thay thế (ảnh mờ) của bài viết, hoặc None."""
+    host = (urllib.parse.urlsplit(page_url).hostname or "").lower()
+    is_x = any(host == d or host.endswith("." + d) for d in ("x.com", "twitter.com"))
+    if is_x and _X_BLURRED_MARKER in html_text:
+        return X_SENSITIVE_LOGIN_MESSAGE
+    return None
 
 
 def describe_media(images: List[MediaImage], dynamic_used: bool = False, truncated: bool = False) -> str:
@@ -1514,18 +1547,25 @@ class PageMediaExtractor(BaseExtractor):
 
         static: Optional[PageScan] = None
         static_err: Optional[Exception] = None
+        login_notice: Optional[str] = None
         try:
             final_url, status, ctype, text, direct = fetch_page(target, browser)
             if direct:
                 return self._direct_result(target, final_url, direct, platform)
             if text is not None:
-                static = scan_html(text, final_url)
-                static.status = status
+                login_notice = login_only_notice(text, final_url)
+                if login_notice is None:
+                    static = scan_html(text, final_url)
+                    static.status = status
         except Exception as err:  # mạng lỗi, chặn bot... → còn trình duyệt thật
             if type(err).__name__ in ("RequestCancelled", "RequestTimedOut"):
                 raise
             static_err = err
             self.warn(f"Không tải được HTML tĩnh ({err}), thử trình duyệt headless...")
+        if login_notice:
+            # Mở bằng trình duyệt thật cũng chỉ thấy đúng ảnh mờ đó
+            self.warn("Trang chỉ hiện bản làm mờ của bài viết cho khách — cần đăng nhập")
+            raise LoginRequiredError(login_notice)
 
         static_items: List[_Candidate] = []
         scope = "page"
@@ -1552,7 +1592,7 @@ class PageMediaExtractor(BaseExtractor):
 
         if not items:
             if scan is not None and scan.has_password:
-                raise RuntimeError(
+                raise LoginRequiredError(
                     "Trang này yêu cầu đăng nhập để xem bài viết. Hãy đăng nhập trang này trên "
                     "trình duyệt (Chrome/Edge/Firefox) rồi thử lại, hoặc mở Cookie Manager (🍪) "
                     "và dán cookie của trang."
