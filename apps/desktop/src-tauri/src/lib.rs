@@ -100,6 +100,7 @@ pub fn run() {
             commands::update_gallery_dl,
             commands::update_ytdlp_latest,
             commands::update_gallery_dl_latest,
+            commands::check_tool_updates,
             // ── App Settings ──────────────────────────────────────────────
             commands::get_app_settings,
             commands::save_app_settings,

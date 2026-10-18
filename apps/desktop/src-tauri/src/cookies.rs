@@ -258,7 +258,7 @@ impl CookieService {
         ];
         let mut count = 0;
 
-        for pair in trimmed.split(|c| c == ';' || c == '\n' || c == '\r') {
+        for pair in trimmed.split([';', '\n', '\r']) {
             let mut p = pair.trim();
             for prefix in ["cookie:", "Cookie:", "COOKIE:"] {
                 if let Some(rest) = p.strip_prefix(prefix) {

@@ -571,6 +571,16 @@ export async function updateGalleryDlLatest() {
   }
 }
 
+// Bản mới của yt-dlp / gallery-dl trên PyPI (backend cache 24 giờ; force = tra lại ngay).
+// { ytdlp: { name, installed, latest, updateAvailable }, galleryDl: {...}, checkedAt }
+export async function checkToolUpdates(force = false) {
+  try {
+    return await invoke('check_tool_updates', { force })
+  } catch (err) {
+    throw new Error(typeof err === 'string' ? err : err.message || 'Lỗi khi kiểm tra bản mới', { cause: err })
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 9b. Python Sidecar — trạng thái & khởi động lại khi engine bóc tách chết
 // ─────────────────────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tauri::{AppHandle, State};
 
-use crate::binary_manager::{AllBinaryStatus, BinaryManager};
+use crate::binary_manager::{AllBinaryStatus, BinaryManager, ToolUpdateReport};
 use crate::cookies::{CookieService, CookieStatusResult, SaveCookieResult};
 use crate::db::{Database, DownloadHistoryRecord};
 use crate::downloader::{DirectFileItem, DownloadOptions, DownloadResult, DownloaderService};
@@ -316,6 +316,13 @@ pub async fn update_ytdlp_latest() -> Result<String, String> {
 #[tauri::command]
 pub async fn update_gallery_dl_latest() -> Result<String, String> {
     BinaryManager::update_gallery_dl_latest().await
+}
+
+/// So phiên bản yt-dlp / gallery-dl đang cài với bản mới nhất trên PyPI (cache 24 giờ;
+/// `force` tra lại ngay). Chỉ báo, không tự cài.
+#[tauri::command]
+pub async fn check_tool_updates(force: Option<bool>) -> ToolUpdateReport {
+    BinaryManager::check_tool_updates(force.unwrap_or(false)).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

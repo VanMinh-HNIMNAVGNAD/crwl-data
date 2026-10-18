@@ -3336,6 +3336,13 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   border: 1px solid #fecaca;
 }
 
+/* Có bản ổn định mới hơn trên PyPI: nhắc bấm "Cập nhật", không báo động như lỗi */
+.tool-status-badge.badge-update {
+  background: #fffbeb;
+  color: #b45309;
+  border: 1px solid #fde68a;
+}
+
 /* Chưa có kết quả quét: trung tính, không đỏ như "Chưa cài đặt" */
 .tool-status-badge.badge-checking {
   background: var(--bg-subtle);

@@ -1884,7 +1884,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   />
                   <span>Nhúng Thumbnail</span>
                 </label>
-                <label className="checkbox-opt-label" title="Tải bằng aria2c (16 kết nối) — cần cài aria2c">
+                <label className="checkbox-opt-label" title="Tải bằng aria2c (8 kết nối) — cần cài aria2c">
                   <input
                     type="checkbox"
                     checked={useAria2c}
@@ -2134,7 +2134,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   <span>Tách theo chương</span>
                 </label>
 
-                <label className="checkbox-opt-label" title="Tải bằng aria2c (16 kết nối) — cần cài aria2c; nếu chưa cài sẽ tự dùng bộ tải mặc định">
+                <label className="checkbox-opt-label" title="Tải bằng aria2c (8 kết nối) — cần cài aria2c; nếu chưa cài sẽ tự dùng bộ tải mặc định">
                   <input
                     type="checkbox"
                     checked={useAria2c}

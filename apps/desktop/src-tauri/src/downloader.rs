@@ -812,7 +812,7 @@ impl DownloaderService {
                 info!("Bật bộ tải ngoài aria2c theo yêu cầu (đã kích hoạt parser tiến trình)");
                 cmd.arg("--downloader").arg("aria2c");
                 cmd.arg("--downloader-args")
-                    .arg("aria2c:-s 16 -x 16 -k 1M --summary-interval=1");
+                    .arg("aria2c:-s 8 -x 8 -k 1M --summary-interval=1");
             } else {
                 warn!("Đã yêu cầu aria2c nhưng chưa cài trên máy — dùng bộ tải mặc định");
             }
@@ -1764,8 +1764,7 @@ impl DownloaderService {
         let target = line
             .split('\r')
             .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .last()
+            .rfind(|s| !s.is_empty())
             .unwrap_or(trimmed);
 
         let caps = regex.captures(target)?;
@@ -4808,7 +4807,7 @@ mod tests {
 
         // 1. Valid JPEG with image/jpeg
         let jpg_path = temp_dir.join("photo.jpg");
-        std::fs::write(&jpg_path, &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00]).unwrap();
+        std::fs::write(&jpg_path, [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00]).unwrap();
         assert!(D::validate_downloaded_media(&jpg_path, 200, "image/jpeg", "http://test.com/photo.jpg").is_ok());
 
         // 2. Valid JPEG with application/octet-stream (CDN binary stream)
@@ -4816,12 +4815,12 @@ mod tests {
 
         // 3. Valid MP4 with video/mp4
         let mp4_path = temp_dir.join("clip.mp4");
-        std::fs::write(&mp4_path, &[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2']).unwrap();
+        std::fs::write(&mp4_path, [0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2']).unwrap();
         assert!(D::validate_downloaded_media(&mp4_path, 200, "video/mp4", "http://test.com/clip.mp4").is_ok());
 
         // 4. Valid PNG with image/png
         let png_path = temp_dir.join("image.png");
-        std::fs::write(&png_path, &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]).unwrap();
+        std::fs::write(&png_path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]).unwrap();
         assert!(D::validate_downloaded_media(&png_path, 200, "image/png", "http://test.com/image.png").is_ok());
 
         // 5. Valid WebP with application/octet-stream

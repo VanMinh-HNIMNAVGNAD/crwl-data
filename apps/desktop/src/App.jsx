@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo } from 'react'
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
 import SystemHeader from './components/SystemHeader'
 import LinkDownloader from './components/LinkDownloader'
 import AccountDownloader from './components/AccountDownloader'
@@ -8,10 +8,16 @@ import ToolsManagerModal from './components/ToolsManagerModal'
 import ToastStack from './components/ToastStack'
 import ErrorBoundary from './components/ErrorBoundary'
 import { normalizeToast } from './utils/toasts'
+import { pendingToolUpdates, toolUpdateKey, toolUpdateToast } from './utils/toolUpdates'
+import { checkToolUpdates } from './services/api'
 import './App.css'
 
 // Hiện tối đa chừng này thông báo cùng lúc; cái cũ nhất bị đẩy ra trước
 const MAX_TOASTS = 3
+
+// Đợi app và engine Python khởi động xong rồi mới kiểm tra bản mới: lệnh này chạy
+// `--version` của yt-dlp / gallery-dl, không nên tranh tài nguyên lúc vừa mở.
+const UPDATE_CHECK_DELAY_MS = 5000
 
 // ─── Shared download options — persist qua localStorage ───────────────────────
 function getLS(key, fallback) {
@@ -99,6 +105,28 @@ function App() {
   const dismissToast = useCallback((id) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
+
+  // Báo bản mới của yt-dlp / gallery-dl mỗi bản đúng một lần. Lỗi mạng thì im lặng:
+  // đây chỉ là thông báo phụ, không được làm phiền lúc mở app.
+  useEffect(() => {
+    let active = true
+    const timer = setTimeout(() => {
+      checkToolUpdates()
+        .then((report) => {
+          if (!active) return
+          const pending = pendingToolUpdates(report)
+          const key = toolUpdateKey(pending)
+          if (!pending.length || getLS('tool_update_notified', '') === key) return
+          setLS('tool_update_notified', key)
+          showToast(toolUpdateToast(pending, () => setIsToolsOpen(true)))
+        })
+        .catch((err) => console.warn('Không kiểm tra được bản mới của công cụ:', err))
+    }, UPDATE_CHECK_DELAY_MS)
+    return () => {
+      active = false
+      clearTimeout(timer)
+    }
+  }, [showToast])
 
   const handleCookieUpdated = () => setCookieRefreshKey((k) => k + 1)
 

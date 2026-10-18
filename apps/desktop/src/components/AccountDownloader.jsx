@@ -1057,7 +1057,7 @@ function AccountDownloader({ onShowToast, dlOptions = {} }) {
                 />
                 <span>Nhúng Thumbnail</span>
               </label>
-              <label className="checkbox-opt-label" title="Tải video bằng aria2c (16 kết nối) — cần cài aria2c">
+              <label className="checkbox-opt-label" title="Tải video bằng aria2c (8 kết nối) — cần cài aria2c">
                 <input
                   type="checkbox"
                   checked={useAria2c}

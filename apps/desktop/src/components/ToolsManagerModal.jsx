@@ -11,6 +11,7 @@ import {
   getAppSettings,
   saveAppSettings,
   askForDownloadDirectory,
+  checkToolUpdates,
 } from '../services/api'
 import { IconClose, IconRefresh, IconCheck, IconSettings, IconInfo, IconDownload } from './Icons'
 import { errorToast } from '../utils/toasts'
@@ -64,6 +65,9 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
   // hiện trạng thái "đang quét" thay vì lặng lẽ hiển thị dữ liệu cũ.
   const [loading, setLoading] = useState(true)
   const [updatingTool, setUpdatingTool] = useState(null)
+  // Bản mới nhất trên PyPI của yt-dlp / gallery-dl — nạp riêng, chậm hay lỗi mạng
+  // cũng không làm modal phải chờ.
+  const [updateInfo, setUpdateInfo] = useState(null)
   // Giữ callback mới nhất trong ref: đưa thẳng vào deps sẽ khiến effect chạy lại
   // mỗi lần App render (onShowToast được tạo mới mỗi lần).
   const showToastRef = useRef(onShowToast)
@@ -71,7 +75,13 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
     showToastRef.current = onShowToast
   }, [onShowToast])
 
-  const fetchStatus = async () => {
+  const refreshUpdateInfo = (force = false) =>
+    checkToolUpdates(force)
+      .then(setUpdateInfo)
+      .catch((err) => console.warn('Không kiểm tra được bản mới:', err))
+
+  const fetchStatus = async ({ forceUpdateCheck = false } = {}) => {
+    refreshUpdateInfo(forceUpdateCheck)
     setLoading(true)
     try {
       const [data, sc, cfg] = await loadStatus()
@@ -91,6 +101,11 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
   useEffect(() => {
     if (!isOpen) return
     let active = true
+    checkToolUpdates()
+      .then((info) => {
+        if (active) setUpdateInfo(info)
+      })
+      .catch((err) => console.warn('Không kiểm tra được bản mới:', err))
     loadStatus()
       .then(([data, sc, cfg]) => {
         if (!active) return
@@ -256,6 +271,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
       name: 'yt-dlp',
       role: 'Engine Video & Audio',
       data: toolsData?.ytdlp,
+      update: updateInfo?.ytdlp,
       updatable: true,
       onUpdate: handleUpdateYtdlp,
       onLatest: handleLatestYtdlp,
@@ -266,6 +282,7 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
       name: 'gallery-dl',
       role: 'Engine Album & Ảnh',
       data: toolsData?.gallery_dl,
+      update: updateInfo?.galleryDl,
       updatable: true,
       onUpdate: handleUpdateGalleryDl,
       onLatest: handleLatestGalleryDl,
@@ -322,9 +339,9 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
             <button
               type="button"
               className="btn-refresh-small"
-              onClick={fetchStatus}
+              onClick={() => fetchStatus({ forceUpdateCheck: true })}
               disabled={loading}
-              title="Quét lại phiên bản & đường dẫn công cụ"
+              title="Quét lại phiên bản & đường dẫn công cụ, tra lại bản mới nhất"
             >
               <IconRefresh className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
             </button>
@@ -374,6 +391,14 @@ export default function ToolsManagerModal({ isOpen, onClose, onShowToast, onSett
                           ) : (
                             'Chưa cài đặt'
                           )}
+                        </span>
+                      )}
+                      {isInstalled && tool.update?.updateAvailable && (
+                        <span
+                          className="tool-status-badge badge-update"
+                          title={`Bản ổn định mới nhất trên PyPI: ${tool.update.latest} — bấm "Cập nhật"`}
+                        >
+                          Có bản mới v{tool.update.latest}
                         </span>
                       )}
                     </div>

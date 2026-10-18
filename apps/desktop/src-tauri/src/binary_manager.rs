@@ -207,12 +207,7 @@ impl BinaryManager {
             PathBuf::from(format!("/snap/bin/{}", name)),
             PathBuf::from(format!("bin/{}", name)),
         ];
-        for c in candidates {
-            if c.exists() {
-                return Some(c);
-            }
-        }
-        None
+        candidates.into_iter().find(|c| c.exists())
     }
 
     /// Tiện ích tìm Python executable đa nền tảng
@@ -914,6 +909,184 @@ impl BinaryManager {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Kiểm tra bản mới — chỉ BÁO, không tự cài
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Nền tảng đổi API liên tục và bản vá đến qua yt-dlp / gallery-dl mới, nhưng người
+/// dùng hiếm khi tự mở modal Công cụ để bấm "Cập nhật". Tra PyPI mỗi ngày một lần là
+/// đủ bắt kịp mà không gọi mạng mỗi lần mở app.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+const PYPI_TIMEOUT: Duration = Duration::from_secs(15);
+const UPDATE_CHECK_PACKAGES: [&str; 2] = ["yt-dlp", "gallery-dl"];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolUpdateInfo {
+    pub name: String,
+    pub installed: Option<String>,
+    /// Bản ổn định mới nhất trên PyPI; None khi chưa tra được
+    pub latest: Option<String>,
+    pub update_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolUpdateReport {
+    pub ytdlp: ToolUpdateInfo,
+    pub gallery_dl: ToolUpdateInfo,
+    /// Lần tra PyPI thành công gần nhất (unix giây)
+    pub checked_at: Option<u64>,
+}
+
+/// Phiên bản mới nhất đã tra được, lưu lại để lần mở app sau trong ngày khỏi gọi mạng.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LatestVersionCache {
+    checked_at: u64,
+    versions: HashMap<String, String>,
+}
+
+/// Lúc mở app, lượt kiểm tra nền và modal Công cụ có thể gọi cùng lúc: xếp hàng để
+/// lượt sau dùng luôn kết quả lượt trước thay vì tra PyPI lần nữa và ghi đè cache.
+fn update_check_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn update_cache_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("crwl").join("tool_updates.json"))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// "2026.09.01" → ([2026, 9, 1], ""), "1.32.12-dev" → ([1, 32, 12], "-dev").
+/// PyPI chuẩn hoá bỏ số 0 đứng đầu ("2026.9.1") nên phải so theo số, không theo chuỗi.
+fn split_version(v: &str) -> (Vec<u64>, &str) {
+    let v = v.trim().trim_start_matches('v');
+    let end = v.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(v.len());
+    let nums = v[..end].split('.').filter(|s| !s.is_empty()).filter_map(|s| s.parse().ok()).collect();
+    (nums, &v[end..])
+}
+
+impl BinaryManager {
+    /// `latest` có mới hơn `installed` không. Bản nightly của yt-dlp
+    /// ("2026.10.15.232245") mới hơn bản ổn định cùng ngày trở về trước, còn bản phát
+    /// triển "1.32.12-dev" của gallery-dl CŨ hơn bản ổn định 1.32.12.
+    pub(crate) fn is_newer_version(latest: &str, installed: &str) -> bool {
+        let (mut l, l_suffix) = split_version(latest);
+        let (mut i, i_suffix) = split_version(installed);
+        if l.is_empty() || i.is_empty() {
+            return false;
+        }
+        let len = l.len().max(i.len());
+        l.resize(len, 0);
+        i.resize(len, 0);
+        match l.cmp(&i) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => l_suffix.is_empty() && !i_suffix.is_empty(),
+        }
+    }
+
+    /// Bản ổn định mới nhất của một gói trên PyPI, đi qua proxy người dùng đã cấu hình.
+    async fn fetch_pypi_version(pkg: &str) -> Result<String, String> {
+        let mut cmd = background_command(Path::new("curl"));
+        cmd.args(["-fsSL", "--max-time", &PYPI_TIMEOUT.as_secs().to_string()])
+            .arg(format!("https://pypi.org/pypi/{pkg}/json"));
+        // Qua biến môi trường thay vì `-x`: proxy có thể chứa mật khẩu, không nên lộ
+        // trong danh sách tiến trình.
+        if let Some(proxy) = SettingsManager::proxy() {
+            cmd.env("ALL_PROXY", &proxy).env("HTTPS_PROXY", &proxy);
+        }
+        let out = run_with_timeout(cmd, PYPI_TIMEOUT + Duration::from_secs(5)).await?;
+        if !out.success {
+            return Err(format!("curl PyPI {pkg}: {}", Self::tail_lines(&out.stderr)));
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&out.stdout).map_err(|e| format!("PyPI {pkg} trả JSON lỗi: {e}"))?;
+        json["info"]["version"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("PyPI {pkg} không có trường info.version"))
+    }
+
+    /// Đọc cache; quá hạn (hoặc `force`) thì tra lại PyPI. Mất mạng vẫn trả về bản đã
+    /// biết lần trước thay vì báo lỗi — đây chỉ là thông báo phụ.
+    async fn latest_versions(force: bool) -> LatestVersionCache {
+        let _guard = update_check_lock().lock().await;
+        let path = update_cache_path();
+        let mut cache: LatestVersionCache = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        // Mốc ở tương lai (đồng hồ máy từng bị chỉnh) thì coi như hết hạn, nếu không
+        // cache sẽ "còn mới" cho tới tận mốc đó.
+        let now = unix_now();
+        let fresh = cache.checked_at <= now
+            && now - cache.checked_at < UPDATE_CHECK_INTERVAL.as_secs()
+            && UPDATE_CHECK_PACKAGES.iter().all(|p| cache.versions.contains_key(*p));
+        if fresh && !force {
+            return cache;
+        }
+
+        let (ytdlp, gallery_dl) = tokio::join!(
+            Self::fetch_pypi_version(UPDATE_CHECK_PACKAGES[0]),
+            Self::fetch_pypi_version(UPDATE_CHECK_PACKAGES[1]),
+        );
+        let mut any_ok = false;
+        for (pkg, res) in UPDATE_CHECK_PACKAGES.iter().zip([ytdlp, gallery_dl]) {
+            match res {
+                Ok(v) => {
+                    cache.versions.insert(pkg.to_string(), v);
+                    any_ok = true;
+                }
+                Err(e) => warn!("[Update check] {e}"),
+            }
+        }
+        // Chỉ ghi khi tra được: mất mạng thì lần mở app sau thử lại.
+        if any_ok {
+            cache.checked_at = unix_now();
+            if let Some(p) = path {
+                let _ = p.parent().map(std::fs::create_dir_all);
+                if let Err(e) = serde_json::to_string(&cache).map_err(|e| e.to_string()).and_then(|s| {
+                    std::fs::write(&p, s).map_err(|e| e.to_string())
+                }) {
+                    warn!("[Update check] Không ghi được cache {:?}: {e}", p);
+                }
+            }
+        }
+        cache
+    }
+
+    pub async fn check_tool_updates(force: bool) -> ToolUpdateReport {
+        let (cache, ytdlp, gallery_dl) = tokio::join!(
+            Self::latest_versions(force),
+            Self::status_of("yt-dlp"),
+            Self::status_of("gallery-dl"),
+        );
+        let info = |status: BinaryStatus| {
+            let latest = cache.versions.get(&status.name).cloned();
+            let update_available = match (&latest, &status.version) {
+                (Some(l), Some(i)) => Self::is_newer_version(l, i),
+                _ => false,
+            };
+            ToolUpdateInfo { name: status.name, installed: status.version, latest, update_available }
+        };
+        ToolUpdateReport {
+            ytdlp: info(ytdlp),
+            gallery_dl: info(gallery_dl),
+            checked_at: (cache.checked_at > 0).then_some(cache.checked_at),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,6 +1206,25 @@ mod tests {
             assert_eq!(BinaryManager::parse_version(raw).as_deref(), Some(expected), "banner: {raw:?}");
         }
         assert_eq!(BinaryManager::parse_version("   \n  "), None);
+    }
+
+    #[test]
+    fn newer_versions_are_detected_like_pypi_and_nightly_builds() {
+        let newer = |l, i| BinaryManager::is_newer_version(l, i);
+        // PyPI bỏ số 0 đứng đầu, `yt-dlp --version` thì giữ
+        assert!(newer("2026.10.10", "2026.09.01"));
+        assert!(!newer("2026.9.1", "2026.09.01"));
+        // Nightly mới hơn bản ổn định cùng ngày, nhưng cũ hơn bản ổn định ngày sau
+        assert!(!newer("2026.10.10", "2026.10.10.232245"));
+        assert!(newer("2026.10.20", "2026.10.15.232245"));
+        // Bản phát triển gallery-dl "x.y.z-dev" có trước bản ổn định x.y.z
+        assert!(newer("1.32.12", "1.32.12-dev"));
+        assert!(!newer("1.32.12", "1.32.13-dev"));
+        assert!(newer("1.32.13", "1.32.12"));
+        assert!(!newer("1.32.12", "1.32.12"));
+        // Không đọc được phiên bản thì không báo bừa
+        assert!(!newer("", "1.0"));
+        assert!(!newer("1.0", "unknown"));
     }
 
     /// pip in "Requirement already satisfied" cho các gói phụ thuộc kể cả khi vừa

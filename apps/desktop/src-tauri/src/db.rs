@@ -218,7 +218,7 @@ impl Database {
         // 2. Tạo mới user
         let user_uuid = uuid::Uuid::new_v4();
         let user_id_str = user_uuid.to_string();
-        let username = format!("desktop_{}", &device_id.chars().take(10).collect::<String>());
+        let username = format!("desktop_{}", device_id.chars().take(10).collect::<String>());
 
         let browser_name = if cfg!(windows) {
             "Windows Desktop (Tauri)"
@@ -778,7 +778,7 @@ impl Database {
                 );
             "#;
 
-            if let Ok(_) = sqlx::query(insert_sql)
+            if sqlx::query(insert_sql)
                 .bind(&media_id_str)
                 .bind(&job_id_str)
                 .bind(&job_item_id_str)
@@ -791,6 +791,7 @@ impl Database {
                 .bind(item_thumb)
                 .execute(&pool)
                 .await
+                .is_ok()
             {
                 inserted_count += 1;
             }
