@@ -534,7 +534,8 @@ impl DownloaderService {
         if host_in(&host, &["reddit.com", "redd.it"]) {
             return Some("reddit");
         }
-        if host_is(&host, "threads.net") {
+        // Threads chuyển sang threads.com (threads.net chỉ còn chuyển hướng)
+        if host_in(&host, &["threads.com", "threads.net"]) {
             return Some("threads");
         }
         if host_is(&host, "linkedin.com") {
@@ -1898,8 +1899,8 @@ impl DownloaderService {
             "https://www.tiktok.com/".to_string()
         } else if lower.contains("facebook.com") || lower.contains("fbcdn.net") {
             "https://www.facebook.com/".to_string()
-        } else if lower.contains("threads.net") {
-            "https://www.threads.net/".to_string()
+        } else if lower.contains("threads.com") || lower.contains("threads.net") {
+            "https://www.threads.com/".to_string()
         } else {
             "https://www.google.com/".to_string()
         }

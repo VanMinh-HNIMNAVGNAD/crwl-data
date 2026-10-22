@@ -337,8 +337,33 @@ class StoryExtractor(BaseExtractor):
             "hoặc cookie đăng nhập đã hết hiệu lực. Hãy thử đăng nhập lại trên trình duyệt."
         )
 
+    # ID tài khoản nằm sẵn trong HTML trang hồ sơ (gallery-dl cũng tra theo cách này)
+    _IG_PROFILE_ID_RE = re.compile(r'"profile_id"\s*:\s*"(\d+)"')
+
     def _ig_get_user_id(self, username: str, cookies: Dict[str, str]) -> Optional[str]:
-        """Lấy Instagram user_id từ username."""
+        """Lấy Instagram user_id từ username.
+
+        Đọc trang hồ sơ trước: từ 10/2026 API web_profile_info trả 429 cho mọi yêu cầu
+        không phải từ trình duyệt, nên Story Instagram luôn báo "không tìm thấy tài khoản"
+        dù API lấy story (feed/reels_media) vẫn hoạt động.
+        """
+        page_headers = {
+            **self._COMMON_HEADERS,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/141.0.0.0 Safari/537.36"
+            ),
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+        }
+        page = self._http_get(f"https://www.instagram.com/{username}/", cookies=cookies, headers=page_headers)
+        m = self._IG_PROFILE_ID_RE.search(page or "")
+        if m:
+            return m.group(1)
+
         headers = {
             **self._COMMON_HEADERS,
             "User-Agent": (

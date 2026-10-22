@@ -145,3 +145,39 @@ test('gợi ý đăng nhập không còn bắt đổi trình duyệt ở mục "
   assert.equal(res.title, 'Nội dung Reddit cần đăng nhập')
   assert.match(res.message, /Đăng nhập Reddit trên trình duyệt/)
 })
+
+test('thay đổi nền tảng 10/2026: câu thông báo của engine hiện đúng nguyên nhân', () => {
+  // dispatcher._dns_blocked_error — DNS của nhà mạng / router trỏ tên miền về 127.0.0.1
+  const dns = describeError(
+    'Mạng của bạn đang chặn www.reddit.com — DNS trả về địa chỉ 127.0.0.1 nên app không kết nối được ' +
+      '(trình duyệt vẫn vào được nếu nó dùng DNS-over-HTTPS). Hãy đổi DNS của máy hoặc router sang ' +
+      '1.1.1.1 / 8.8.8.8, hoặc đặt proxy trong Cài đặt rồi thử lại.'
+  )
+  assert.equal(dns.title, 'Mạng của bạn đang chặn www.reddit.com')
+  assert.match(dns.message, /1\.1\.1\.1/)
+
+  // gallery.GalleryDlExtractor.platform_failure — Reddit chặn khách
+  const reddit = describeError(
+    'Reddit đã chặn truy cập khi chưa đăng nhập (chính sách mới từ 10/2026). Hãy đăng nhập Reddit trên trình duyệt ' +
+      '(app tự dùng trình duyệt đang đăng nhập) rồi thử lại, hoặc mở Cookie Manager (🍪) → tab Reddit và dán cookie. ' +
+      "(Chi tiết: [reddit][error] You've been blocked by network security.)"
+  )
+  assert.match(reddit.title, /^Reddit đã chặn truy cập khi chưa đăng nhập/)
+  assert.match(reddit.message, /đăng nhập Reddit/)
+
+  // dispatcher._site_changed_error — Facebook đổi cách nạp video khi đã đăng nhập
+  const fb = describeError(
+    'Facebook vừa thay đổi cách tải dữ liệu nên yt-dlp chưa đọc được liên kết này. Mở Công cụ (⚙) → yt-dlp → ' +
+      '"Bản mới nhất" rồi thử lại; nếu vẫn lỗi thì bản sửa chưa phát hành, hãy thử lại sau vài ngày. ' +
+      '(Chi tiết: Cannot parse data; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= )'
+  )
+  assert.equal(fb.title, 'Facebook vừa thay đổi cách tải dữ liệu nên yt-dlp chưa đọc được liên kết này')
+  assert.match(fb.message, /Bản mới nhất/)
+  assert.ok(!/cần đăng nhập/.test(fb.title))
+
+  // TikTok mã 10204: video bị giới hạn theo quốc gia, không phải lỗi đăng nhập
+  const tiktok = describeError(
+    'yt-dlp extract thất bại: ERROR: [TikTok] 6748451240264420610: Your IP address is blocked from accessing this post'
+  )
+  assert.equal(tiktok.title, 'Nội dung bị chặn theo khu vực')
+})

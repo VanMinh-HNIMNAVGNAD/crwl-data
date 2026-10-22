@@ -289,6 +289,9 @@ class ProfileCrawlResult:
     stats: Optional[str] = None
     media: List[CrawlMediaItem] = field(default_factory=list)
     total_count: Optional[int] = None
+    # Kết quả chỉ là một phần của yêu cầu (vd. Instagram đổi API mục Bài viết nên chỉ
+    # quét được Reels): câu giải thích hiện cho người dùng cùng thông báo kết quả.
+    notice: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         res = {
@@ -302,6 +305,8 @@ class ProfileCrawlResult:
         }
         if self.total_count is not None:
             res["totalCount"] = self.total_count
+        if self.notice:
+            res["notice"] = self.notice
         return res
 
 

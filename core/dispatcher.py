@@ -8,10 +8,10 @@ Ported from MediaDispatcherService into standalone Python.
 import re
 from typing import Optional, Dict, Any, List
 from .models import MediaImage, MediaMetadata, ProfileCrawlResult, ResolveUrlResult, StreamFormat
-from .resolver.url_resolver import UrlResolver
+from .resolver.url_resolver import UrlResolver, dns_blocked_host
 from .extractors.base import BaseExtractor
 from .extractors.ytdlp import PlaylistUrlError, YtDlpExtractor
-from .extractors.gallery import GalleryDlExtractor
+from .extractors.gallery import GalleryDlExtractor, InstagramApiChanged, PlatformBlocked
 from .extractors.tiktok import TikTokExtractor
 from .extractors.movie import MovieExtractor
 from .extractors.direct import DirectImageExtractor
@@ -73,7 +73,7 @@ class MediaDispatcher(BaseExtractor):
         "imgur.com", "flickr.com", "deviantart.com", "artstation.com",
         "danbooru.donmai.us", "gelbooru.com", "safebooru.org",
         "pixiv.net", "redd.it",
-        "threads.net", "bsky.app", "tumblr.com",
+        "threads.com", "threads.net", "bsky.app", "tumblr.com",
         "x.com", "twitter.com",
     )
 
@@ -214,6 +214,8 @@ class MediaDispatcher(BaseExtractor):
             name = "X (Twitter)"
         elif "youtube.com" in platform_url or "youtu.be" in platform_url:
             name = "YouTube"
+        elif "threads.com" in platform_url or "threads.net" in platform_url:
+            name = "Threads"
         else:
             name = "nền tảng này"
         detail = cls._short_reason(cause)
@@ -222,6 +224,56 @@ class MediaDispatcher(BaseExtractor):
             f"Hãy đăng nhập {name} trên trình duyệt (app tự dùng trình duyệt đang đăng nhập), "
             f"hoặc vào Cookie Manager (🍪), chọn tab {name} và dán cookie."
             + (f" (Chi tiết: {detail})" if detail else "")
+        )
+
+    @staticmethod
+    def _dns_blocked_error(host: str) -> RuntimeError:
+        return RuntimeError(
+            f"Mạng của bạn đang chặn {host} — DNS trả về địa chỉ 127.0.0.1 nên app không kết nối "
+            f"được (trình duyệt vẫn vào được nếu nó dùng DNS-over-HTTPS). Hãy đổi DNS của máy hoặc "
+            f"router sang 1.1.1.1 / 8.8.8.8, hoặc đặt proxy trong Cài đặt rồi thử lại."
+        )
+
+    # yt-dlp tự ghi "please report this issue" khi extractor của một trang không còn đọc
+    # được trang đó — tức là trang vừa đổi cấu trúc, không phải lỗi của người dùng.
+    _SITE_CHANGED_RE = re.compile(
+        r"please report this issue|cannot parse data|unable to extract (?:initial state|[a-z_ ]*data)",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_site_changed_error(cls, err: Optional[Exception]) -> bool:
+        return bool(err) and bool(cls._SITE_CHANGED_RE.search(str(err)))
+
+    @classmethod
+    def _site_changed_error(cls, platform_url: str, err: Exception) -> RuntimeError:
+        name = cls._platform_name(platform_url)
+        detail = cls._short_reason(err)
+        return RuntimeError(
+            f"{name} vừa thay đổi cách tải dữ liệu nên yt-dlp chưa đọc được liên kết này. "
+            f"Mở Công cụ (⚙) → yt-dlp → \"Bản mới nhất\" rồi thử lại; nếu vẫn lỗi thì bản sửa "
+            f"chưa phát hành, hãy thử lại sau vài ngày."
+            + (f" (Chi tiết: {detail})" if detail else "")
+        )
+
+    @classmethod
+    def _platform_name(cls, url: str) -> str:
+        try:
+            _, name = UrlResolver.detect_platform(url)
+        except Exception:
+            name = None
+        return name if name and name not in ("Web Chung",) else "Trang này"
+
+    @staticmethod
+    def _normalize_bilibili_url(url: str) -> str:
+        """`bilibili.com/en/video/BV...` (giao diện tiếng Anh, 10/2026) → `/video/BV...`.
+
+        yt-dlp chỉ nhận dạng `/video/`: link `/en/` rơi vào bộ đọc trang chung và trả về
+        một "định dạng" duy nhất là chính trang HTML — một video giả không tải được.
+        """
+        return re.sub(
+            r"^(https?://(?:www\.|m\.)?bilibili\.com)/[a-z]{2}(?:-[a-z]{2})?/(video/)",
+            r"\1/\2", url.strip(), flags=re.IGNORECASE,
         )
 
     @staticmethod
@@ -243,6 +295,12 @@ class MediaDispatcher(BaseExtractor):
         resolved = self.resolver.resolve_url(trimmed)
         target_url = resolved.resolved_url if resolved.is_shortened else trimmed
         target_url = self._normalize_facebook_single_url(target_url)
+        target_url = self._normalize_bilibili_url(target_url)
+
+        # 1. Tên miền bị DNS chặn: mọi engine đều chỉ nhận "Connection refused"
+        blocked = dns_blocked_host(target_url)
+        if blocked:
+            raise self._dns_blocked_error(blocked)
 
         # 2. Story (Facebook / Instagram) → ưu tiên StoryExtractor chuyên biệt
         #    Story CDN URL hết hạn cực nhanh (5-15 phút) nên phải xử lý ngay,
@@ -337,14 +395,24 @@ class MediaDispatcher(BaseExtractor):
                     res = self.gallery.extract_gallery(target_url, browser=browser)
                     self._fill_video_posters(res, target_url, browser)
                     return self._enhance_metadata(res, target_url)
+                except PlatformBlocked:
+                    raise
                 except Exception as gal_err:
+                    # "Cannot parse data" của Facebook thường là trang chặn khách — nhưng
+                    # khi ĐÃ có phiên đăng nhập thì đó là Facebook đổi cách nạp video
+                    # (10/2026: dữ liệu video không còn nằm trong HTML). Bảo người dùng
+                    # đăng nhập lại là sai hướng.
+                    fb_site_changed = (
+                        is_fb and self._is_site_changed_error(yt_err)
+                        and has_login_session(target_url, browser)
+                    )
                     # Nếu cả 2 đều lỗi auth -> trả thông báo đăng nhập rõ ràng
-                    if is_fb and (self._is_auth_error(yt_err) or self._is_auth_error(gal_err)):
+                    if is_fb and not fb_site_changed and (self._is_auth_error(yt_err) or self._is_auth_error(gal_err)):
                         raise self._make_login_error(target_url, yt_err)
                     # Video giới hạn tuổi / riêng tư / YouTube đòi "xác nhận không phải bot":
                     # trang vẫn có ảnh bìa nên web_scraper từng trả "thành công" một album
                     # chỉ gồm ảnh bìa, che mất lỗi thật là cần cookie đăng nhập.
-                    if self._is_auth_error(yt_err):
+                    if self._is_auth_error(yt_err) and not fb_site_changed:
                         raise self._make_login_error(target_url, yt_err)
                     self.warn(f"gallery-dl fallback cũng thất bại ({gal_err}), web_scraper fallback...")
                     try:
@@ -355,6 +423,8 @@ class MediaDispatcher(BaseExtractor):
                             return self._enhance_metadata(res, target_url)
                     except Exception:
                         pass
+                if self._is_site_changed_error(yt_err):
+                    raise self._site_changed_error(target_url, yt_err) from yt_err
                 raise yt_err
 
         # 6. Nền tảng gallery/album -> ưu tiên gallery-dl
@@ -378,6 +448,10 @@ class MediaDispatcher(BaseExtractor):
 
                 self._fill_video_posters(res, target_url, browser)
                 return self._enhance_metadata(res, target_url)
+            except PlatformBlocked:
+                # Nền tảng chặn theo chính sách (Reddit chặn khách...): yt-dlp và đọc trang
+                # chỉ ra cùng lỗi hoặc một album avatar giả.
+                raise
             except Exception as gal_err:
                 # Nếu lỗi auth đối với platform yêu cầu đăng nhập -> trả thông báo rõ ràng
                 if needs_auth and self._is_auth_error(gal_err):
@@ -631,6 +705,10 @@ class MediaDispatcher(BaseExtractor):
         target_url = self._normalize_x_url(target_url)
         target_url = self._normalize_instagram_url(target_url, media_type)
 
+        blocked = dns_blocked_host(target_url)
+        if blocked:
+            raise self._dns_blocked_error(blocked)
+
         is_youtube = clean_hint == "youtube" or any(d in target_url for d in ("youtube.com", "youtu.be"))
         is_tiktok = clean_hint == "tiktok" or "tiktok.com" in target_url
         is_soundcloud = clean_hint == "soundcloud" or "soundcloud.com" in target_url
@@ -709,10 +787,14 @@ class MediaDispatcher(BaseExtractor):
                 return res
             # gallery-dl thành công nhưng trả về rỗng (không có exception)
             # → lưu lại để fallback bên dưới xử lý
-            gal_err_saved = RuntimeError(
-                GalleryDlExtractor.instagram_outdated_message(target_url)
-                or f"gallery-dl không tìm thấy media từ {target_url}"
+            gal_err_saved = self.gallery.empty_crawl_error(target_url, browser)
+        except InstagramApiChanged as ig_err:
+            gal_err_saved = ig_err
+            reels = self._instagram_reels_fallback(
+                target_url, ig_err, limit, media_type, browser, range_start, range_end
             )
+            if reels:
+                return reels
         except Exception as gal_err:
             gal_err_saved = gal_err
 
@@ -733,6 +815,50 @@ class MediaDispatcher(BaseExtractor):
         if gal_err_saved:
             raise gal_err_saved
         raise RuntimeError(f"Không tìm thấy tệp phương tiện nào từ {target_url}")
+
+    # Mục Bài viết / Ảnh của một tài khoản Instagram (cùng dùng truy vấn danh sách bài đăng)
+    _IG_FEED_URL_RE = re.compile(r"^(https?://(?:www\.)?instagram\.com/[^/?#]+)/(?:posts|photos)/?$", re.IGNORECASE)
+
+    def _instagram_reels_fallback(
+        self,
+        url: str,
+        err: Exception,
+        limit: int,
+        media_type: str,
+        browser: Optional[str],
+        range_start: Optional[int],
+        range_end: Optional[int],
+    ) -> Optional[ProfileCrawlResult]:
+        """Mục Bài viết lỗi vì Instagram đổi API → quét tạm mục Reels (dùng truy vấn riêng).
+
+        10/2026: truy vấn danh sách bài đăng thiếu biến bắt buộc mới, trong khi truy vấn
+        Reels vẫn chạy. Trả None khi không áp dụng được (người dùng chỉ cần ảnh...).
+        """
+        m = self._IG_FEED_URL_RE.match(url.split("?")[0])
+        if not m or media_type == "image":
+            return None
+        reels_url = f"{m.group(1)}/reels/"
+        self.warn(f"Mục Bài viết Instagram lỗi ({err}) → quét tạm mục Reels: {reels_url}")
+        try:
+            res = self.gallery.crawl_profile(
+                reels_url,
+                limit=limit,
+                media_type=media_type,
+                browser=browser,
+                range_start=range_start,
+                range_end=range_end,
+            )
+        except Exception as reels_err:
+            self.warn(f"Quét Reels cũng thất bại: {reels_err}")
+            return None
+        if not res.media:
+            return None
+        res.notice = (
+            "Instagram vừa đổi API của mục Bài viết nên tạm thời chỉ quét được Reels (video) — ảnh và "
+            "bài nhiều ảnh chưa lấy được. Sau 1-2 ngày, mở Công cụ (⚙) → gallery-dl → \"Bản mới nhất\" "
+            "rồi quét lại để lấy đủ."
+        )
+        return res
 
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers

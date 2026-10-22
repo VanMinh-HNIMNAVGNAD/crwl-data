@@ -4,6 +4,7 @@ Ported from UrlResolverService to pure Python.
 Expands shortened URLs, cleans tracking params, and identifies target platforms.
 """
 
+import os
 import re
 import ipaddress
 import socket
@@ -80,7 +81,8 @@ SUPPORTED_PLATFORMS = [
     {
         "id": "threads",
         "name": "Threads",
-        "domains": ["threads.net"],
+        # Threads chuyển từ threads.net sang threads.com (threads.net chỉ còn chuyển hướng)
+        "domains": ["threads.com", "threads.net"],
     },
     {
         "id": "bluesky",
@@ -135,6 +137,39 @@ def is_direct_stream_url(url: str) -> bool:
     except Exception:
         path = url
     return bool(STREAM_SEGMENT_RE.search(path) or STREAM_PATH_RE.search(path))
+
+
+# Hậu tố của tên máy trong mạng nội bộ: trỏ về 127.0.0.1 là chuyện bình thường
+_LOCAL_HOST_SUFFIXES = (".local", ".localhost", ".lan", ".home", ".internal", ".test", ".arpa", ".localdomain")
+
+
+def dns_blocked_host(url: str) -> Optional[str]:
+    """Tên miền công khai mà DNS của máy trả về địa chỉ loopback / 0.0.0.0, hoặc None.
+
+    Đó là dấu hiệu tên miền bị DNS chặn (nhà mạng, router, AdGuard/Pi-hole...): vd.
+    www.reddit.com → 127.0.0.1 trong khi trình duyệt dùng DNS-over-HTTPS vẫn vào được.
+    Trước đây yt-dlp, gallery-dl, đọc HTML, Chromium lần lượt thất bại với "Connection
+    refused" (mất 10-40 giây) rồi app báo một lỗi chẳng liên quan.
+    """
+    # Có proxy thì tên miền do proxy phân giải: DNS của máy không còn liên quan
+    if any(os.environ.get(k) for k in ("CRWL_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")):
+        return None
+    host = UrlResolver.parse_hostname(url)
+    if not host or "." not in host or host.endswith(_LOCAL_HOST_SUFFIXES):
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None  # địa chỉ IP gõ thẳng: người dùng cố ý
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        addresses = {ipaddress.ip_address(info[4][0].split("%", 1)[0]) for info in infos}
+    except (OSError, UnicodeError, ValueError):
+        return None  # không phân giải được: để bước tải báo lỗi mạng như thường
+    if addresses and all(a.is_loopback or a.is_unspecified for a in addresses):
+        return host
+    return None
 
 
 GENERIC_SHORTENER_DOMAINS = [

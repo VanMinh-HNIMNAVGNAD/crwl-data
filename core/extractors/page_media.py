@@ -36,9 +36,9 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
-from .base import BaseExtractor
+from .base import SOCIAL_DECOR_URL_PARTS, BaseExtractor
 from ..cancellation import cap_timeout, raise_if_cancelled
-from ..cookies.browser_cookies import get_browser_cookies_txt
+from ..cookies.browser_cookies import expiry_seconds, get_browser_cookies_txt
 from ..models import MediaImage, MediaMetadata, StreamFormat
 
 
@@ -110,7 +110,7 @@ _JUNK_URL_PARTS = (
     # Avatar mặc định của người bình luận trên Reddit: trang bài viết khi chưa đăng nhập
     # từng ra "7 ảnh và 1 video" — 7 ảnh là avatar_default_0..7.png.
     "redditstatic.com/avatars/",
-)
+) + SOCIAL_DECOR_URL_PARTS
 # class của <img> trang trí: emoji / mặt cười chèn trong chữ, avatar người đăng, icon.
 # Emoji của diễn đàn (XenForo "smilie") khai báo 72x72 nên lọt bộ lọc theo kích thước.
 _DECOR_CLASS_WORDS = frozenset({
@@ -1399,10 +1399,8 @@ def load_cookie_jar(path: str) -> Optional[http.cookiejar.CookieJar]:
         domain = domain.strip()
         if not domain or not name:
             continue
-        try:
-            exp = int(float(expires)) if expires.strip() else 0
-        except ValueError:
-            exp = 0
+        # Tệp cookie dán tay / xuất từ Firefox có thể ghi hạn bằng mili-giây
+        exp = expiry_seconds(expires.strip())
         domain_specified = domain.startswith(".") or flag.upper() == "TRUE"
         cookie = http.cookiejar.Cookie(
             version=0, name=name, value=value, port=None, port_specified=False,

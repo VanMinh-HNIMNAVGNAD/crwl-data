@@ -233,7 +233,8 @@ export function detectPlatform(url = '') {
     }
   }
 
-  if (isMatchingDomain(hostname, 'threads.net')) return 'threads'
+  // Threads chuyển sang threads.com (threads.net chỉ còn chuyển hướng)
+  if (isMatchingDomain(hostname, 'threads.com') || isMatchingDomain(hostname, 'threads.net')) return 'threads'
   if (isMatchingDomain(hostname, 'bsky.app')) return 'bluesky'
   if (isMatchingDomain(hostname, 'pixiv.net') || isMatchingDomain(hostname, 'pixiv.me')) return 'pixiv'
   if (isMatchingDomain(hostname, 'deviantart.com')) return 'deviantart'

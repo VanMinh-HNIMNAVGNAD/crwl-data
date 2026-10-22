@@ -851,6 +851,12 @@ class PlaywrightStreamSniffer(BaseExtractor):
         skip_patterns = [
             "google-analytics", "gtag", "pixel.gif", "beacon",
             "analytics", "telemetry", "stats.", "/ping",
+            # Tài nguyên giao diện của Facebook/Instagram (âm báo .mp3/.ogg, mô-đun
+            # "oz-player/manifests") và web app manifest — trang video Facebook từng
+            # ra cả chục "luồng" kiểu này, không cái nào là video.
+            "/rsrc.php/", "/data/manifest", "manifest.json", ".webmanifest",
+            # Mẩu regex / JSON thoát ký tự nằm trong mã JS, không phải URL thật
+            "(?:", "^http", "\\/",
         ]
         if any(s in lower for s in skip_patterns):
             return False

@@ -12,7 +12,7 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 from typing import Optional, List, Dict, Any, Tuple
 
-from .base import BaseExtractor
+from .base import SOCIAL_DECOR_URL_PARTS, BaseExtractor
 from ..models import MediaMetadata, MediaImage, StreamFormat
 from ..cancellation import cap_timeout
 
@@ -354,6 +354,9 @@ class WebScraperExtractor(BaseExtractor):
             if raw_img and not raw_img.startswith("data:"):
                 full_img = urljoin(target_url, raw_img)
                 # Bắt buộc: Phải là URL ảnh hợp lệ, tuyệt đối không nhận .m3u8, .m4s, .ts, .mp4
+                # og:image của trang mạng xã hội khi bài không có ảnh là avatar người đăng.
+                if any(p in full_img.lower() for p in SOCIAL_DECOR_URL_PARTS):
+                    continue
                 if self.is_thumbnail_candidate(full_img) and full_img not in seen_img_urls:
                     seen_img_urls.add(full_img)
                     ordered_img_urls.append(full_img)
@@ -386,7 +389,7 @@ class WebScraperExtractor(BaseExtractor):
                 "pixel", "tracking", "counter", "yandex.ru/watch", "google-analytics",
                 "badge", "spinner", "loader", "blank.gif", "transparent.png"
             ]
-            if any(p in lower_src for p in skip_patterns):
+            if any(p in lower_src for p in skip_patterns) or any(p in lower_src for p in SOCIAL_DECOR_URL_PARTS):
                 continue
 
             # Bắt buộc: Loại trừ nếu URL là video, manifest (.m3u8, .mpd) hay segment (.m4s, .ts)

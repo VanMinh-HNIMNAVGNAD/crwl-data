@@ -7,7 +7,7 @@
 ![Rust](https://img.shields.io/badge/Rust-2021%20Edition-black?style=for-the-badge&logo=rust&logoColor=white)
 ![React](https://img.shields.io/badge/React-19.x-61DAFB?style=for-the-badge&logo=react&logoColor=black)
 ![Vite](https://img.shields.io/badge/Vite-6.x-646CFF?style=for-the-badge&logo=vite&logoColor=white)
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-Local%20DB-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
 ![License](https://img.shields.io/badge/license-ISC-green.svg?style=for-the-badge)
 
@@ -139,7 +139,7 @@ Trước khi chạy hoặc build dự án, hãy đảm bảo máy tính đã cà
 | **Node.js** | `>= 22.12.0` | Khuyên dùng bản LTS mới nhất |
 | **pnpm** | `>= 9.15.5` | Package manager chính thức của repo |
 | **Rust & Cargo** | `Stable (>= 1.77)` | Trình biên dịch mã nguồn Tauri |
-| **Python** | `>= 3.10` | Lõi xử lý bóc tách sidecar |
+| **Python** | `>= 3.11` | Lõi xử lý bóc tách sidecar (yt-dlp đã bỏ hỗ trợ Python 3.10 từ sau bản 2026.10.21) |
 | **FFmpeg** | Bản mới nhất | Ghép luồng âm thanh/hình ảnh & trích xuất MP3 |
 
 ### Cài đặt thư viện hệ thống cần thiết (Dành cho Linux):
@@ -288,6 +288,10 @@ Hệ thống được cấu thành từ 3 thành phần chính: **Frontend**, **
 | `yt-dlp: command not found` | Chưa cài đặt hoặc chưa nhận binary trong PATH | Cài đặt: `pip install -U yt-dlp` hoặc dùng tính năng **Tools Manager** trong app |
 | Video tải về bị mất tiếng | Thiếu bộ giải mã FFmpeg | Cài đặt: `sudo apt install ffmpeg` |
 | YouTube yêu cầu n-sig challenge | Thuật toán YouTube cập nhật mới | Mở **Tools Manager** bấm **Cập nhật yt-dlp** lên bản phát hành mới nhất |
+| "Mạng của bạn đang chặn www.reddit.com" | DNS của nhà mạng / router trỏ tên miền về `127.0.0.1` (trình duyệt dùng DNS-over-HTTPS nên vẫn vào được) | Đổi DNS của máy hoặc router sang `1.1.1.1` / `8.8.8.8`, hoặc đặt proxy trong Cài đặt |
+| "Reddit đã chặn truy cập khi chưa đăng nhập" | Từ 10/2026 Reddit chặn khách gọi API `.json` | Đăng nhập Reddit trên trình duyệt (app tự dùng trình duyệt đang đăng nhập) hoặc dán cookie vào Cookie Manager 🍪 |
+| Quét Instagram báo cần đăng nhập / chỉ ra Reels | Từ 10/2026 Instagram chỉ cho tài khoản đã đăng nhập xem danh sách bài; truy vấn mục Bài viết đổi liên tục | Đăng nhập Instagram trên trình duyệt; khi app báo "chỉ quét được Reels", sau 1-2 ngày bấm **Công cụ → gallery-dl → Bản mới nhất** rồi quét lại |
+| "Facebook vừa thay đổi cách tải dữ liệu" | Dữ liệu video không còn nằm trong HTML, yt-dlp chưa theo kịp (lỗi `Cannot parse data`) | **Công cụ → yt-dlp → Bản mới nhất** (nightly), thử lại sau vài ngày nếu bản sửa chưa phát hành |
 
 ---
 
@@ -330,6 +334,7 @@ Quá trình build tự động thực hiện:
 | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | Chạy unit test của tầng Rust |
 | `python3 -m pytest scripts/test_page_media.py scripts/test_any_site_post.py` | Kiểm thử lấy hết ảnh/video của bài viết trên trang bất kỳ (offline, máy chủ cục bộ; ca cần Chromium tự bỏ qua nếu chưa cài Playwright) |
 | `python3 -m pytest scripts/test_hang_crash_leak_guards.py` | Kiểm thử treo / crash / rò rỉ: regex quay lui trên trang lớn, IPC sai định dạng, chạy engine thật nhiều vòng (RAM, file descriptor, luồng, tiến trình con, tệp tạm), huỷ giữa chừng, Chromium không để lại tiến trình / tệp tạm |
+| `python3 -m pytest scripts/test_platform_changes.py scripts/test_platform_policy_2026_10.py` | Kiểm thử thay đổi phía nền tảng (offline): Reddit chặn khách, Instagram đổi API / bắt đăng nhập, Facebook "Cannot parse data", Threads chuyển sang threads.com, DNS chặn tên miền, cookie Firefox tính hạn bằng mili-giây, avatar lọt thành ảnh của bài |
 
 ---
 

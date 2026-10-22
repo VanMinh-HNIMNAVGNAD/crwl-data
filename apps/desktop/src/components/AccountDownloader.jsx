@@ -357,10 +357,11 @@ function AccountDownloader({ onShowToast, dlOptions = {} }) {
         setProfileResult(resultData)
         setResultSeq((seq) => seq + 1)
         setSelectedBatchIds({})
+        // `notice`: chỉ quét được một phần (vd. Instagram đổi API mục Bài viết → chỉ có Reels)
         onShowToast?.({
-          type: 'success',
+          type: resultData.notice ? 'warning' : 'success',
           title: `Đã quét được ${resultData.media.length} tệp`,
-          message: resultData.name ? `Từ tài khoản ${resultData.name}` : '',
+          message: resultData.notice || (resultData.name ? `Từ tài khoản ${resultData.name}` : ''),
         })
       } else {
         onShowToast?.({

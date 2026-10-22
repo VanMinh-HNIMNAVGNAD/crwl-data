@@ -45,7 +45,7 @@ EXCLUDED_SOCIAL_DOMAINS = [
     "instagram.com", "instagr.am", "tiktok.com", "twitter.com", "x.com",
     "pinterest.com", "pin.it", "reddit.com", "redd.it", "soundcloud.com",
     "twitch.tv", "dailymotion.com", "dai.ly", "bilibili.com", "b23.tv",
-    "threads.net", "bsky.app",
+    "threads.com", "threads.net", "bsky.app",
 ]
 
 # Dấu hiệu stream URL trong HTML/JS (theo thứ tự ưu tiên).

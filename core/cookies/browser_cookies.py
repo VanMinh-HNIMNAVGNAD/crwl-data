@@ -94,6 +94,30 @@ def _host_matches(host: str, base_domain: str) -> bool:
     return h == base_domain or h.endswith("." + base_domain)
 
 
+# Mốc hạn cookie lớn nhất còn là GIÂY (năm 5138). Lớn hơn nữa là mili-giây.
+_MAX_EXPIRY_SECONDS = 10 ** 11
+
+
+def expiry_seconds(expiry) -> int:
+    """Hạn cookie → giây Unix (0 = cookie phiên).
+
+    Từ Firefox 142 (cookies.sqlite schema 16) cột `expiry` tính bằng MILI-GIÂY. Trước
+    đây giá trị đó được ghi nguyên vào tệp Netscape: Chromium chạy ngầm (Playwright)
+    từ chối CẢ lô cookie ("Cookie should have a valid expires") nên trang cần đăng
+    nhập bị đọc như khách. Xét theo độ lớn thay vì số phiên bản schema: mốc giây chỉ
+    vượt 10^11 sau năm 5138, còn mốc mili-giây thì đã vượt từ 1973.
+    """
+    try:
+        value = int(float(expiry or 0))
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0:
+        return 0
+    if value > _MAX_EXPIRY_SECONDS:
+        value //= 1000
+    return value
+
+
 def _rows_have_login(rows, base_domain: str) -> bool:
     """Các cookie này có chứa phiên đăng nhập của `base_domain` không."""
     wanted = _AUTH_COOKIES.get(base_domain)
@@ -390,7 +414,7 @@ class BrowserCookieExporter:
             for host, path, is_sec, exp, name, val in rows:
                 domain_flag = "TRUE" if host.startswith(".") else "FALSE"
                 sec_flag = "TRUE" if is_sec else "FALSE"
-                exp_unix = exp if exp else 0
+                exp_unix = expiry_seconds(exp)
                 cookies_out.append((host, domain_flag, path, sec_flag, exp_unix, name, val or ""))
 
         return cookies_out
@@ -522,6 +546,7 @@ _DOMAIN_TO_PLATFORM = {
     "pinterest.com": "pinterest",
     "pin.it": "pinterest",
     "threads.net": "threads",
+    "threads.com": "threads",
     "bilibili.com": "bilibili",
     "soundcloud.com": "soundcloud",
     "tumblr.com": "tumblr",

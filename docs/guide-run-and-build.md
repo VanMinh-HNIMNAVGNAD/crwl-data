@@ -97,7 +97,7 @@ Tauri yêu cầu một số thư viện C/GTK để render giao diện và tươ
   ```
 
 ### 2.4. Python & Các Tiện Ích Media
-- **Python**: `>= 3.10`
+- **Python**: `>= 3.11` (yt-dlp đã bỏ hỗ trợ Python 3.10)
   ```bash
   sudo apt install -y python3 python3-pip python3-venv ffmpeg
   ```

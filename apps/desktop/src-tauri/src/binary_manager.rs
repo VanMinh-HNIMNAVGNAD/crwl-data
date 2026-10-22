@@ -690,6 +690,49 @@ impl BinaryManager {
     /// lên `--break-system-packages`: binary của pipx/venv hay của apt không được
     /// nâng cấp, thay vào đó một bản thứ hai bị cài lạc vào site-packages của người dùng.
     async fn upgrade_in_place(pkg: &str, kind: &InstallKind) -> Result<String, String> {
+        let result = Self::upgrade_package(pkg, kind).await;
+        if result.is_ok() {
+            Self::refresh_certifi(pkg, kind).await;
+        }
+        result
+    }
+
+    /// Nâng `certifi` (kho chứng chỉ gốc mà requests / yt-dlp dùng cho HTTPS) trong CÙNG
+    /// môi trường với công cụ. `pipx upgrade` / `pip install -U <gói>` không nâng gói phụ
+    /// thuộc đã thoả yêu cầu, nên certifi cũ ở lại mãi — bản trước 2026.10.18 còn tin
+    /// chứng chỉ gốc emSign đã lộ khoá (GHSA-6q48-6c7w-9gw2, nguy cơ bị nghe lén/giả mạo).
+    /// Lỗi ở bước này chỉ ghi log, không làm hỏng lượt cập nhật.
+    async fn refresh_certifi(pkg: &str, kind: &InstallKind) {
+        let base = ["install", "-U", "certifi"];
+        let outcome = match kind {
+            InstallKind::Pipx => {
+                let Some(pipx) = Self::find_binary("pipx") else { return };
+                let mut cmd = background_command(&pipx);
+                cmd.args(["runpip", pkg])
+                    .args(base)
+                    .args(["--disable-pip-version-check", "--no-input"]);
+                run_with_timeout(cmd, UPDATE_TIMEOUT).await
+            }
+            InstallKind::Venv(python) => Self::run_pip(python, &base).await,
+            InstallKind::PipUser(python) => {
+                let user = ["install", "-U", "--user", "certifi"];
+                match Self::run_pip(python, &user).await {
+                    Ok(out) if !out.success && out.combined().contains("externally-managed-environment") => {
+                        Self::run_pip(python, &["install", "-U", "--user", "--break-system-packages", "certifi"]).await
+                    }
+                    other => other,
+                }
+            }
+            InstallKind::Unmanaged => return,
+        };
+        match outcome {
+            Ok(out) if out.success => info!("Đã cập nhật certifi trong môi trường của {pkg}"),
+            Ok(out) => warn!("Không cập nhật được certifi cho {pkg}: {}", Self::tail_lines(&out.combined())),
+            Err(e) => warn!("Không cập nhật được certifi cho {pkg}: {e}"),
+        }
+    }
+
+    async fn upgrade_package(pkg: &str, kind: &InstallKind) -> Result<String, String> {
         match kind {
             InstallKind::Pipx => Self::pipx_upgrade(pkg).await,
             InstallKind::Venv(python) => {
@@ -773,7 +816,19 @@ impl BinaryManager {
                 Self::unmanaged_hint("gallery-dl", &gallery_path, "")
             ));
         }
-        let msg = Self::upgrade_in_place("gallery-dl", &kind).await?;
+        // Đang dùng bản phát triển: pip coi "1.33.0-dev" mới hơn mọi bản 1.32.x nên
+        // `pip install -U` không làm gì, dù bản đó có thể cũ hơn bản ổn định mới nhất
+        // (xem is_stale_dev_build). Cài lại bản phát triển mới nhất thay vào.
+        let is_dev = Self::get_version(&gallery_path)
+            .await
+            .map(|v| split_version(&v).1.to_ascii_lowercase().contains("dev"))
+            .unwrap_or(false);
+        let msg = if is_dev {
+            Self::install_latest_build("gallery-dl", GALLERY_DL_DEV_SOURCE, &["--force-reinstall", "--no-deps"], &kind)
+                .await?
+        } else {
+            Self::upgrade_in_place("gallery-dl", &kind).await?
+        };
         Ok(Self::with_version(msg, &gallery_path).await)
     }
 
@@ -797,6 +852,15 @@ impl BinaryManager {
     }
 
     async fn install_latest_build(pkg: &str, spec: &str, extra: &[&str], kind: &InstallKind) -> Result<String, String> {
+        // `--no-deps` của bản phát triển gallery-dl càng không đụng tới certifi
+        let result = Self::install_latest_package(pkg, spec, extra, kind).await;
+        if result.is_ok() {
+            Self::refresh_certifi(pkg, kind).await;
+        }
+        result
+    }
+
+    async fn install_latest_package(pkg: &str, spec: &str, extra: &[&str], kind: &InstallKind) -> Result<String, String> {
         match kind {
             InstallKind::Pipx => {
                 let Some(pipx) = Self::find_binary("pipx") else {
@@ -944,6 +1008,10 @@ pub struct ToolUpdateReport {
 struct LatestVersionCache {
     checked_at: u64,
     versions: HashMap<String, String>,
+    /// Lúc bản ổn định đó được đăng lên PyPI (unix giây) — để biết một bản phát triển
+    /// "-dev" đang cài có cũ hơn nó không.
+    #[serde(default)]
+    uploaded: HashMap<String, u64>,
 }
 
 /// Lúc mở app, lượt kiểm tra nền và modal Công cụ có thể gọi cùng lúc: xếp hàng để
@@ -993,8 +1061,45 @@ impl BinaryManager {
         }
     }
 
-    /// Bản ổn định mới nhất của một gói trên PyPI, đi qua proxy người dùng đã cấu hình.
-    async fn fetch_pypi_version(pkg: &str) -> Result<String, String> {
+    /// Bản phát triển ("1.33.0-dev") được cài TRƯỚC khi bản ổn định mới nhất ra đời?
+    ///
+    /// Số hiệu "-dev" luôn là bản kế tiếp (1.33.0-dev > 1.32.17) nên phép so số luôn coi
+    /// nó là mới nhất — trong khi bản cài từ mã nguồn hôm 16/10 thiếu các bản vá
+    /// Instagram có trong 1.32.17 (17/10). So thời điểm cài với lúc phát hành thay vì số.
+    pub(crate) fn is_stale_dev_build(installed: &str, installed_at: Option<u64>, latest_uploaded: Option<u64>) -> bool {
+        let (_, suffix) = split_version(installed);
+        let is_dev = suffix.to_ascii_lowercase().contains("dev");
+        matches!((installed_at, latest_uploaded), (Some(at), Some(up)) if is_dev && at < up)
+    }
+
+    /// Lúc công cụ được cài / cập nhật: pip viết lại script chạy (hoặc tệp chạy) mỗi lần cài.
+    fn install_time(path: &str) -> Option<u64> {
+        let real = std::fs::canonicalize(path).ok()?;
+        let modified = std::fs::metadata(real).ok()?.modified().ok()?;
+        modified.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_secs())
+    }
+
+    /// "2026-10-17T14:19:14.123456Z" → unix giây (đủ chính xác cho việc so ngày cài).
+    fn parse_iso8601_utc(s: &str) -> Option<u64> {
+        let date = s.get(0..10)?;
+        let time = s.get(11..19)?;
+        let mut d = date.split('-').map(|x| x.parse::<i64>());
+        let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+        let mut t = time.split(':').map(|x| x.parse::<i64>());
+        let (hh, mm, ss) = (t.next()?.ok()?, t.next()?.ok()?, t.next()?.ok()?);
+        // Số ngày kể từ 1970-01-01 (thuật toán days_from_civil)
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
+    }
+
+    /// Bản ổn định mới nhất của một gói trên PyPI (kèm lúc phát hành), đi qua proxy
+    /// người dùng đã cấu hình.
+    async fn fetch_pypi_release(pkg: &str) -> Result<(String, Option<u64>), String> {
         let mut cmd = background_command(Path::new("curl"));
         cmd.args(["-fsSL", "--max-time", &PYPI_TIMEOUT.as_secs().to_string()])
             .arg(format!("https://pypi.org/pypi/{pkg}/json"));
@@ -1009,10 +1114,16 @@ impl BinaryManager {
         }
         let json: serde_json::Value =
             serde_json::from_str(&out.stdout).map_err(|e| format!("PyPI {pkg} trả JSON lỗi: {e}"))?;
-        json["info"]["version"]
+        let version = json["info"]["version"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| format!("PyPI {pkg} không có trường info.version"))
+            .ok_or_else(|| format!("PyPI {pkg} không có trường info.version"))?;
+        // `urls` = các tệp của chính bản mới nhất
+        let uploaded = json["urls"]
+            .as_array()
+            .and_then(|files| files.iter().filter_map(|f| f["upload_time_iso_8601"].as_str()).min())
+            .and_then(Self::parse_iso8601_utc);
+        Ok((version, uploaded))
     }
 
     /// Đọc cache; quá hạn (hoặc `force`) thì tra lại PyPI. Mất mạng vẫn trả về bản đã
@@ -1037,14 +1148,18 @@ impl BinaryManager {
         }
 
         let (ytdlp, gallery_dl) = tokio::join!(
-            Self::fetch_pypi_version(UPDATE_CHECK_PACKAGES[0]),
-            Self::fetch_pypi_version(UPDATE_CHECK_PACKAGES[1]),
+            Self::fetch_pypi_release(UPDATE_CHECK_PACKAGES[0]),
+            Self::fetch_pypi_release(UPDATE_CHECK_PACKAGES[1]),
         );
         let mut any_ok = false;
         for (pkg, res) in UPDATE_CHECK_PACKAGES.iter().zip([ytdlp, gallery_dl]) {
             match res {
-                Ok(v) => {
+                Ok((v, uploaded)) => {
                     cache.versions.insert(pkg.to_string(), v);
+                    match uploaded {
+                        Some(t) => cache.uploaded.insert(pkg.to_string(), t),
+                        None => cache.uploaded.remove(*pkg),
+                    };
                     any_ok = true;
                 }
                 Err(e) => warn!("[Update check] {e}"),
@@ -1073,8 +1188,12 @@ impl BinaryManager {
         );
         let info = |status: BinaryStatus| {
             let latest = cache.versions.get(&status.name).cloned();
+            let installed_at = status.path.as_deref().and_then(Self::install_time);
             let update_available = match (&latest, &status.version) {
-                (Some(l), Some(i)) => Self::is_newer_version(l, i),
+                (Some(l), Some(i)) => {
+                    Self::is_newer_version(l, i)
+                        || Self::is_stale_dev_build(i, installed_at, cache.uploaded.get(&status.name).copied())
+                }
                 _ => false,
             };
             ToolUpdateInfo { name: status.name, installed: status.version, latest, update_available }
@@ -1225,6 +1344,27 @@ mod tests {
         // Không đọc được phiên bản thì không báo bừa
         assert!(!newer("", "1.0"));
         assert!(!newer("1.0", "unknown"));
+    }
+
+    /// 10/2026: gallery-dl "1.33.0-dev" cài hôm 16/10 bị coi là mới nhất trong khi bản
+    /// 1.32.17 (17/10) mới có bản vá Instagram — so theo thời điểm, không theo số.
+    #[test]
+    fn dev_builds_older_than_the_latest_release_are_reported() {
+        let release = BinaryManager::parse_iso8601_utc("2026-10-17T14:19:14.123456Z").unwrap();
+        assert_eq!(release, 1_792_246_754);
+        let before = release - 86_400;
+        let after = release + 86_400;
+        assert!(BinaryManager::is_stale_dev_build("1.33.0-dev", Some(before), Some(release)));
+        assert!(!BinaryManager::is_stale_dev_build("1.33.0-dev", Some(after), Some(release)));
+        // Bản ổn định / nightly của yt-dlp đã so theo số ở is_newer_version
+        assert!(!BinaryManager::is_stale_dev_build("1.32.16", Some(before), Some(release)));
+        assert!(!BinaryManager::is_stale_dev_build("2026.10.21.233146", Some(before), Some(release)));
+        // Thiếu một trong hai mốc thời gian thì không báo bừa
+        assert!(!BinaryManager::is_stale_dev_build("1.33.0-dev", None, Some(release)));
+        assert!(!BinaryManager::is_stale_dev_build("1.33.0-dev", Some(before), None));
+        assert_eq!(BinaryManager::parse_iso8601_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(BinaryManager::parse_iso8601_utc("2000-02-29T12:00:00Z"), Some(951_825_600));
+        assert_eq!(BinaryManager::parse_iso8601_utc("garbage"), None);
     }
 
     /// pip in "Requirement already satisfied" cho các gói phụ thuộc kể cả khi vừa

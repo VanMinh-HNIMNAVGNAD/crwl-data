@@ -121,7 +121,8 @@ impl CookieService {
             "twitter" | "x" => ".x.com",
             "youtube" | "google" => ".youtube.com",
             "pinterest" => ".pinterest.com",
-            "threads" => ".threads.net",
+            // Threads chuyển sang threads.com: cookie của .threads.net không còn được gửi
+            "threads" => ".threads.com",
             "linkedin" => ".linkedin.com",
             "pixiv" | "pixiv_net" => ".pixiv.net",
             "reddit" => ".reddit.com",
@@ -329,7 +330,7 @@ impl CookieService {
             "twitter" | "twitter.com" | "x.com" | "x" | "t.co" => Some("twitter".to_string()),
             "youtube" | "youtube.com" | "youtu.be" | "youtube-nocookie.com" | "yt" | "google" => Some("youtube".to_string()),
             "pinterest" | "pinterest.com" | "pin.it" => Some("pinterest".to_string()),
-            "threads" | "threads.net" => Some("threads".to_string()),
+            "threads" | "threads.com" | "threads.net" => Some("threads".to_string()),
             "pixiv" | "pixiv.net" | "pixiv.me" | "pixiv_net" => Some("pixiv".to_string()),
             "reddit" | "reddit.com" | "redd.it" | "v.redd.it" => Some("reddit".to_string()),
             "bilibili" | "bilibili.com" | "b23.tv" => Some("bilibili".to_string()),
@@ -374,7 +375,7 @@ impl CookieService {
                 if s.ends_with(".linkedin.com") {
                     return Some("linkedin".to_string());
                 }
-                if s.ends_with(".threads.net") {
+                if s.ends_with(".threads.com") || s.ends_with(".threads.net") {
                     return Some("threads".to_string());
                 }
                 if s.ends_with(".pixiv.net") {
@@ -417,7 +418,7 @@ impl CookieService {
         }
         let candidates: &[&str] = match normalized_platform {
             "pixiv" => &["pixiv.net.txt", "pixiv_net.txt"],
-            "threads" => &["threads.net.txt"],
+            "threads" => &["threads.com.txt", "threads.net.txt"],
             "twitter" => &["x.com.txt", "twitter.com.txt", "x.txt"],
             "facebook" => &["facebook.com.txt", "fb.com.txt", "fb.txt"],
             "youtube" => &["youtube.com.txt", "youtu.be.txt", "google.txt"],
@@ -449,6 +450,7 @@ impl CookieService {
         let legacy_mappings = [
             ("pixiv.net.txt", "pixiv.txt"),
             ("pixiv_net.txt", "pixiv.txt"),
+            ("threads.com.txt", "threads.txt"),
             ("threads.net.txt", "threads.txt"),
             ("x.com.txt", "twitter.txt"),
             ("twitter.com.txt", "twitter.txt"),

@@ -21,6 +21,19 @@ from ..cancellation import (
 # Đuôi stderr mà run_process() gắn vào khi phải kill tiến trình vì quá giờ
 TIMEOUT_MARK = "Timeout after"
 
+# Ảnh đại diện, ảnh bìa trang cá nhân và tài nguyên giao diện của các mạng xã hội:
+# không bao giờ là media của bài viết. Bài X mà video đã bị gỡ từng ra "album 4 ảnh"
+# — cả 4 là pbs.twimg.com/profile_images/ của người đăng và người trả lời.
+SOCIAL_DECOR_URL_PARTS = (
+    "pbs.twimg.com/profile_images/", "pbs.twimg.com/profile_banners/", "abs.twimg.com/",
+    "/t51.2885-19/",                      # ảnh đại diện Instagram / Threads
+    "/t39.30808-1/", "/t1.30497-1/",      # ảnh đại diện Facebook (thật / mặc định)
+    "static.xx.fbcdn.net/rsrc.php",       # biểu tượng, âm báo giao diện Facebook
+    "-avt-",                              # ảnh đại diện TikTok (tos-…-avt-…)
+    "cdn.bsky.app/img/avatar", "cdn.bsky.app/img/banner",
+    "styles.redditmedia.com/", "redditstatic.com/",
+)
+
 
 class BaseExtractor:
     """Lớp cơ sở cho các engine trích xuất"""

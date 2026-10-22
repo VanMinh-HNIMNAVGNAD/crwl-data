@@ -30,7 +30,23 @@ from ..models import (
     CrawlMediaItem,
     ProfileCrawlResult,
 )
-from ..cookies.browser_cookies import get_browser_cookies_txt
+from ..cookies.browser_cookies import get_browser_cookies_txt, has_login_session
+
+
+class InstagramApiChanged(RuntimeError):
+    """Instagram đổi truy vấn GraphQL mà gallery-dl đang cài chưa theo kịp.
+
+    Dispatcher dựa vào loại lỗi này để thử mục khác của tài khoản (Reels dùng truy
+    vấn riêng) thay vì trả lỗi ngay.
+    """
+
+
+class PlatformBlocked(RuntimeError):
+    """Nền tảng chặn hẳn yêu cầu này theo chính sách (vd. Reddit chặn khách từ 10/2026).
+
+    Thử engine khác cũng chỉ ra cùng kết quả, hoặc tệ hơn là một album "ảnh" gồm
+    avatar và ảnh của bài khác — dispatcher phải báo ngay lỗi này.
+    """
 
 
 class GalleryDlExtractor(BaseExtractor):
@@ -84,6 +100,13 @@ class GalleryDlExtractor(BaseExtractor):
         args = [
             "--sleep-request", "0",
         ]
+        if self._category_of(target_url) == "instagram":
+            # gallery-dl nhớ kết quả tra tài khoản Instagram VĨNH VIỄN (cache.sqlite3).
+            # Bản ghi do bản cũ lưu thiếu "username", nên từ 10/2026 bản mới lỗi
+            # KeyError rồi báo "Requested user could not be found" với MỌI tài khoản
+            # đã từng quét — không hề gọi mạng. Chỉ nhớ trong một lượt chạy: tốn thêm
+            # một lượt tra tài khoản, không đụng tới cache của người dùng.
+            args.extend(["-o", "user-cache=memory"])
         tmp_cookie_file = None
 
         if browser != "none":
@@ -117,6 +140,9 @@ class GalleryDlExtractor(BaseExtractor):
             self._cleanup_cookie(tmp_cookie)
 
         if code != 0 and not stdout.strip():
+            failure = self.platform_failure(url, stderr, browser)
+            if failure:
+                raise failure
             raise RuntimeError(f"gallery-dl extract thất bại: {stderr.strip() or f'Exit code {code}'}")
 
         raw_entries = self._parse_json(stdout)
@@ -135,6 +161,9 @@ class GalleryDlExtractor(BaseExtractor):
         if not any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in raw_entries):
             error = self._first_error(raw_entries)
             if error:
+                failure = self.platform_failure(url, f"{error}\n{stderr or ''}", browser)
+                if failure:
+                    raise failure
                 raise RuntimeError(f"gallery-dl không lấy được media: {error}")
 
         return self._normalize_gallery(raw_entries, url)
@@ -183,6 +212,13 @@ class GalleryDlExtractor(BaseExtractor):
                     "Hết thời gian quét trước khi lấy được bài đăng nào. "
                     "Hãy giảm số lượng cần quét hoặc chọn 'Khoảng' nhỏ hơn."
                 )
+            # gallery-dl mới thoát với mã lỗi khi API GraphQL của Instagram từ chối truy
+            # vấn: trước đây người dùng chỉ thấy "[instagram][error] Failed to load API data".
+            failure = self.platform_failure(
+                profile_url, f"{self._first_error(raw_entries) or ''}\n{stderr or ''}", browser
+            )
+            if failure:
+                raise failure
             if code != 0:
                 raise RuntimeError(f"gallery-dl crawl thất bại: {stderr.strip() or f'Exit code {code}'}")
             # Ở chế độ output.jsonl, gallery-dl KHÔNG in entry lỗi [-1, ...] ra stdout.
@@ -315,9 +351,11 @@ class GalleryDlExtractor(BaseExtractor):
         if auth_reason:
             raise RuntimeError(self._login_required_message(url, auth_reason))
         error = self._first_error(entries)
+        failure = self.platform_failure(url, f"{error or ''}\n{stderr or ''}", browser)
+        if failure:
+            raise failure
         if error:
-            hint = self.instagram_outdated_message(url, error)
-            raise RuntimeError(hint or f"gallery-dl không quét được {url}: {error}")
+            raise RuntimeError(f"gallery-dl không quét được {url}: {error}")
 
     @staticmethod
     def _first_error(entries: Optional[List[Any]]) -> Optional[str]:
@@ -333,16 +371,22 @@ class GalleryDlExtractor(BaseExtractor):
         return None
 
     # Dấu hiệu gallery-dl đang dùng API Instagram đã cũ: Instagram đổi truy vấn GraphQL
-    # (10/2026) khiến MỌI tài khoản đều "không tìm thấy" hoặc ra rỗng, trong khi bản
-    # ổn định mới nhất trên PyPI chưa kịp sửa (bản vá chỉ có ở bản phát triển).
+    # liên tục (10/2026: thêm biến bắt buộc — "missing_required_variable_value") khiến
+    # MỌI tài khoản đều "không tìm thấy", ra rỗng hoặc "Failed to load API data".
     _INSTAGRAM_API_CHANGED = (
         "requested user could not be found", "missing_required_variable_value",
-        "polarisprofile", "doc_id",
+        "polarisprofile", "doc_id", "failed to load api data", "keyerror: 'data'",
+    )
+    # Reddit chặn yêu cầu (10/2026 chặn hẳn khách gọi API .json): gallery-dl nhận trang
+    # "You've been blocked by network security" thay cho JSON nên báo đủ kiểu lỗi.
+    _REDDIT_BLOCKED = (
+        "network security", "keyerror: 'data'", "not enough values to unpack",
+        "jsondecodeerror", "expecting value",
     )
 
     @classmethod
     def instagram_outdated_message(cls, url: str, error: Optional[str] = None) -> Optional[str]:
-        """Câu hướng dẫn cập nhật gallery-dl khi quét tài khoản Instagram thất bại, hoặc None."""
+        """Câu hướng dẫn khi quét tài khoản Instagram thất bại vì API đổi, hoặc None."""
         if cls._category_of(url) != "instagram":
             return None
         if error is not None and not any(sig in error.lower() for sig in cls._INSTAGRAM_API_CHANGED):
@@ -350,9 +394,65 @@ class GalleryDlExtractor(BaseExtractor):
         return (
             "Không quét được tài khoản Instagram này. Nếu tài khoản vẫn mở được trên trình duyệt "
             "thì Instagram vừa thay đổi cách trả dữ liệu và gallery-dl đang cài chưa theo kịp — mở "
-            "Công cụ (⚙) → gallery-dl → \"Bản mới nhất\" rồi quét lại."
+            "Công cụ (⚙) → gallery-dl → \"Bản mới nhất\" rồi quét lại; nếu vẫn lỗi thì bản sửa "
+            "chưa phát hành, hãy thử lại sau 1-2 ngày."
             + (f" (Chi tiết: {error})" if error else "")
         )
+
+    def empty_crawl_error(self, url: str, browser: Optional[str]) -> RuntimeError:
+        """Lỗi khi gallery-dl quét xong mà không ra tệp nào (và không báo lỗi gì)."""
+        if self._category_of(url) == "instagram":
+            if not has_login_session(url, browser):
+                return PlatformBlocked(self._login_required_message(
+                    url, "Instagram chỉ cho tài khoản đã đăng nhập xem danh sách bài đăng"
+                ))
+            return RuntimeError(self.instagram_outdated_message(url))
+        return RuntimeError(f"gallery-dl không tìm thấy media từ {url}")
+
+    @staticmethod
+    def _error_detail(text: str) -> str:
+        """Dòng lỗi có nghĩa nhất trong output của gallery-dl (để gắn vào "Chi tiết")."""
+        lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+        for line in lines:
+            if "[error]" in line.lower():
+                return line[:200]
+        return lines[0][:200] if lines else ""
+
+    @classmethod
+    def platform_failure(cls, url: str, text: str, browser: Optional[str]) -> Optional[RuntimeError]:
+        """Lỗi gallery-dl do chính sách / API mới của nền tảng → lỗi kèm cách xử lý đúng.
+
+        Trả None khi không nhận ra (để bên gọi báo lỗi gốc như trước).
+        """
+        low = (text or "").lower()
+        if not low.strip():
+            return None
+        category = cls._category_of(url)
+        detail = cls._error_detail(text)
+        if category == "instagram" and any(sig in low for sig in cls._INSTAGRAM_API_CHANGED):
+            # Từ 10/2026 Instagram từ chối mọi truy vấn danh sách bài đăng của khách
+            # ("Unauthorized logged out query"): khuyên cập nhật gallery-dl là sai hướng.
+            if not has_login_session(url, browser):
+                return PlatformBlocked(cls._login_required_message(
+                    url, detail or "Instagram chỉ cho tài khoản đã đăng nhập xem bài đăng"
+                ))
+            return InstagramApiChanged(cls.instagram_outdated_message(url, detail))
+        if category == "reddit" and any(sig in low for sig in cls._REDDIT_BLOCKED):
+            if not has_login_session(url, browser):
+                return PlatformBlocked(
+                    "Reddit đã chặn truy cập khi chưa đăng nhập (chính sách mới từ 10/2026). "
+                    "Hãy đăng nhập Reddit trên trình duyệt (app tự dùng trình duyệt đang đăng nhập) "
+                    "rồi thử lại, hoặc mở Cookie Manager (🍪) → tab Reddit và dán cookie."
+                    + (f" (Chi tiết: {detail})" if detail else "")
+                )
+            # Có phiên đăng nhập: KHÔNG dừng hẳn — trang mở bằng Chromium kèm cookie vẫn có
+            # thể đọc được bài (dispatcher thử tiếp, hết cách mới báo câu này).
+            return RuntimeError(
+                "Reddit từ chối yêu cầu dù đã có cookie đăng nhập — phiên đăng nhập có thể đã hết hạn. "
+                "Hãy mở Reddit trên trình duyệt, đăng nhập lại rồi thử lại."
+                + (f" (Chi tiết: {detail})" if detail else "")
+            )
+        return None
 
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -913,7 +1013,7 @@ class GalleryDlExtractor(BaseExtractor):
             name, tab = "Instagram", "Instagram"
         elif "facebook.com" in lower or "fb.com" in lower or "fb.watch" in lower:
             name, tab = "Facebook", "Facebook"
-        elif "threads.net" in lower:
+        elif "threads.com" in lower or "threads.net" in lower:
             name, tab = "Threads", "Threads"
         elif "x.com" in lower or "twitter.com" in lower:
             name, tab = "X (Twitter)", "Twitter"

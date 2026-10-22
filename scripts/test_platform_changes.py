@@ -335,12 +335,17 @@ def test_instagram_profile_not_found_points_to_the_latest_gallery_dl():
         "https://x.com/natgeo/media", "NotFoundError: Requested user could not be found") is None
 
 
-def test_probe_error_for_instagram_profile_suggests_updating(tmp_path):
+def test_probe_error_for_instagram_profile_suggests_updating(tmp_path, fake_browsers):
     ext = _fake_gallery_dl(
         tmp_path, '[[-1, {"error": "NotFoundError", "message": "Requested user could not be found"}]]')
+    # Edge đang đăng nhập Instagram: lỗi do gallery-dl chưa theo kịp API mới
+    with pytest.raises(RuntimeError) as info:
+        ext._raise_probe_error("https://www.instagram.com/lilithzxm/posts/", "edge")
+    assert "Bản mới nhất" in str(info.value)
+    # Từ 10/2026 khách không xem được danh sách bài: cần đăng nhập, cập nhật không giúp gì
     with pytest.raises(RuntimeError) as info:
         ext._raise_probe_error("https://www.instagram.com/lilithzxm/posts/", "none")
-    assert "Bản mới nhất" in str(info.value)
+    assert "Instagram yêu cầu đăng nhập" in str(info.value)
 
 
 def test_heic_url_served_as_jpeg_is_labelled_jpg():

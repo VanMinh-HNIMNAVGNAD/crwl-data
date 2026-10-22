@@ -123,7 +123,9 @@ const RULES = [
     message: 'Hãy phân tích (hoặc quét) lại liên kết rồi tải lại.',
   },
   {
-    test: /not available in your country|geo[- ]?restrict|from your location|khu vực của bạn/i,
+    // TikTok trả mã 10204 ("Your IP address is blocked from accessing this post") cho
+    // video bị giới hạn theo quốc gia — đăng nhập không giúp gì.
+    test: /not available in your country|geo[- ]?restrict|from your location|khu vực của bạn|ip address is blocked/i,
     title: 'Nội dung bị chặn theo khu vực',
     message: 'Thử đặt proxy ở khu vực được phép trong "Công cụ" (⚙).',
   },
@@ -142,7 +144,7 @@ const RULES = [
     strong: true,
     title: 'Không quét được tài khoản Instagram',
     message:
-      'Nếu tài khoản vẫn mở được trên trình duyệt: Instagram vừa thay đổi — mở "Công cụ" (⚙) → gallery-dl → "Bản mới nhất" rồi quét lại.',
+      'Nếu tài khoản vẫn mở được trên trình duyệt: Instagram vừa thay đổi — mở "Công cụ" (⚙) → gallery-dl → "Bản mới nhất" rồi quét lại. Vẫn lỗi thì bản sửa chưa phát hành, hãy thử lại sau 1-2 ngày.',
   },
   {
     test: /yêu cầu đăng nhập|cần đăng nhập|\blog ?in\b|logged[- ]in|sign in|authenticat|not a bot|confirm your age|age[- ]restrict|giới hạn (?:độ )?tuổi|members?[- ]only|\bprivate\b|riêng tư|empty media response|cookies? (?:are |is )?(?:needed|required)|http error 401|unauthori[sz]ed/i,
