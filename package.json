@@ -1,6 +1,6 @@
 {
   "name": "crwl-on-socialmedia",
-  "version": "2.7.1",
+  "version": "3.7.3",
   "private": true,
   "packageManager": "pnpm@9.15.5",
   "engines": {
@@ -15,6 +15,8 @@
     "lint": "pnpm --filter desktop lint",
     "test:core": "python3 scripts/test_desktop_system.py",
     "test:ui": "pnpm --filter desktop test",
+    "bump": "node scripts/bump_version.mjs",
+    "version:check": "node scripts/bump_version.mjs --check",
     "repomix": "repomix --config repomix.desktop.config.json && repomix --config repomix.core.config.json",
     "repomix:desktop": "repomix --config repomix.desktop.config.json",
     "repomix:core": "repomix --config repomix.core.config.json"
