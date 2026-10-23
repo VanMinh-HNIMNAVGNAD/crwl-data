@@ -121,7 +121,7 @@ def run_mock_server() -> Tuple[HTTPServer, threading.Thread, str]:
     return server, thread, base_url
 
 
-def test_1(base_url: str) -> bool:
+def check_1(base_url: str) -> bool:
     print("\n" + "=" * 70)
     print("  🚀 CHẠY TEST #1 — Kiểm thử Deduplication Pattern và Insertion Order")
     print("=" * 70)
@@ -171,7 +171,7 @@ def test_1(base_url: str) -> bool:
     return True
 
 
-def test_2(base_url: str) -> bool:
+def check_2(base_url: str) -> bool:
     print("\n" + "=" * 70)
     print("  🚀 CHẠY TEST #2 — Kiểm thử Scraper trên Media List có Duplicate & Order Stability")
     print("=" * 70)
@@ -242,13 +242,22 @@ def test_2(base_url: str) -> bool:
     return True
 
 
+def test_image_order_is_preserved():
+    server, _thread, base_url = run_mock_server()
+    try:
+        assert check_1(base_url), "TEST #1 thất bại"
+        assert check_2(base_url), "TEST #2 thất bại"
+    finally:
+        server.shutdown()
+
+
 def main():
     server, thread, base_url = run_mock_server()
     print(f"Đã khởi động Mock Web Server tại: {base_url}")
 
     try:
-        t1_ok = test_1(base_url)
-        t2_ok = test_2(base_url)
+        t1_ok = check_1(base_url)
+        t2_ok = check_2(base_url)
 
         print("\n" + "=" * 70)
         print("TỔNG KẾT:")
