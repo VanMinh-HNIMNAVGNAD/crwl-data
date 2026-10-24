@@ -197,3 +197,20 @@ export function cleanLinkText(text) {
     .map((row) => row.value)
     .join('\n')
 }
+
+/**
+ * Tách liên kết để hiển thị gọn trên một dòng: tên miền (bỏ "https://", "www.")
+ * và phần còn lại. Chỉ dùng để HIỂN THỊ — nội dung khung nhập giữ nguyên văn.
+ * @returns `{ host, rest }`
+ */
+export function displayLink(link) {
+  const value = String(link || '').trim()
+  try {
+    const u = new URL(normalizeLink(value))
+    const host = u.hostname.replace(/^www\./i, '') + (u.port ? `:${u.port}` : '')
+    const path = u.pathname === '/' ? '' : u.pathname
+    return { host, rest: `${path}${u.search}${u.hash}` }
+  } catch {
+    return { host: '', rest: value }
+  }
+}
