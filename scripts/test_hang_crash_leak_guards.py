@@ -483,10 +483,23 @@ def test_repeated_extractions_do_not_accumulate_python_objects(site):
 @linux_only
 def test_cancel_kills_the_running_child_and_answers_immediately(engine, site):
     engine.send({"id": "slow", "action": "extract", "url": site + "/slow", "browser": "none", "budget_sec": 120})
+
+    def extracting():
+        # Tiến trình con đầu tiên có thể là `yt-dlp --help` (dò tính năng) — huỷ lúc đó
+        # thì chưa có gì để kill. Chờ đúng lượt bóc tách URL /slow.
+        for pid, state in engine.children():
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    if state != "Z" and b"/slow" in fh.read():
+                        return True
+            except OSError:
+                continue
+        return False
+
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and not any(s != "Z" for _, s in engine.children()):
+    while time.monotonic() < deadline and not extracting():
         time.sleep(0.1)
-    assert engine.children(), "yt-dlp giả phải đang chạy"
+    assert extracting(), "yt-dlp giả phải đang bóc tách /slow"
     started = time.monotonic()
     engine.send({"id": "cancel-1", "action": "cancel", "target": "slow"})
     got = engine.wait_ids({"slow", "cancel-1"}, timeout=20)

@@ -24,7 +24,7 @@ import subprocess
 from pathlib import Path
 
 
-def test_scenario(base_dest: Path, album_name: str, num_images: int, num_videos: int) -> bool:
+def check_scenario(base_dest: Path, album_name: str, num_images: int, num_videos: int) -> bool:
     target_dir = base_dest / album_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -93,21 +93,21 @@ def run_test_1() -> bool:
         # 1. images only
         d1 = base / "run_images_only"
         d1.mkdir()
-        if not test_scenario(d1, "Album_ImagesOnly", num_images=5, num_videos=0):
+        if not check_scenario(d1, "Album_ImagesOnly", num_images=5, num_videos=0):
             return False
         print("  ✓ images only + ZIP: OK (5 files in ZIP, 0 outside)")
 
         # 2. videos only
         d2 = base / "run_videos_only"
         d2.mkdir()
-        if not test_scenario(d2, "Album_VideosOnly", num_images=0, num_videos=3):
+        if not check_scenario(d2, "Album_VideosOnly", num_images=0, num_videos=3):
             return False
         print("  ✓ videos only + ZIP: OK (3 files in ZIP, 0 outside)")
 
         # 3. images + videos
         d3 = base / "run_mixed"
         d3.mkdir()
-        if not test_scenario(d3, "Album_Mixed", num_images=5, num_videos=3):
+        if not check_scenario(d3, "Album_Mixed", num_images=5, num_videos=3):
             return False
         print("  ✓ images + videos + ZIP: OK (8 files in ZIP, 0 outside)")
 
@@ -122,11 +122,17 @@ def run_test_2() -> bool:
         d_clean = clean_base / "clean_profile_run"
         d_clean.mkdir()
 
-        if not test_scenario(d_clean, "Profile_CleanTestUser", num_images=5, num_videos=3):
+        if not check_scenario(d_clean, "Profile_CleanTestUser", num_images=5, num_videos=3):
             return False
         print("  ✓ clean mixed images + videos + ZIP: OK (8 files in ZIP, 0 outside)")
 
     return True
+
+
+def test_zip_contains_all_selected_media():
+    """Chạy hai kịch bản đóng ZIP dưới pytest (phần cargo test do job Rust của CI lo)."""
+    assert run_test_1(), "TEST #1 thất bại"
+    assert run_test_2(), "TEST #2 thất bại"
 
 
 def main():
