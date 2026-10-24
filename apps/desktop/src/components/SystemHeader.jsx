@@ -9,8 +9,9 @@ import {
   getAlwaysAskDownloadDir,
   setAlwaysAskDownloadDir,
 } from '../services/api'
-import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings } from './Icons'
+import { IconChevronDown, IconCheck, IconRefresh, IconHistory, IconSettings, IconSun, IconMoon } from './Icons'
 import { describeError } from '../utils/messages'
+import { applyTheme, getStoredTheme, nextTheme } from '../utils/theme'
 const mediaLogo = '/favicon.svg'
 
 export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools, cookieRefreshKey, settingsVersion }) {
@@ -24,6 +25,9 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
   const browserDropdownRef = useRef(null)
   const toastTimer = useRef(null)
   const autoPickedRef = useRef(Boolean(getActiveBrowser()))
+  const [theme, setTheme] = useState(getStoredTheme)
+
+  const handleToggleTheme = () => setTheme(applyTheme(nextTheme(theme)))
 
   const showToast = (msg) => {
     setToastMsg(msg)
@@ -303,6 +307,17 @@ export default function SystemHeader({ onOpenHistory, onOpenCookies, onOpenTools
           >
             <IconHistory className="w-4 h-4 text-slate-400" />
             <span>Lịch sử tải</span>
+          </button>
+
+          {/* Chuyển giao diện sáng / tối */}
+          <button
+            type="button"
+            className="btn-theme-toggle"
+            onClick={handleToggleTheme}
+            title={theme === 'dark' ? 'Chuyển sang giao diện sáng' : 'Chuyển sang giao diện tối (đỡ chói mắt)'}
+            aria-label={theme === 'dark' ? 'Chuyển sang giao diện sáng' : 'Chuyển sang giao diện tối'}
+          >
+            {theme === 'dark' ? <IconSun className="w-4 h-4" /> : <IconMoon className="w-4 h-4" />}
           </button>
 
           {/* Tools & Engine Status Trigger */}

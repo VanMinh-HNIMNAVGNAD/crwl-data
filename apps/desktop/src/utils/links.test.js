@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   analyzeLinkLines,
   cleanLinkText,
+  displayLink,
   extractLinks,
   isLikelyLink,
   linkKey,
@@ -78,4 +79,12 @@ test('ghép thêm liên kết bỏ link đã có / trùng nhau', () => {
 
 test('dọn dẹp giữ đúng các liên kết, bỏ dòng rác và dòng trùng', () => {
   assert.equal(cleanLinkText('rác\nhttps://a.com/1\n\nhttps://a.com/1\n youtu.be/x '), 'https://a.com/1\nyoutu.be/x')
+})
+
+test('hiển thị gọn liên kết: tên miền bỏ giao thức và "www.", phần còn lại giữ nguyên', () => {
+  assert.deepEqual(displayLink('https://www.youtube.com/watch?v=abc&t=1'), { host: 'youtube.com', rest: '/watch?v=abc&t=1' })
+  assert.deepEqual(displayLink('youtu.be/abc'), { host: 'youtu.be', rest: '/abc' })
+  assert.deepEqual(displayLink('https://example.com/'), { host: 'example.com', rest: '' })
+  assert.deepEqual(displayLink('http://localhost:8080/v#t=3'), { host: 'localhost:8080', rest: '/v#t=3' })
+  assert.deepEqual(displayLink('không phải link'), { host: '', rest: 'không phải link' })
 })

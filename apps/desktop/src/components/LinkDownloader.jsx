@@ -380,12 +380,15 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
   // Kết quả phân tích của từng link trong khung "Nhiều link" (✓ / ✕ ở lề trái),
   // khoá theo linkKey để vẫn khớp khi người dùng chèn/xoá dòng khác.
   const [linkStatus, setLinkStatus] = useState({})
+  // Ẩn hẳn danh sách link (chỉ còn thanh thống kê) để nhường chỗ cho kết quả. Tự bật
+  // khi phân tích xong có kết quả, tự tắt khi danh sách link thay đổi.
+  const [isLinkListHidden, setIsLinkListHidden] = useState(false)
   const batchInputRef = useRef(null)
   // Vừa tự chuyển từ "1 Liên kết" sang "Nhiều link": đặt con trỏ cuối danh sách để
   // lần dán (Ctrl+V) tiếp theo nối tiếp vào cuối thay vì chèn lên đầu.
   const focusBatchEndRef = useRef(false)
   const [isLoading, setIsLoading] = useState(false)
-  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, statusText: '' })
+  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 })
 
   // Kết quả sau khi phân tích
   const [singleMedia, setSingleMedia] = useState(null)
@@ -515,6 +518,15 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const batchAnalysis = useMemo(() => analyzeLinkLines(batchText, MAX_BATCH_LINKS), [batchText])
   const parsedBatchLinks = batchAnalysis.links
   const batchCounts = batchAnalysis.counts
+  // Số link đã phân tích xong / bị lỗi trong danh sách hiện tại (thanh thống kê)
+  const batchStatusCounts = useMemo(() => {
+    const counts = { ok: 0, error: 0 }
+    for (const row of batchAnalysis.rows) {
+      const state = row.kind === 'link' ? linkStatus[row.key]?.state : null
+      if (state === 'ok' || state === 'error') counts[state]++
+    }
+    return counts
+  }, [batchAnalysis, linkStatus])
 
   const notifyLinksAdded = ({ added, skipped, switched = false }) => {
     const skippedNote = skipped > 0 ? `Bỏ qua ${skipped} link đã có trong danh sách.` : ''
@@ -535,6 +547,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const addLinksToBatch = (links, { fromSingle = false } = {}) => {
     const { text, added, skipped } = mergeLinks(batchText, links)
     setBatchText(text)
+    setIsLinkListHidden(false)
     if (fromSingle) {
       setMode('batch')
       focusBatchEndRef.current = true
@@ -675,7 +688,9 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
     setIsCancelling(false)
     setIsLoading(true)
     setLinkStatus({})
-    setBatchProgress({ current: 0, total: links.length, statusText: 'Đang bắt đầu...' })
+    // Hiện lại danh sách để theo dõi ✓ / ✕ của từng link trong lúc phân tích
+    setIsLinkListHidden(false)
+    setBatchProgress({ current: 0, total: links.length })
 
     const results = []
     const failures = []
@@ -687,7 +702,6 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
       setBatchProgress({
         current: i + 1,
         total: links.length,
-        statusText: `Đang phân tích link ${i + 1}/${links.length}...`,
       })
       markLink(key, { state: 'running' })
 
@@ -724,12 +738,14 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
     }
     setIsLoading(false)
     setIsCancelling(false)
-    setBatchProgress({ current: 0, total: 0, statusText: '' })
+    setBatchProgress({ current: 0, total: 0 })
 
     if (results.length > 0) {
       setBatchMedias(results)
       setSelectedBatchIds({})
       setSingleMedia(null)
+      // Thu danh sách link lại để phần kết quả có đủ chỗ (link lỗi vẫn đếm ở thanh thống kê)
+      setIsLinkListHidden(true)
     }
 
     if (cancelled) {
@@ -748,7 +764,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
           results.length > 0
             ? `Đã phân tích ${results.length}/${links.length} liên kết`
             : 'Không phân tích được liên kết nào',
-        message: `${failures.length} link lỗi (đánh dấu ✕ ở lề trái) — ${first.title}.`,
+        message: `${failures.length} link lỗi (đánh dấu ✕ trong danh sách link) — ${first.title}.`,
         detail: formatFailures(failures),
       })
     }
@@ -1607,6 +1623,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
   const handleClearBatch = () => {
     setBatchText('')
     setLinkStatus({})
+    setIsLinkListHidden(false)
     setBatchMedias([])
     setSelectedBatchIds({})
     setSelectedImages({})
@@ -1629,6 +1646,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
   // Khung "Nhiều link" (đã memo) chỉ vẽ lại khi nội dung / trạng thái link đổi
   const handleBatchTextChange = useStableCallback((val) => {
     setBatchText(val)
+    setIsLinkListHidden(false)
     if (!val.trim()) {
       setLinkStatus({})
       setBatchMedias([])
@@ -1772,24 +1790,39 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
           </form>
         ) : (
           <form onSubmit={handleBatchExtract} className="pane-form">
-            <div className="batch-textarea-wrap">
-              <LinkListEditor
-                value={batchText}
-                onChange={handleBatchTextChange}
-                analysis={batchAnalysis}
-                statusByKey={linkStatus}
-                maxLinks={MAX_BATCH_LINKS}
-                disabled={isLoading}
-                inputRef={batchInputRef}
-                placeholder={BATCH_PLACEHOLDER}
-                onLinksPasted={handleLinksPasted}
-                onSubmit={handleBatchSubmit}
-              />
+            <div className={`batch-textarea-wrap ${isLinkListHidden ? 'is-list-hidden' : ''}`}>
+              {!isLinkListHidden && (
+                <LinkListEditor
+                  value={batchText}
+                  onChange={handleBatchTextChange}
+                  analysis={batchAnalysis}
+                  statusByKey={linkStatus}
+                  maxLinks={MAX_BATCH_LINKS}
+                  disabled={isLoading}
+                  inputRef={batchInputRef}
+                  placeholder={BATCH_PLACEHOLDER}
+                  onLinksPasted={handleLinksPasted}
+                  onSubmit={handleBatchSubmit}
+                />
+              )}
               <div className="textarea-footer-bar">
                 <span className="textarea-footer-stats">
                   <span className="footer-stat-ok">
                     {parsedBatchLinks.length}/{MAX_BATCH_LINKS} link
                   </span>
+                  {batchStatusCounts.ok > 0 && (
+                    <span className="footer-stat-done">✓ {batchStatusCounts.ok} xong</span>
+                  )}
+                  {batchStatusCounts.error > 0 && (
+                    <button
+                      type="button"
+                      className="footer-stat-bad footer-stat-btn"
+                      onClick={() => setIsLinkListHidden(false)}
+                      title="Xem link nào bị lỗi (rê chuột lên dòng để xem lý do)"
+                    >
+                      ✕ {batchStatusCounts.error} lỗi
+                    </button>
+                  )}
                   {batchCounts.duplicate > 0 && <span>{batchCounts.duplicate} trùng</span>}
                   {batchCounts.invalid > 0 && (
                     <span className="footer-stat-bad">{batchCounts.invalid} không hợp lệ</span>
@@ -1799,6 +1832,16 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   )}
                 </span>
                 <div className="textarea-footer-actions">
+                  {batchText.trim() && (
+                    <button
+                      type="button"
+                      className="minimal-small-btn"
+                      onClick={() => setIsLinkListHidden((hidden) => !hidden)}
+                      title={isLinkListHidden ? 'Hiện lại danh sách liên kết' : 'Ẩn danh sách liên kết để xem kết quả rộng hơn'}
+                    >
+                      {isLinkListHidden ? 'Hiện link' : 'Thu gọn'}
+                    </button>
+                  )}
                   {batchCounts.duplicate + batchCounts.invalid > 0 && !isLoading && (
                     <button
                       type="button"
@@ -1831,8 +1874,9 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
               </div>
             </div>
 
-            {/* Container + options cho batch mode */}
-            <div className="pane-control-row">
+            {/* Container + tùy chọn + nút phân tích trên CÙNG một hàng (tự xuống dòng khi
+                hẹp) — tiết kiệm chiều cao cho phần kết quả bên dưới */}
+            <div className="pane-control-row is-wrapping">
               <div className="pills-group">
                 {VIDEO_CONTAINER_OPTIONS.map((f) => (
                   <button
@@ -1855,6 +1899,42 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                 <IconSettings className="w-3 h-3" />
                 <span>Tùy chọn</span>
               </button>
+
+              {/* Nút chính + Hủy luôn đi cùng nhau, nằm bên phải kể cả khi hàng xuống dòng */}
+              <div className="control-row-actions">
+                <button
+                  type="submit"
+                  className="pane-submit-btn"
+                  disabled={isLoading || parsedBatchLinks.length === 0}
+                  title="Phân tích tất cả liên kết (Ctrl+Enter)"
+                >
+                  {isLoading ? (
+                    <>
+                      <span className="minimal-spinner" />
+                      <span>
+                        {isCancelling
+                          ? 'Đang hủy...'
+                          : `Đang phân tích ${batchProgress.current}/${batchProgress.total}...`}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <IconDownload className="w-3.5 h-3.5" />
+                      <span>Bóc tách hàng loạt</span>
+                    </>
+                  )}
+                </button>
+                {isLoading && !isCancelling && (
+                  <button
+                    type="button"
+                    className="pane-cancel-btn"
+                    onClick={handleCancelExtract}
+                    title="Hủy giải mã đang chạy"
+                  >
+                    ✕ Hủy
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* Options box cho batch mode */}
@@ -1895,40 +1975,6 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
               </div>
             )}
 
-            <div className="pane-control-row">
-              {batchProgress.statusText && (
-                <span className="validation-hint">{batchProgress.statusText}</span>
-              )}
-
-              <button
-                type="submit"
-                className="pane-submit-btn"
-                disabled={isLoading || parsedBatchLinks.length === 0}
-                title="Phân tích tất cả liên kết (Ctrl+Enter)"
-              >
-                {isLoading ? (
-                  <>
-                    <span className="minimal-spinner" />
-                    <span>{isCancelling ? 'Đang hủy...' : 'Đang phân tích...'}</span>
-                  </>
-                ) : (
-                  <>
-                    <IconDownload className="w-3.5 h-3.5" />
-                    <span>Bóc tách hàng loạt</span>
-                  </>
-                )}
-              </button>
-              {isLoading && !isCancelling && (
-                <button
-                  type="button"
-                  className="pane-cancel-btn"
-                  onClick={handleCancelExtract}
-                  title="Hủy giải mã đang chạy"
-                >
-                  ✕ Hủy
-                </button>
-              )}
-            </div>
           </form>
         )}
       </div>
