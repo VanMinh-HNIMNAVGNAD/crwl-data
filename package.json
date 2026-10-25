@@ -26,6 +26,6 @@
   "license": "ISC",
   "type": "module",
   "devDependencies": {
-    "repomix": "^1.18.0"
+    "repomix": "^1.18.1"
   }
 }
