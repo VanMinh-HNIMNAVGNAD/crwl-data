@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import threading
+import urllib.parse
 from typing import Optional, List, Dict, Any, Tuple
 from .base import BaseExtractor
 from .media_probe import AUDIO_FILE_EXTS, DIRECT_MEDIA_EXTS, MediaProbe, ProbeInfo, path_ext
@@ -36,6 +37,42 @@ _COOKIE_INDEPENDENT_ERROR_RE = re.compile(
     r"HTTP Error 404|HTTP Error 410",
     re.IGNORECASE,
 )
+
+# Facebook đang đổi dần cách trả trang video (10/2026, yt-dlp #17906): yt-dlp báo
+# "Cannot parse data" cho cả reel / watch công khai, kể cả khi đã đăng nhập, và chưa có
+# bản sửa. Giả dạng trình duyệt Firefox (`--impersonate firefox`: TLS + header của
+# Firefox, cần thư viện curl_cffi) thì Facebook lại trả trang đầy đủ. Bước tải (Rust,
+# downloader.rs) thử lại y như vậy.
+IMPERSONATE_TARGET = "firefox"
+_IMPERSONATE_DOMAINS = ("facebook.com", "fb.watch", "fb.com", "fb.me")
+_IMPERSONATE_ERROR_RE = re.compile(r"cannot parse data", re.IGNORECASE)
+# yt-dlp không giả dạng được: Python chạy nó thiếu curl_cffi, hoặc bản quá cũ chưa có `--impersonate`
+_IMPERSONATE_UNAVAILABLE_RE = re.compile(
+    r'impersonate target "[^"]*" is not available|no such option: --impersonate',
+    re.IGNORECASE,
+)
+
+
+def impersonation_target_for(url: str, stderr: str) -> Optional[str]:
+    """Trình duyệt cần giả dạng khi chạy lại yt-dlp sau lỗi `stderr` ở `url`, hoặc None."""
+    if not _IMPERSONATE_ERROR_RE.search(stderr or ""):
+        return None
+    raw = (url or "").strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        raw = "https://" + raw
+    try:
+        host = (urllib.parse.urlparse(raw).hostname or "").lower()
+    except ValueError:
+        return None
+    if any(host == d or host.endswith("." + d) for d in _IMPERSONATE_DOMAINS):
+        return IMPERSONATE_TARGET
+    return None
+
+
+class ImpersonationUnavailable(RuntimeError):
+    """yt-dlp phải giả dạng trình duyệt mới đọc được trang nhưng không làm được — Python
+    đang chạy yt-dlp thiếu curl_cffi. Cập nhật yt-dlp không giúp gì, phải cài curl_cffi."""
+
 
 AUDIO_PRESETS = (
     ("opus_best", "OPUS Chuẩn gốc (160 kbps, không suy hao)", "OPUS"),
@@ -227,11 +264,14 @@ class YtDlpExtractor(BaseExtractor):
         browser: Optional[str] = None,
         timeout: int = 30,
         referer: Optional[str] = None,
+        impersonate: Optional[str] = None,
     ) -> MediaMetadata:
         """Trích xuất chi tiết metadata của 1 URL video/audio.
 
         `referer`: trang chứa luồng (luồng tìm thấy bên trong trang phim) — máy chủ
         luồng hay chặn yêu cầu thiếu Referer đúng trang.
+        `impersonate`: trình duyệt yt-dlp giả dạng — chỉ đặt ở lượt tự chạy lại sau lỗi
+        trang đã đổi (xem impersonation_target_for).
         """
         if not self.is_available():
             raise RuntimeError("yt-dlp binary không được tìm thấy trên hệ thống.")
@@ -239,6 +279,8 @@ class YtDlpExtractor(BaseExtractor):
         args, tmp_cookie = self.get_base_args(allow_playlist=False, browser=browser, target_url=url)
         if referer:
             args += ["--referer", referer]
+        if impersonate:
+            args += ["--impersonate", impersonate]
         # `--flat-playlist` không đổi gì với một video đơn (vẫn bóc tách đầy đủ), nhưng
         # với playlist/kênh thì chỉ liệt kê nhanh các mục thay vì bóc tách từng video
         # tới khi quá giờ — nhờ đó nhận ra ngay đây là danh sách (PlaylistUrlError).
@@ -259,10 +301,25 @@ class YtDlpExtractor(BaseExtractor):
             # Quá giờ thì chạy lại lần nữa (không cookie) chỉ tốn gấp đôi thời gian.
             if self.is_timeout(code, stderr):
                 raise RuntimeError(f"yt-dlp quá thời gian {timeout}s khi đọc thông tin liên kết.")
+            if impersonate and _IMPERSONATE_UNAVAILABLE_RE.search(stderr or ""):
+                raise ImpersonationUnavailable(stderr.strip())
+            failure = f"yt-dlp extract thất bại: {stderr.strip() or f'Exit code {code}'}"
+            target = None if impersonate else impersonation_target_for(url, stderr)
+            if target:
+                # Giữ nguyên cookie: Facebook vẫn đọc được trang khi đã đăng nhập
+                self.warn(f"yt-dlp không đọc được trang (Cannot parse data) → thử lại giả dạng trình duyệt {target}...")
+                try:
+                    return self.extract_metadata(
+                        url, browser=browser, timeout=timeout, referer=referer, impersonate=target
+                    )
+                except ImpersonationUnavailable as e:
+                    # Chạy lại không cookie chỉ ra đúng lỗi cũ: báo ngay cách cài curl_cffi
+                    self.warn(f"yt-dlp không giả dạng được {target} (thiếu curl_cffi): {e}")
+                    raise ImpersonationUnavailable(failure) from e
             if retry_plain:
                 self.warn("yt-dlp extract lỗi với cookies, đang thử lại không dùng cookies ('none')...")
-                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer)
-            raise RuntimeError(f"yt-dlp extract thất bại: {stderr.strip() or f'Exit code {code}'}")
+                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer, impersonate=impersonate)
+            raise RuntimeError(failure)
 
         # Lấy dòng JSON đầu tiên
         json_line = None
@@ -274,7 +331,7 @@ class YtDlpExtractor(BaseExtractor):
         if not json_line:
             if retry_plain:
                 self.warn("yt-dlp không trả metadata hợp lệ với cookies, thử lại không cookie...")
-                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer)
+                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer, impersonate=impersonate)
             raise ValueError("Không tìm thấy dữ liệu JSON hợp lệ từ kết quả yt-dlp.")
 
         try:
@@ -282,7 +339,7 @@ class YtDlpExtractor(BaseExtractor):
         except json.JSONDecodeError as e:
             if retry_plain:
                 self.warn("yt-dlp trả JSON lỗi với cookies, thử lại không cookie...")
-                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer)
+                return self.extract_metadata(url, browser="none", timeout=timeout, referer=referer, impersonate=impersonate)
             raise ValueError(f"Lỗi parse JSON yt-dlp: {e}")
 
         # Mục "phẳng" (chỉ là liên kết tới video khác) chỉ xuất hiện khi URL là một

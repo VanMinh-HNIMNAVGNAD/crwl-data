@@ -175,6 +175,21 @@ test('thay đổi nền tảng 10/2026: câu thông báo của engine hiện đ�
   assert.match(fb.message, /Bản mới nhất/)
   assert.ok(!/cần đăng nhập/.test(fb.title))
 
+  // Facebook 24/10: phải giả dạng Firefox mới đọc được mà thiếu curl_cffi — câu của engine
+  // Python (phân tích) và của Rust (tải) đều ra cùng một hướng dẫn cài đặt
+  for (const action of ['đọc được liên kết này', 'tải được video này']) {
+    const missing = describeError(
+      `Facebook vừa thay đổi cách tải dữ liệu: yt-dlp phải giả dạng trình duyệt Firefox mới ${action} nhưng ` +
+        'Python đang chạy yt-dlp thiếu thư viện curl_cffi. Hãy cài: pip install --upgrade curl_cffi (yt-dlp cài ' +
+        'bằng pipx: pipx inject yt-dlp curl_cffi) rồi thử lại. (Chi tiết: Cannot parse data; please report this ' +
+        'issue on  https://github.com/yt-dlp/yt-dlp/issues?q= )'
+    )
+    assert.equal(missing.title, 'Cần cài thư viện curl_cffi cho yt-dlp')
+    assert.match(missing.message, /^Facebook vừa đổi cách tải dữ liệu/)
+    assert.match(missing.message, /pip install --upgrade curl_cffi/)
+    assert.ok(!/cần đăng nhập|Bản mới nhất/.test(`${missing.title} ${missing.message}`))
+  }
+
   // TikTok mã 10204: video bị giới hạn theo quốc gia, không phải lỗi đăng nhập
   const tiktok = describeError(
     'yt-dlp extract thất bại: ERROR: [TikTok] 6748451240264420610: Your IP address is blocked from accessing this post'

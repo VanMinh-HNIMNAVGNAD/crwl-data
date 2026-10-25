@@ -9,7 +9,8 @@ Kiểm thử các thay đổi chính sách / kỹ thuật của nền tảng (cu
      Bài viết thiếu biến bắt buộc mới (mục Reels vẫn chạy); khách không còn xem được
      danh sách bài; API web_profile_info trả 429 (Story Instagram).
   3. Facebook: dữ liệu video không còn nằm trong HTML ("Cannot parse data") — khi đã
-     đăng nhập thì không được báo "cần đăng nhập".
+     đăng nhập thì không được báo "cần đăng nhập". Từ 24/10 (yt-dlp #17906) yt-dlp chỉ
+     đọc được khi giả dạng Firefox (`--impersonate firefox`, cần curl_cffi) — mục 7.
   4. Threads chuyển sang threads.com; Bilibili có đường dẫn /en/video/.
   5. Firefox 142+ lưu hạn cookie bằng mili-giây (Chromium chạy ngầm từ chối cả lô).
   6. Avatar / ảnh bìa trang cá nhân không bao giờ là "ảnh trong bài".
@@ -17,6 +18,7 @@ Kiểm thử các thay đổi chính sách / kỹ thuật của nền tảng (cu
 Chạy offline:  python3 -m pytest -q scripts/test_platform_policy_2026_10.py
 """
 
+import json
 import os
 import socket
 import sqlite3
@@ -40,6 +42,7 @@ from core.extractors.page_media import _decor_or_junk, load_cookie_jar
 from core.extractors.story import StoryExtractor
 from core.extractors.stream_sniffer import PlaywrightStreamSniffer
 from core.extractors.web_scraper import WebScraperExtractor
+from core.extractors.ytdlp import ImpersonationUnavailable, YtDlpExtractor, impersonation_target_for
 from core.models import CrawlMediaItem, MediaImage, MediaMetadata, ProfileCrawlResult
 from core.resolver import url_resolver
 from core.resolver.url_resolver import UrlResolver, dns_blocked_host
@@ -466,3 +469,122 @@ def test_sniffer_ignores_facebook_interface_files():
         assert not sniffer._is_media_url(url), url
     assert sniffer._is_media_url("https://cdn.example.com/hls/master.m3u8?token=1")
     assert sniffer._is_media_url("https://video.xx.fbcdn.net/v/t42/abc.mp4?bytestart=0")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Facebook 24/10/2026: yt-dlp chỉ đọc được trang khi giả dạng Firefox
+# ─────────────────────────────────────────────────────────────────────────────
+
+FB_REEL = "https://www.facebook.com/reel/1515445133963008"
+FB_CANNOT_PARSE_STDERR = (
+    "ERROR: [facebook] 1515445133963008: Cannot parse data; please report this issue on  "
+    "https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. "
+    "Confirm you are on the latest version using  yt-dlp -U\n"
+)
+# stderr THẬT của yt-dlp 2026.10.21 khi Python chạy nó không có curl_cffi
+IMPERSONATE_MISSING_STDERR = (
+    "Traceback (most recent call last):\n"
+    '  File "/usr/lib/python3/dist-packages/yt_dlp/YoutubeDL.py", line 768, in __init__\n'
+    "    raise YoutubeDLError(\n"
+    'yt_dlp.utils.YoutubeDLError: Impersonate target "firefox" is not available. Use '
+    "--list-impersonate-targets to see available targets. You may be missing dependencies "
+    "required to support this target.\n"
+)
+FB_INFO = {
+    "_type": "video", "id": "1515445133963008", "title": "Reel", "extractor": "facebook",
+    "extractor_key": "Facebook", "webpage_url": FB_REEL,
+    "formats": [{"format_id": "hd", "url": "https://video.xx.fbcdn.net/v/t42/hd.mp4", "ext": "mp4",
+                 "width": 1080, "height": 1920, "vcodec": "h264", "acodec": "aac"}],
+}
+
+
+def _fake_fb_ytdlp(tmp_path, impersonated):
+    """yt-dlp giả: không giả dạng thì "Cannot parse data"; với `--impersonate firefox` thì
+    `impersonated` = "ok" (đọc được video), "missing" (thiếu curl_cffi), "broken" (vẫn lỗi)."""
+    calls = tmp_path / "yt-dlp.calls"
+    script = tmp_path / "yt-dlp"
+    script.write_text(
+        "#!/usr/bin/env python3\nimport sys\n"
+        "if '--help' in sys.argv:\n    print('  --cookies FILE'); sys.exit(0)\n"
+        f"open({str(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "args = sys.argv[1:]\n"
+        "firefox = '--impersonate' in args and args[args.index('--impersonate') + 1] == 'firefox'\n"
+        f"mode = {impersonated!r} if firefox else 'broken'\n"
+        f"if mode == 'ok':\n    print({json.dumps(FB_INFO)!r}); sys.exit(0)\n"
+        f"if mode == 'missing':\n    sys.stderr.write({IMPERSONATE_MISSING_STDERR!r}); sys.exit(1)\n"
+        f"sys.stderr.write({FB_CANNOT_PARSE_STDERR!r}); sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return str(script), calls
+
+
+def _ytdlp_at(binary):
+    ext = YtDlpExtractor()
+    ext.binary_path = binary
+    return ext
+
+
+def test_only_facebook_cannot_parse_data_is_retried_as_firefox():
+    for url in (FB_REEL, "https://m.facebook.com/watch/?v=1", "https://fb.watch/abc/", "facebook.com/reel/1"):
+        assert impersonation_target_for(url, FB_CANNOT_PARSE_STDERR) == "firefox", url
+    assert impersonation_target_for(FB_REEL, "ERROR: [facebook] 1: This video is private") is None
+    assert impersonation_target_for("https://notfacebook.com/reel/1", FB_CANNOT_PARSE_STDERR) is None
+    assert impersonation_target_for("https://www.youtube.com/watch?v=x", FB_CANNOT_PARSE_STDERR) is None
+
+
+def test_facebook_is_read_as_firefox_with_the_same_login_cookies(tmp_path, browsers):
+    browsers["firefox"] = [_row(".facebook.com", "c_user", "1000")]
+    binary, calls = _fake_fb_ytdlp(tmp_path, "ok")
+    meta = _ytdlp_at(binary).extract_metadata(FB_REEL, browser="firefox")
+    assert meta.id == "1515445133963008" and meta.streams
+    runs = calls.read_text().splitlines()
+    assert len(runs) == 2
+    assert "--impersonate" not in runs[0], "lượt đầu chạy như cũ — Facebook chưa đổi ở mọi nơi"
+    assert "--impersonate firefox" in runs[1] and "--cookies" in runs[1], "giả dạng mà vẫn giữ phiên đăng nhập"
+
+
+def test_missing_curl_cffi_stops_with_the_original_page_error(tmp_path, browsers):
+    browsers["firefox"] = [_row(".facebook.com", "c_user", "1000")]
+    binary, calls = _fake_fb_ytdlp(tmp_path, "missing")
+    with pytest.raises(ImpersonationUnavailable) as info:
+        _ytdlp_at(binary).extract_metadata(FB_REEL, browser="firefox")
+    assert "Cannot parse data" in str(info.value), "Chi tiết là lỗi của trang, không phải traceback"
+    assert len(calls.read_text().splitlines()) == 2, "lượt chạy lại không cookie chỉ ra đúng lỗi cũ"
+
+
+def test_impersonation_that_still_fails_is_not_retried_again(tmp_path, browsers):
+    browsers["firefox"] = [_row(".facebook.com", "c_user", "1000")]
+    binary, calls = _fake_fb_ytdlp(tmp_path, "broken")
+    with pytest.raises(RuntimeError) as info:
+        _ytdlp_at(binary).extract_metadata(FB_REEL, browser="firefox")
+    assert not isinstance(info.value, ImpersonationUnavailable)
+    runs = calls.read_text().splitlines()
+    # có cookie → có cookie + Firefox → không cookie + Firefox
+    assert len(runs) == 3 and all("--impersonate firefox" in r for r in runs[1:])
+    assert "--cookies" in runs[1] and "--cookies" not in runs[2]
+
+
+def test_other_sites_are_never_impersonated(tmp_path, browsers):
+    binary, calls = _fake_fb_ytdlp(tmp_path, "ok")
+    with pytest.raises(RuntimeError):
+        _ytdlp_at(binary).extract_metadata("https://www.bilibili.com/video/BV13x41117TL", browser="none")
+    assert "--impersonate" not in calls.read_text()
+
+
+def test_dispatcher_asks_to_install_curl_cffi_not_to_log_in_or_update(tmp_path, monkeypatch, browsers):
+    binary, _ = _fake_fb_ytdlp(tmp_path, "missing")
+    d = MediaDispatcher()
+    d.ytdlp.binary_path = binary
+    monkeypatch.setattr(d.resolver, "resolve_url", lambda url, expected_platform=None: type(
+        "R", (), {"is_shortened": False, "resolved_url": url})())
+    monkeypatch.setattr(d.gallery, "extract_gallery", lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("gallery-dl extract thất bại: Unsupported URL")))
+    monkeypatch.setattr(d.web_scraper, "extract", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("không có video")))
+    # Khách (chưa đăng nhập): trước đây "Cannot parse data" luôn bị báo là cần đăng nhập
+    with pytest.raises(RuntimeError) as info:
+        d.extract(FB_REEL, browser="none")
+    msg = str(info.value)
+    assert msg.startswith("Facebook vừa thay đổi") and "thiếu thư viện curl_cffi" in msg
+    assert "pip install --upgrade curl_cffi" in msg
+    assert "yêu cầu đăng nhập" not in msg and "Bản mới nhất" not in msg
