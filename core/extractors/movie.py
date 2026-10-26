@@ -42,7 +42,7 @@ MOVIE_PATH_KEYWORDS = [
 
 EXCLUDED_SOCIAL_DOMAINS = [
     "youtube.com", "youtu.be", "facebook.com", "fb.watch", "fb.com",
-    "instagram.com", "instagr.am", "tiktok.com", "twitter.com", "x.com",
+    "instagram.com", "instagr.am", "tiktok.com", "douyin.com", "twitter.com", "x.com",
     "pinterest.com", "pin.it", "reddit.com", "redd.it", "soundcloud.com",
     "twitch.tv", "dailymotion.com", "dai.ly", "bilibili.com", "b23.tv",
     "threads.com", "threads.net", "bsky.app",

@@ -178,6 +178,16 @@ _DATA_SRCSET_ATTRS = ("data-bgset", "data-srcset", "data-background-set")
 # Thẻ đã có cách đọc riêng (hoặc không bao giờ chứa media của bài)
 _NO_DATA_SCAN_TAGS = frozenset({"img", "source", "video", "audio", "iframe", "script", "style", "link", "meta", "base", "input"})
 
+# Trang AMP (bản báo mobile mà Google chia sẻ) dùng thẻ riêng thay cho <img> / <video> /
+# <iframe>: trước đây chúng bị bỏ qua, link AMP của một bài báo chỉ ra video, mất hết ảnh.
+_AMP_IMAGE_TAGS = frozenset({"amp-img", "amp-anim"})
+_VIDEO_TAGS = frozenset({"video", "audio", "amp-video", "amp-audio"})
+_AMP_EMBED_URLS = {
+    "amp-youtube": "https://www.youtube.com/embed/{}",
+    "amp-vimeo": "https://player.vimeo.com/video/{}",
+    "amp-dailymotion": "https://www.dailymotion.com/embed/video/{}",
+}
+
 
 class NoPostMediaError(RuntimeError):
     """Không thấy ảnh/video nào trong bài viết.
@@ -328,8 +338,33 @@ def media_kind_of_url(url: str) -> Optional[str]:
     return None
 
 
+# Ký tự giữ nguyên khi mã hoá path / query (ngoài chữ, số và "_.-~"). Còn lại — dấu cách,
+# chữ có dấu, " < > ` { } \ — được mã hoá %XX như trình duyệt làm; "%" giữ nguyên để
+# URL đã mã hoá sẵn không bị mã hoá hai lần.
+_URL_PATH_SAFE = "/%:@!$&'()*+,;=[]|^"
+_URL_QUERY_SAFE = _URL_PATH_SAFE + "?"
+
+
+def _encode_netloc(netloc: str) -> str:
+    """Tên miền có dấu (IDN, vd. "bóngđá.vn") → dạng punycode mà curl / urllib nhận."""
+    if netloc.isascii():
+        return netloc
+    userinfo, at, hostport = netloc.rpartition("@")
+    host, colon, port = hostport.partition(":")
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return netloc
+    return f"{userinfo}{at}{host}{colon}{port}"
+
+
 def _clean_url(raw: Optional[str], base: str) -> Optional[str]:
-    """URL tuyệt đối http(s) hoặc None (data:, blob:, javascript:, quá dài...)."""
+    """URL tuyệt đối http(s) đã mã hoá đúng chuẩn, hoặc None (data:, blob:, javascript:, quá dài...).
+
+    Trang web hay ghi thẳng tên tệp có dấu cách / tiếng Việt (`<img src="/uploads/ảnh đẹp
+    1.jpg">`): trình duyệt tự mã hoá nên vẫn hiện ảnh, còn curl từ chối URL đó ("URL
+    rejected: Malformed input") — bài viết phân tích ra đủ ảnh nhưng tải tệp nào cũng hỏng.
+    """
     if not raw or not isinstance(raw, str):
         return None
     value = raw.strip()
@@ -346,7 +381,13 @@ def _clean_url(raw: Optional[str], base: str) -> Optional[str]:
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return None
     # Bỏ phần #fragment: cùng một tệp, khác fragment là trùng
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+    return urllib.parse.urlunsplit((
+        parts.scheme,
+        _encode_netloc(parts.netloc),
+        urllib.parse.quote(parts.path, safe=_URL_PATH_SAFE),
+        urllib.parse.quote(parts.query, safe=_URL_QUERY_SAFE),
+        "",
+    ))
 
 
 def _is_placeholder(raw: Optional[str]) -> bool:
@@ -854,18 +895,29 @@ class _MediaHTMLParser(HTMLParser):
             kind = media_kind_of_url(href) if href else None
             if kind in ("image", "video"):
                 self._link = {"url": href, "kind": kind, "depth": depth, "used": False}
+        elif tag in _AMP_IMAGE_TAGS:
+            # Ảnh bìa tạm (`placeholder` / `fallback`) của khung video AMP không phải ảnh bài viết
+            if "placeholder" not in attrs and "fallback" not in attrs:
+                self._void("img", attrs)
+        elif tag in _AMP_EMBED_URLS:
+            video_id = (attrs.get("data-videoid") or "").strip()
+            if video_id and len(video_id) <= 64:
+                cand, _ = iframe_candidate(
+                    _AMP_EMBED_URLS[tag].format(urllib.parse.quote(video_id, safe="")), self.base_url
+                )
+                self._add(cand)
         elif tag == "picture":
             self._picture = {"sets": [], "depth": depth}
-        elif tag in ("video", "audio"):
+        elif tag in _VIDEO_TAGS:
             self._video = {
-                "tag": tag,
+                "tag": "audio" if tag.endswith("audio") else "video",
                 "src": attrs.get("src") or attrs.get("data-src") or "",
                 "poster": attrs.get("poster") or attrs.get("data-poster") or "",
                 "sources": [],
                 "depth": depth,
                 "path": tuple(self.open),
             }
-        elif tag == "iframe":
+        elif tag in ("iframe", "amp-iframe"):
             cand, unknown = iframe_candidate(
                 attrs.get("src") or attrs.get("data-src") or attrs.get("data-lazy-src"), self.base_url
             )
@@ -939,7 +991,7 @@ class _MediaHTMLParser(HTMLParser):
                     self._add(video_candidate(link["url"], [], link.get("thumb"), self.base_url))
         elif tag == "picture" and self._picture and self._picture["depth"] == depth:
             self._picture = None
-        elif tag in ("video", "audio") and self._video and self._video["depth"] == depth:
+        elif tag in _VIDEO_TAGS and self._video and self._video["depth"] == depth:
             video = self._video
             self._video = None
             if video["tag"] == "audio":

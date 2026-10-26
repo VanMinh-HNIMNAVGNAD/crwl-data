@@ -58,7 +58,7 @@ class MediaDispatcher(BaseExtractor):
     # khiến dispatcher định tuyến sang engine sai.
     _VIDEO_AUDIO_DOMAINS = (
         "youtube.com", "youtu.be",
-        "tiktok.com",
+        "tiktok.com", "douyin.com",
         "twitch.tv",
         "dailymotion.com", "dai.ly",
         "soundcloud.com",
@@ -119,6 +119,10 @@ class MediaDispatcher(BaseExtractor):
             # redd.it chỉ tính là video khi là v.redd.it
             if self._host_is(host, "redd.it"):
                 return host.startswith("v.")
+            # Bài ảnh TikTok: yt-dlp chỉ nhận /video/ nên link /photo/ từng chạy bộ đọc trang
+            # chung của yt-dlp (vô ích) trước khi tới gallery-dl — công cụ tải được bài ảnh.
+            if self._host_is(host, "tiktok.com") and "/photo/" in self._path_of(url):
+                return False
             return True
 
         # Facebook Video / Reel / Watch
@@ -151,7 +155,9 @@ class MediaDispatcher(BaseExtractor):
         path = self._path_of(url)
 
         if self._host_in(host, ("instagram.com", "instagr.am")):
-            return any(p in path for p in ("/p/", "/reel/", "/reels/", "/stories/", "/tv/"))
+            # /share/<mã>: link "Chia sẻ" của app Instagram (gallery-dl nhận, yt-dlp thì không).
+            # Không giải mã chuyển hướng trước: khách chưa đăng nhập bị chuyển sang trang đăng nhập.
+            return any(p in path for p in ("/p/", "/reel/", "/reels/", "/stories/", "/tv/", "/share/"))
 
         # Facebook Photos / Posts / Albums
         if self._host_in(host, self._FACEBOOK_DOMAINS):
@@ -305,6 +311,7 @@ class MediaDispatcher(BaseExtractor):
         target_url = resolved.resolved_url if resolved.is_shortened else trimmed
         target_url = self._normalize_facebook_single_url(target_url)
         target_url = self._normalize_bilibili_url(target_url)
+        target_url = UrlResolver.normalize_douyin_url(target_url)
 
         # 1. Tên miền bị DNS chặn: mọi engine đều chỉ nhận "Connection refused"
         blocked = dns_blocked_host(target_url)

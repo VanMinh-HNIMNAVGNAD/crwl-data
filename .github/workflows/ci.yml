@@ -83,5 +83,12 @@ jobs:
       - name: Cài dependency Python
         run: pip install pytest yt-dlp gallery-dl curl_cffi requests
 
+      # Chromium chạy ngầm cho trang dựng bằng JS / dò luồng video: không có thì các test
+      # đọc trang bằng trình duyệt thật và test rò rỉ Chromium luôn bị bỏ qua.
+      - name: Cài Playwright + Chromium
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
       - name: Pytest
         run: pytest scripts -q

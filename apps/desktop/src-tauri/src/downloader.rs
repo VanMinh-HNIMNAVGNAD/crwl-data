@@ -3368,6 +3368,21 @@ impl DownloaderService {
     /// URL http(s) trỏ tới địa chỉ công khai (không phải localhost / mạng nội bộ).
     /// DNS được phân giải bất đồng bộ: trước đây `to_socket_addrs()` chặn luồng
     /// của tokio trong lúc chờ DNS, mỗi tệp của album chiếm một luồng runtime.
+    /// URL gửi cho curl, đã mã hoá như trình duyệt: dấu cách, chữ có dấu trong đường dẫn /
+    /// query → `%XX`, tên miền có dấu → punycode, bỏ `#fragment`. curl từ chối URL thô
+    /// ("URL rejected: Malformed input") — trang ghi thẳng `<img src="/ảnh đẹp 1.jpg">`
+    /// từng phân tích ra đủ ảnh mà tải tệp nào cũng hỏng. Không đọc được thì giữ nguyên
+    /// (`is_public_http_url` sẽ từ chối).
+    fn request_url(raw: &str) -> String {
+        match url::Url::parse(raw.trim()) {
+            Ok(mut parsed) => {
+                parsed.set_fragment(None);
+                parsed.to_string()
+            }
+            Err(_) => raw.to_string(),
+        }
+    }
+
     async fn is_public_http_url(raw_url: &str) -> bool {
         let parsed = match url::Url::parse(raw_url) {
             Ok(value) if matches!(value.scheme(), "http" | "https") => value,
@@ -3431,7 +3446,7 @@ impl DownloaderService {
         const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
         let proxy = SettingsManager::proxy();
 
-        let mut current = url.to_string();
+        let mut current = Self::request_url(url);
         let mut hops = 0usize;
         loop {
             if !Self::is_public_http_url(&current).await {
@@ -3620,7 +3635,7 @@ impl DownloaderService {
         let mut public_origins: HashMap<String, bool> = HashMap::new();
         // (chỉ số mục, URL hiện tại) — URL đổi sau mỗi lần chuyển hướng
         let mut pending: Vec<(usize, String)> =
-            items.iter().enumerate().map(|(i, it)| (i, it.url.clone())).collect();
+            items.iter().enumerate().map(|(i, it)| (i, Self::request_url(&it.url))).collect();
 
         for _hop in 0..=MAX_REDIRECTS {
             if pending.is_empty() {
@@ -4828,7 +4843,8 @@ mod tests {
                             };
 
                             let (status, content_type, body): (&str, &str, Vec<u8>) = match path {
-                                "/valid_image.jpg" | "/anh[1].jpg" | "/slow_image.jpg" => (
+                                "/valid_image.jpg" | "/anh[1].jpg" | "/slow_image.jpg"
+                                | "/%E1%BA%A3nh%20%C4%91%E1%BA%B9p%201.jpg" => (
                                     "200 OK",
                                     "image/jpeg",
                                     vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01, 0x00, 0x60, 0x00, 0x60, 0x00, 0x00, 0xFF, 0xD9],
@@ -4922,6 +4938,8 @@ mod tests {
         let cases: &[(&str, &str, bool)] = &[
             ("/valid_image.jpg", "anh 1.jpg", true),
             ("/anh[1].jpg", "ngoac.jpg", true),
+            // Trang ghi thẳng tên tệp có dấu cách / tiếng Việt: phải mã hoá trước khi gọi curl
+            ("/ảnh đẹp 1.jpg", "tieng-viet.jpg", true),
             ("/valid_video.mp4", "clip \"trích\" \\ 2.mp4", true),
             ("/challenge.html", "gia.jpg", false),
             ("/error.json", "loi.jpg", false),
@@ -4949,7 +4967,7 @@ mod tests {
             assert_eq!(dir.join(name).is_file(), *expect_ok, "{path}: tệp hỏng không được để lại");
         }
         assert_eq!(results[0].1.as_deref(), Some("image/jpeg"));
-        assert_eq!(results[2].1.as_deref(), Some("video/mp4"));
+        assert_eq!(results[3].1.as_deref(), Some("video/mp4"));
         assert_eq!(seen, (1..=cases.len()).collect::<Vec<_>>(), "tiến trình phải báo từng tệp, tăng dần");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5025,6 +5043,34 @@ mod tests {
         assert!(!looped.exists(), "Vòng chuyển hướng vô hạn phải dừng và không để lại tệp");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// curl từ chối URL thô có dấu cách / chữ có dấu ("URL rejected: Malformed input"):
+    /// trang `<img src="/ảnh đẹp 1.jpg">` từng phân tích ra đủ ảnh mà tải tệp nào cũng hỏng.
+    #[test]
+    fn request_urls_are_encoded_like_a_browser() {
+        assert_eq!(
+            D::request_url("http://h.vn/up/ảnh đẹp 1.jpg?q=a b#xem"),
+            "http://h.vn/up/%E1%BA%A3nh%20%C4%91%E1%BA%B9p%201.jpg?q=a%20b"
+        );
+        // Đã mã hoá sẵn: giữ nguyên, không mã hoá hai lần
+        let encoded = "https://cdn.vn/a/%E1%BA%A3nh%20x.jpg?w=1080&q=75";
+        assert_eq!(D::request_url(encoded), encoded);
+        assert!(D::request_url("https://bóngđá.vn/a.jpg").starts_with("https://xn--"));
+        assert_eq!(D::request_url("khong phai url"), "khong phai url");
+    }
+
+    #[tokio::test]
+    async fn file_names_with_spaces_and_accents_still_download() {
+        let (server_url, _shutdown) = run_mock_server().await;
+        let dir = std::env::temp_dir().join(format!("test_accents_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("anh.jpg");
+        let (ok, ct) = D::curl_to_file_with_meta(&format!("{server_url}/ảnh đẹp 1.jpg"), "", &dest).await;
+        assert!(ok, "URL có dấu cách / chữ có dấu phải tải được");
+        assert_eq!(ct.as_deref(), Some("image/jpeg"));
+        assert!(dest.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

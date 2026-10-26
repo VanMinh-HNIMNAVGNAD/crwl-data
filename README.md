@@ -28,7 +28,7 @@
 | Nền tảng | Nội dung hỗ trợ | Định dạng trích xuất |
 | :--- | :--- | :--- |
 | **YouTube** | Video, Shorts, Music, Playlist | 8K/4K/1080p, MP3/M4A, Subtitles, Thumbnail |
-| **TikTok / Douyin** | Video, Slideshow/Photo post, Âm thanh gốc | Video No-Watermark (HD), Zip ảnh, Audio MP3 |
+| **TikTok / Douyin** | Video, Slideshow/Photo post, Âm thanh gốc (Douyin: video, kể cả link `v.douyin.com`) | Video No-Watermark (HD), Zip ảnh, Audio MP3 |
 | **Facebook** | Reels, Watch Video, Public Post | Full HD / HD / SD, Audio |
 | **Instagram** | Reels, Posts, Carousel Album, Stories | Video gốc, Ảnh phân giải cao, Zip trọn bộ |
 | **Twitter / X** | Video tweets, GIF, Multi-image posts | Đa phân giải (1080p, 720p), Ảnh JPG/PNG |
@@ -111,7 +111,8 @@ flowchart TD
   - App đọc luồng bằng ffprobe để biết link có **hình, tiếng hay cả hai** và độ phân giải thật — luồng chỉ có hình ghi rõ "Không tiếng", luồng chỉ có tiếng chỉ hiện lựa chọn âm thanh kèm lời giải thích.
   - Dán **một mảnh** `.ts` / `.m4s` (vài giây): app tự dò danh sách phát đầy đủ (`.m3u8` / `.mpd`) cùng thư mục hoặc thư mục cha để tải nguyên video; mảnh `.m4s` không tự phát được mà không tìm thấy danh sách phát thì báo rõ thay vì mời tải. Tệp `.m4s` hoàn chỉnh (vd. Bilibili) được đổi sang `.mp4` khi tải.
   - Link bị chặn (403, thiếu Referer) hoặc đã hết hạn (404) báo ngay kèm cách xử lý (dán link **trang** chứa video) thay vì thử thêm 5-40 giây rồi trả về kết quả không tải được.
-- [x] **Bài viết trên trang web bất kỳ:** Dán link một bài viết (blog, báo điện tử, diễn đàn, trang dựng bằng JavaScript...) — app lấy **toàn bộ** ảnh và video của bài: ảnh lazy-load, `srcset` / `<picture>` (tự chọn bản lớn nhất để tải, bản nhỏ để xem trước), link "xem ảnh gốc", khung so sánh trước/sau, thẻ `<video>`, video nhúng YouTube / Vimeo / Dailymotion / Facebook, luồng HLS/DASH, ảnh trong JSON-LD.
+- [x] **Bài viết trên trang web bất kỳ:** Dán link một bài viết (blog, báo điện tử, diễn đàn, trang dựng bằng JavaScript...) — app lấy **toàn bộ** ảnh và video của bài: ảnh lazy-load, `srcset` / `<picture>` (tự chọn bản lớn nhất để tải, bản nhỏ để xem trước), link "xem ảnh gốc", khung so sánh trước/sau, thẻ `<video>`, video nhúng YouTube / Vimeo / Dailymotion / Facebook, luồng HLS/DASH, ảnh trong JSON-LD, trang AMP (bản báo mobile Google chia sẻ: `<amp-img>`, `<amp-video>`, `<amp-youtube>`).
+  - Tên tệp có dấu cách / tiếng Việt (`ảnh đẹp 1.jpg`) được mã hoá như trình duyệt trước khi tải.
   - Tự nhận ra vùng **bài viết** và bỏ logo, menu, quảng cáo, bài liên quan, bình luận, emoji, avatar. Trang nhiều bài (thread diễn đàn, trang chuyên mục) lấy media của mọi bài.
   - **Có hoặc không đăng nhập đều được:** app dùng cookie của trình duyệt bạn đang đăng nhập (hoặc cookie dán trong Cookie Manager 🍪) cho **đúng tên miền** của trang — cả khi đọc bài lẫn khi tải từng tệp. Chọn "không dùng cookie" thì không đọc cookie nào.
   - Trang dựng bằng JavaScript, cần đăng nhập, ảnh nạp khi cuộn, player video ẩn: app mở trang bằng Chromium chạy ngầm (cần Playwright, xem bên dưới), cuộn hết trang rồi đọc lại. Chromium tự đóng sau 3 phút không dùng.

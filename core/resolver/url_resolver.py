@@ -31,6 +31,11 @@ SUPPORTED_PLATFORMS = [
         "domains": ["tiktok.com"],
     },
     {
+        "id": "douyin",
+        "name": "Douyin",
+        "domains": ["douyin.com", "iesdouyin.com"],
+    },
+    {
         "id": "facebook",
         "name": "Facebook",
         "domains": ["facebook.com", "fb.watch", "fb.com", "fb.me"],
@@ -276,6 +281,15 @@ class UrlResolver:
         # TikTok shortlink like vt.tiktok.com or vm.tiktok.com
         if hostname.endswith(".tiktok.com") and hostname != "www.tiktok.com" and hostname != "tiktok.com":
             return True
+        # Douyin: nút "Chia sẻ" chỉ tạo link v.douyin.com/<mã> — yt-dlp không nhận dạng này
+        if hostname == "v.douyin.com":
+            return True
+        # Nút "Chia sẻ" của app Reddit: /r/<sub>/s/<mã> chuyển hướng tới bài /comments/<id>/.
+        # yt-dlp không nhận dạng /s/ nên bài video chỉ còn bản gallery-dl, thiếu lựa chọn chất lượng.
+        if cls.match_domain(hostname, "reddit.com"):
+            raw = url.strip() if re.match(r"^https?://", url.strip(), re.I) else "https://" + url.strip()
+            if re.match(r"^/(?:r|u|user)/[^/]+/s/[A-Za-z0-9]+/?$", urllib.parse.urlparse(raw).path or ""):
+                return True
         return False
 
     @staticmethod
@@ -315,6 +329,19 @@ class UrlResolver:
             query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
             return "https://www.youtube.com/watch?" + urllib.parse.urlencode([("v", video_id)] + query)
         return None
+
+    @staticmethod
+    def normalize_douyin_url(url: str) -> str:
+        """Link Douyin dạng chia sẻ → `www.douyin.com/video/<id>`, dạng duy nhất yt-dlp nhận.
+
+        v.douyin.com/<mã> chuyển hướng tới `www.iesdouyin.com/share/video/<id>/?...`; trang
+        di động `m.douyin.com/share/video/<id>` cũng vậy. Với các dạng đó yt-dlp chỉ chạy bộ
+        đọc trang chung và báo "Unsupported URL".
+        """
+        m = re.match(
+            r"^https?://(?:www\.|m\.)?(?:ies)?douyin\.com/share/video/(\d{6,})", (url or "").strip(), re.IGNORECASE
+        )
+        return f"https://www.douyin.com/video/{m.group(1)}" if m else url
 
     @classmethod
     def unshorten_url(cls, url: str, max_hops: int = 5, timeout: int = 10) -> str:
@@ -465,6 +492,8 @@ class UrlResolver:
                     m_p = re.search(r"/share/p/(\d+)", resolved_url)
                     if m_p:
                         resolved_url = f"https://www.facebook.com/photo/?fbid={m_p.group(1)}"
+
+        resolved_url = cls.normalize_douyin_url(resolved_url)
 
         platform_id, platform_name = cls.detect_platform(resolved_url)
         is_supported = platform_id is not None and platform_id != "generic"
