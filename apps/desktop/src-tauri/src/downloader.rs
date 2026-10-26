@@ -192,6 +192,9 @@ const ALBUM_DIR_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60
 /// hệ điều hành có thể giết luôn ứng dụng. Lượt vượt mức nay xếp hàng (huỷ được).
 const MAX_CONCURRENT_YTDLP_DOWNLOADS: usize = 3;
 
+/// Trình duyệt yt-dlp giả dạng khi chạy lại sau lỗi trang đã đổi (xem impersonation_target_for).
+const IMPERSONATE_TARGET: &str = "firefox";
+
 static YTDLP_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 fn ytdlp_slots() -> Arc<tokio::sync::Semaphore> {
@@ -756,6 +759,43 @@ impl DownloaderService {
         })
     }
 
+    /// Trình duyệt cần giả dạng khi chạy lại yt-dlp sau lỗi `stderr_lines` ở `url`, hoặc None.
+    ///
+    /// Facebook đang đổi dần cách trả trang video (10/2026, yt-dlp #17906): yt-dlp báo
+    /// "Cannot parse data" cho cả reel / watch công khai, kể cả khi đã đăng nhập, và chưa
+    /// có bản sửa. Giả dạng Firefox (`--impersonate firefox`: TLS + header của Firefox, cần
+    /// thư viện curl_cffi) thì Facebook lại trả trang đầy đủ. Engine Python thử lại y như
+    /// vậy ở bước phân tích (`impersonation_target_for` trong core/extractors/ytdlp.py).
+    fn impersonation_target_for(url: &str, stderr_lines: &[String]) -> Option<&'static str> {
+        let page_changed = stderr_lines
+            .iter()
+            .any(|l| l.to_lowercase().contains("cannot parse data"));
+        (page_changed && Self::detect_platform_from_url(url) == Some("facebook")).then_some(IMPERSONATE_TARGET)
+    }
+
+    /// yt-dlp không giả dạng được trình duyệt: Python chạy nó thiếu curl_cffi
+    /// (`Impersonate target "firefox" is not available`), hoặc bản quá cũ chưa có `--impersonate`.
+    fn is_impersonation_unavailable(stderr_lines: &[String]) -> bool {
+        stderr_lines.iter().any(|l| {
+            let lower = l.to_lowercase();
+            (lower.contains("impersonate target") && lower.contains("is not available"))
+                || lower.contains("no such option: --impersonate")
+        })
+    }
+
+    /// Lỗi khi phải giả dạng Firefox mới tải được mà thiếu curl_cffi — cùng câu với engine
+    /// Python (dispatcher._site_changed_error) để giao diện nhận ra cả hai.
+    fn impersonation_missing_message(detail: &str) -> String {
+        let mut msg = "Facebook vừa thay đổi cách tải dữ liệu: yt-dlp phải giả dạng trình duyệt Firefox mới \
+             tải được video này nhưng Python đang chạy yt-dlp thiếu thư viện curl_cffi. Hãy cài: \
+             pip install --upgrade curl_cffi (yt-dlp cài bằng pipx: pipx inject yt-dlp curl_cffi) rồi tải lại."
+            .to_string();
+        if !detail.is_empty() {
+            msg.push_str(&format!(" (Chi tiết: {detail})"));
+        }
+        msg
+    }
+
     /// Dựng lệnh yt-dlp cho một lượt tải (mỗi lần thử cần một `Command` mới).
     fn build_ytdlp_command(
         ytdlp_path: &Path,
@@ -763,6 +803,7 @@ impl DownloaderService {
         opts: &DownloadOptions,
         js_runtime: Option<&str>,
         cookies: &CookieArg,
+        impersonate: Option<&str>,
     ) -> Command {
         // Giới hạn cả title và id ngay trong template: yt-dlp mở file trước khi
         // backend có cơ hội đổi tên sau đó, nên chỉ sanitize ở Rust là chưa đủ.
@@ -798,6 +839,11 @@ impl DownloaderService {
         // (xem BinaryManager::ytdlp_supports_js_runtimes).
         if let Some(runtime) = js_runtime {
             cmd.arg("--js-runtimes").arg(runtime);
+        }
+
+        // Chỉ có ở lượt thử lại sau lỗi trang đã đổi (xem impersonation_target_for)
+        if let Some(target) = impersonate {
+            cmd.arg("--impersonate").arg(target);
         }
 
         // Số mảnh HLS/DASH tải song song. Tải tuần tự từng mảnh (-N 1) chậm theo độ trễ
@@ -1027,6 +1073,7 @@ impl DownloaderService {
             _ => None,
         };
         let mut cookies = Self::cookie_arg_for(&opts);
+        let mut impersonate: Option<&'static str> = None;
 
         // Mã tác vụ: UI lọc sự kiện tiến trình theo mã này nên nhiều tệp tải
         // song song không còn ghi đè lên nhau trên cùng một thanh tiến trình.
@@ -1106,13 +1153,23 @@ impl DownloaderService {
         // render, nhân với số video tải song song thì UI giật và CPU tăng vọt.
         const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-        // Tối đa hai lượt: lượt thứ hai chỉ chạy khi lượt đầu thất bại vì không đọc
-        // được cookie của trình duyệt. Trước đây lỗi đó (trình duyệt "Chưa cài", DB
-        // cookie bị trình duyệt đang mở khoá, mã hoá DPAPI trên Windows...) làm MỌI
-        // lượt tải thất bại kể cả nội dung công khai, kèm thông báo sai là "cần đăng
-        // nhập". Engine bóc tách (Python) vốn đã tự thử lại không cookie như vậy.
+        // Lượt chạy lại chỉ có khi lượt trước thất bại vì không đọc được cookie của
+        // trình duyệt (chạy lại không cookie), hoặc vì trang Facebook đã đổi (chạy lại
+        // giả dạng Firefox) — mỗi kiểu tối đa một lần. Trước đây lỗi cookie (trình duyệt
+        // "Chưa cài", DB cookie bị trình duyệt đang mở khoá, mã hoá DPAPI trên Windows...)
+        // làm MỌI lượt tải thất bại kể cả nội dung công khai, kèm thông báo sai là "cần
+        // đăng nhập". Engine bóc tách (Python) vốn đã tự thử lại như vậy.
+        // Lỗi của lượt chưa giả dạng: thiếu curl_cffi thì báo lỗi này thay cho traceback.
+        let mut stderr_before_impersonation: Option<Vec<String>> = None;
         let (status, collected_stderr, downloaded_file_path, printed_final_path, overall_percent) = loop {
-            let mut cmd = Self::build_ytdlp_command(&ytdlp_path, &dest_folder, &opts, js_runtime.as_deref(), &cookies);
+            let mut cmd = Self::build_ytdlp_command(
+                &ytdlp_path,
+                &dest_folder,
+                &opts,
+                js_runtime.as_deref(),
+                &cookies,
+                impersonate,
+            );
 
             info!("Bắt đầu tải tệp với yt-dlp [{task_id}]: {}", opts.url);
             let mut child = match cmd.spawn() {
@@ -1468,7 +1525,38 @@ impl DownloaderService {
                 continue;
             }
 
+            if !status.success() && impersonate.is_none() {
+                if let Some(target) = Self::impersonation_target_for(&opts.url, &collected_stderr) {
+                    warn!(
+                        "[{task_id}] yt-dlp không đọc được trang ({}) — thử lại giả dạng trình duyệt {target}",
+                        collected_stderr.last().map(String::as_str).unwrap_or("")
+                    );
+                    progress_emit(DownloadProgressPayload::new(
+                        &task_id,
+                        0.0,
+                        "preparing",
+                        "Facebook vừa đổi cách tải dữ liệu — đang thử lại giả dạng trình duyệt Firefox...",
+                    ));
+                    if let Some(pid) = child_pid {
+                        Self::unregister_pid(&task_id, pid).await;
+                    }
+                    impersonate = Some(target);
+                    stderr_before_impersonation = Some(collected_stderr);
+                    continue;
+                }
+            }
+
             break (status, collected_stderr, downloaded_file_path, printed_final_path, overall_percent);
+        };
+
+        // Lượt giả dạng không chạy được vì thiếu curl_cffi: lỗi đáng báo là lỗi của trang
+        // ở lượt trước, kèm cách cài — không phải traceback "Impersonate target ...".
+        let impersonation_missing = !status.success()
+            && impersonate.is_some()
+            && Self::is_impersonation_unavailable(&collected_stderr);
+        let collected_stderr = match stderr_before_impersonation {
+            Some(before) if impersonation_missing => before,
+            _ => collected_stderr,
         };
 
         let media_file_exists = printed_final_path
@@ -1499,7 +1587,9 @@ impl DownloaderService {
         let failure = if !status.success() && !thumbnail_only_failure {
             // Báo đúng nguyên nhân từ yt-dlp thay vì một câu chung chung
             let detail = Self::summarize_ytdlp_error(&collected_stderr);
-            Some(if detail.is_empty() {
+            Some(if impersonation_missing {
+                Self::impersonation_missing_message(&detail)
+            } else if detail.is_empty() {
                 format!("Tải thất bại (yt-dlp kết thúc với mã {})", status.code().unwrap_or(-1))
             } else {
                 detail
@@ -5234,9 +5324,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let ytdlp = std::path::Path::new("/usr/bin/true");
 
-        let plain = args_of(&D::build_ytdlp_command(ytdlp, &dir, &opts, None, &super::CookieArg::None));
+        let plain = args_of(&D::build_ytdlp_command(ytdlp, &dir, &opts, None, &super::CookieArg::None, None));
         assert!(!plain.iter().any(|a| a == "--js-runtimes"), "yt-dlp cũ không hiểu --js-runtimes");
         assert!(!plain.iter().any(|a| a.starts_with("--cookies")));
+        assert!(!plain.iter().any(|a| a == "--impersonate"), "chỉ giả dạng ở lượt thử lại");
 
         let full = args_of(&D::build_ytdlp_command(
             ytdlp,
@@ -5244,11 +5335,60 @@ mod tests {
             &opts,
             Some("node:/usr/bin/node"),
             &super::CookieArg::Browser("firefox".to_string()),
+            Some("firefox"),
         ));
         let pos = full.iter().position(|a| a == "--js-runtimes").expect("thiếu --js-runtimes");
         assert_eq!(full[pos + 1], "node:/usr/bin/node");
         let pos = full.iter().position(|a| a == "--cookies-from-browser").expect("thiếu cookie trình duyệt");
         assert_eq!(full[pos + 1], "firefox");
+        let pos = full.iter().position(|a| a == "--impersonate").expect("thiếu --impersonate");
+        assert_eq!(full[pos + 1], "firefox");
+    }
+
+    /// Facebook 24/10/2026 (yt-dlp #17906): "Cannot parse data" → tải lại giả dạng Firefox.
+    /// Chỉ Facebook, chỉ đúng lỗi đó — trang khác / lỗi khác chạy y như cũ.
+    #[test]
+    fn facebook_page_change_is_retried_as_firefox() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cannot_parse = lines(&[
+            "[facebook] Extracting URL: https://www.facebook.com/reel/1515445133963008",
+            "ERROR: [facebook] 1515445133963008: Cannot parse data; please report this issue on  \
+             https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template",
+        ]);
+        for url in [
+            "https://www.facebook.com/reel/1515445133963008",
+            "https://m.facebook.com/watch/?v=1",
+            "https://fb.watch/abc/",
+        ] {
+            assert_eq!(D::impersonation_target_for(url, &cannot_parse), Some("firefox"), "{url}");
+        }
+        assert_eq!(D::impersonation_target_for("https://www.youtube.com/watch?v=x", &cannot_parse), None);
+        assert_eq!(D::impersonation_target_for("https://notfacebook.com/reel/1", &cannot_parse), None);
+        let private = lines(&["ERROR: [facebook] 1: This video is only available for registered users"]);
+        assert_eq!(D::impersonation_target_for("https://www.facebook.com/reel/1", &private), None);
+    }
+
+    /// stderr THẬT của yt-dlp 2026.10.21 khi Python chạy nó thiếu curl_cffi (không có
+    /// tiền tố "ERROR:") phải được nhận ra, và lỗi báo cho người dùng là cách cài curl_cffi.
+    #[test]
+    fn missing_curl_cffi_is_recognised_and_explained() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let missing = lines(&[
+            "Traceback (most recent call last):",
+            "File \"/usr/lib/python3/dist-packages/yt_dlp/YoutubeDL.py\", line 768, in __init__",
+            "yt_dlp.utils.YoutubeDLError: Impersonate target \"firefox\" is not available. Use \
+             --list-impersonate-targets to see available targets. You may be missing dependencies \
+             required to support this target.",
+        ]);
+        assert!(D::is_impersonation_unavailable(&missing));
+        assert!(D::is_impersonation_unavailable(&lines(&["yt-dlp: error: no such option: --impersonate"])));
+        assert!(!D::is_impersonation_unavailable(&lines(&["ERROR: [facebook] 1: Cannot parse data"])));
+
+        let msg = D::impersonation_missing_message("[facebook] 1: Cannot parse data");
+        assert!(msg.starts_with("Facebook vừa thay đổi cách tải dữ liệu"), "{msg}");
+        assert!(msg.contains("thiếu thư viện curl_cffi") && msg.contains("pip install --upgrade curl_cffi"));
+        assert!(msg.ends_with("(Chi tiết: [facebook] 1: Cannot parse data)"), "{msg}");
+        assert!(!D::impersonation_missing_message("").contains("Chi tiết"));
     }
 
     /// Đối chiếu với stderr THẬT của yt-dlp: trình duyệt không có kho cookie phải được

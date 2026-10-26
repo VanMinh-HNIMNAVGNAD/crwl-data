@@ -147,6 +147,16 @@ const RULES = [
       'Nếu tài khoản vẫn mở được trên trình duyệt: Instagram vừa thay đổi — mở "Công cụ" (⚙) → gallery-dl → "Bản mới nhất" rồi quét lại. Vẫn lỗi thì bản sửa chưa phát hành, hãy thử lại sau 1-2 ngày.',
   },
   {
+    // yt-dlp phải giả dạng Firefox mới đọc được trang (Facebook 10/2026) nhưng thiếu
+    // curl_cffi — cả engine Python lẫn bước tải (Rust) đều viết câu này
+    test: /thiếu thư viện curl_cffi/i,
+    strong: true,
+    title: 'Cần cài thư viện curl_cffi cho yt-dlp',
+    message: (raw) =>
+      `${platformOf(raw) || 'Trang này'} vừa đổi cách tải dữ liệu, yt-dlp phải giả dạng trình duyệt Firefox mới đọc được. ` +
+      'Cài bằng lệnh: pip install --upgrade curl_cffi (yt-dlp cài bằng pipx: pipx inject yt-dlp curl_cffi), rồi thử lại.',
+  },
+  {
     test: /yêu cầu đăng nhập|cần đăng nhập|\blog ?in\b|logged[- ]in|sign in|authenticat|not a bot|confirm your age|age[- ]restrict|giới hạn (?:độ )?tuổi|members?[- ]only|\bprivate\b|riêng tư|empty media response|cookies? (?:are |is )?(?:needed|required)|http error 401|unauthori[sz]ed/i,
     title: (raw) => {
       const platform = platformOf(raw)

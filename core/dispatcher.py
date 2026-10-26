@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, List
 from .models import MediaImage, MediaMetadata, ProfileCrawlResult, ResolveUrlResult, StreamFormat
 from .resolver.url_resolver import UrlResolver, dns_blocked_host
 from .extractors.base import BaseExtractor
-from .extractors.ytdlp import PlaylistUrlError, YtDlpExtractor
+from .extractors.ytdlp import ImpersonationUnavailable, PlaylistUrlError, YtDlpExtractor
 from .extractors.gallery import GalleryDlExtractor, InstagramApiChanged, PlatformBlocked
 from .extractors.tiktok import TikTokExtractor
 from .extractors.movie import MovieExtractor
@@ -249,6 +249,15 @@ class MediaDispatcher(BaseExtractor):
     def _site_changed_error(cls, platform_url: str, err: Exception) -> RuntimeError:
         name = cls._platform_name(platform_url)
         detail = cls._short_reason(err)
+        if isinstance(err, ImpersonationUnavailable):
+            # Đã biết cách đọc được trang (giả dạng Firefox) — cập nhật yt-dlp không giúp gì
+            return RuntimeError(
+                f"{name} vừa thay đổi cách tải dữ liệu: yt-dlp phải giả dạng trình duyệt Firefox mới đọc "
+                f"được liên kết này nhưng Python đang chạy yt-dlp thiếu thư viện curl_cffi. Hãy cài: "
+                f"pip install --upgrade curl_cffi (yt-dlp cài bằng pipx: pipx inject yt-dlp curl_cffi) "
+                f"rồi thử lại."
+                + (f" (Chi tiết: {detail})" if detail else "")
+            )
         return RuntimeError(
             f"{name} vừa thay đổi cách tải dữ liệu nên yt-dlp chưa đọc được liên kết này. "
             f"Mở Công cụ (⚙) → yt-dlp → \"Bản mới nhất\" rồi thử lại; nếu vẫn lỗi thì bản sửa "
@@ -401,10 +410,11 @@ class MediaDispatcher(BaseExtractor):
                     # "Cannot parse data" của Facebook thường là trang chặn khách — nhưng
                     # khi ĐÃ có phiên đăng nhập thì đó là Facebook đổi cách nạp video
                     # (10/2026: dữ liệu video không còn nằm trong HTML). Bảo người dùng
-                    # đăng nhập lại là sai hướng.
+                    # đăng nhập lại là sai hướng. Thiếu curl_cffi để giả dạng Firefox cũng
+                    # vậy: chưa cài thì đăng nhập rồi vẫn lỗi y nguyên.
                     fb_site_changed = (
                         is_fb and self._is_site_changed_error(yt_err)
-                        and has_login_session(target_url, browser)
+                        and (has_login_session(target_url, browser) or isinstance(yt_err, ImpersonationUnavailable))
                     )
                     # Nếu cả 2 đều lỗi auth -> trả thông báo đăng nhập rõ ràng
                     if is_fb and not fb_site_changed and (self._is_auth_error(yt_err) or self._is_auth_error(gal_err)):

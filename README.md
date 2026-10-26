@@ -291,7 +291,8 @@ Hệ thống được cấu thành từ 3 thành phần chính: **Frontend**, **
 | "Mạng của bạn đang chặn www.reddit.com" | DNS của nhà mạng / router trỏ tên miền về `127.0.0.1` (trình duyệt dùng DNS-over-HTTPS nên vẫn vào được) | Đổi DNS của máy hoặc router sang `1.1.1.1` / `8.8.8.8`, hoặc đặt proxy trong Cài đặt |
 | "Reddit đã chặn truy cập khi chưa đăng nhập" | Từ 10/2026 Reddit chặn khách gọi API `.json` | Đăng nhập Reddit trên trình duyệt (app tự dùng trình duyệt đang đăng nhập) hoặc dán cookie vào Cookie Manager 🍪 |
 | Quét Instagram báo cần đăng nhập / chỉ ra Reels | Từ 10/2026 Instagram chỉ cho tài khoản đã đăng nhập xem danh sách bài; truy vấn mục Bài viết đổi liên tục | Đăng nhập Instagram trên trình duyệt; khi app báo "chỉ quét được Reels", sau 1-2 ngày bấm **Công cụ → gallery-dl → Bản mới nhất** rồi quét lại |
-| "Facebook vừa thay đổi cách tải dữ liệu" | Dữ liệu video không còn nằm trong HTML, yt-dlp chưa theo kịp (lỗi `Cannot parse data`) | **Công cụ → yt-dlp → Bản mới nhất** (nightly), thử lại sau vài ngày nếu bản sửa chưa phát hành |
+| "Facebook vừa thay đổi cách tải dữ liệu" | Dữ liệu video không còn nằm trong HTML, yt-dlp chưa theo kịp (lỗi `Cannot parse data`). App đã tự thử lại giả dạng trình duyệt Firefox (`--impersonate firefox`) mà vẫn lỗi | **Công cụ → yt-dlp → Bản mới nhất** (nightly), thử lại sau vài ngày nếu bản sửa chưa phát hành |
+| "Cần cài thư viện curl_cffi cho yt-dlp" | Từ 24/10/2026 Facebook chỉ trả trang video đầy đủ cho yêu cầu giống trình duyệt thật; yt-dlp cần `curl_cffi` để giả dạng Firefox | `pip install --upgrade curl_cffi` vào Python đang chạy yt-dlp (yt-dlp cài bằng pipx: `pipx inject yt-dlp curl_cffi`) rồi thử lại |
 
 ---
 
