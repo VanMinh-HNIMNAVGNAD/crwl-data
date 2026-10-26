@@ -405,5 +405,5 @@ export const VIDEO_CONTAINER_OPTIONS = [
   { id: 'mkv', label: 'MKV', desc: 'Chất lượng gốc, đa phụ đề' },
   { id: 'mov', label: 'MOV', desc: 'Chuẩn dựng phim Apple' },
   { id: 'webm', label: 'WebM', desc: 'Nhẹ, tối ưu web' },
-  { id: 'gif', label: 'GIF', desc: 'Ảnh động' },
+  { id: 'gif', label: 'GIF', desc: 'Ảnh động, không tiếng (rộng tối đa 480px)' },
 ]

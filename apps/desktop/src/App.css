@@ -1582,6 +1582,21 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
   box-shadow: var(--ring-focus);
 }
 
+.trimmer-input[aria-invalid="true"] {
+  border-color: var(--tint-danger-border);
+}
+
+/* Đoạn sẽ tải / lý do mốc sai — cả dòng riêng dưới các ô nhập */
+.trimmer-status {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.trimmer-status.is-error {
+  color: var(--text-danger);
+}
+
 .trimmer-presets {
   display: inline-flex;
   align-items: center;
@@ -3451,6 +3466,17 @@ button, .tab-btn, .pane-toggle-btn, .system-brand-group, .system-drag-handle, .p
 .checkbox-opt-label input[type="checkbox"] {
   cursor: pointer;
   accent-color: var(--accent-primary);
+}
+
+/* Tuỳ chọn không có tác dụng với kết quả đang mở (lý do nằm ở title) */
+.checkbox-opt-label.is-disabled,
+.checkbox-opt-label.is-disabled input[type="checkbox"] {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.download-options-inline-box .options-note {
+  flex-basis: 100%;
 }
 
 .container-select-group {

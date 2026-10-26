@@ -212,6 +212,7 @@ export async function startNativeDownload({
   isMute = false,
   sponsorBlock = false,
   embedSubs = false,
+  embedSubLangs = [],
   embedThumbnail = false,
   embedMetadata = false,
   splitChapters = false,
@@ -244,6 +245,8 @@ export async function startNativeDownload({
         sponsor_block: Boolean(sponsorBlock),
         // Các tuỳ chọn dưới đây trước kia bị bỏ rơi tại đây nên bật ở UI cũng không có tác dụng
         embed_subs: Boolean(embedSubs),
+        // Ngôn ngữ phụ đề nhúng (gồm phụ đề tự động); trống = mọi phụ đề thủ công
+        embed_sub_langs: Array.isArray(embedSubLangs) ? embedSubLangs.filter(Boolean).map(String) : [],
         embed_thumbnail: Boolean(embedThumbnail),
         embed_metadata: Boolean(embedMetadata),
         split_chapters: Boolean(splitChapters),

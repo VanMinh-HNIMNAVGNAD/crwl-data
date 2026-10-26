@@ -52,6 +52,10 @@ pub struct DownloadOptions {
     pub sponsor_block: bool,
     #[serde(default, alias = "embedSubs")]
     pub embed_subs: bool,
+    /// Ngôn ngữ phụ đề nhúng vào video (đang chọn ở giao diện), gồm cả phụ đề tự động.
+    /// Trống thì nhúng mọi phụ đề thủ công như cũ.
+    #[serde(default, alias = "embedSubLangs")]
+    pub embed_sub_langs: Vec<String>,
     #[serde(default, alias = "embedThumbnail")]
     pub embed_thumbnail: bool,
     #[serde(default, alias = "embedMetadata")]
@@ -194,6 +198,11 @@ const MAX_CONCURRENT_YTDLP_DOWNLOADS: usize = 3;
 
 /// Trình duyệt yt-dlp giả dạng khi chạy lại sau lỗi trang đã đổi (xem impersonation_target_for).
 const IMPERSONATE_TARGET: &str = "firefox";
+
+/// Tham số ffmpeg khi chuyển video sang GIF: bỏ tiếng (`-an`, GIF không có luồng tiếng),
+/// 12 khung/giây, rộng tối đa 480px, bảng màu riêng của video. Để mặc định thì một video
+/// 1080p60 vài phút ra GIF hàng GB và màu bị vỡ.
+const GIF_CONVERT_ARGS: &str = "VideoConvertor:-an -vf \"fps=12,scale=min(480\\,iw):-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse\"";
 
 static YTDLP_SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
@@ -797,6 +806,8 @@ impl DownloaderService {
     }
 
     /// Dựng lệnh yt-dlp cho một lượt tải (mỗi lần thử cần một `Command` mới).
+    /// `recode_container`: lượt thử lại sau khi đổi vỏ sang định dạng đã chọn thất bại
+    /// (xem `remux_fallback_container`) — chuyển mã thay vì chỉ đổi vỏ.
     fn build_ytdlp_command(
         ytdlp_path: &Path,
         dest_folder: &Path,
@@ -804,6 +815,7 @@ impl DownloaderService {
         js_runtime: Option<&str>,
         cookies: &CookieArg,
         impersonate: Option<&str>,
+        recode_container: bool,
     ) -> Command {
         // Giới hạn cả title và id ngay trong template: yt-dlp mở file trước khi
         // backend có cơ hội đổi tên sau đó, nên chỉ sanitize ở Rust là chưa đủ.
@@ -865,30 +877,24 @@ impl DownloaderService {
             }
         }
 
-        // Cắt clip theo mốc thời gian (Trimmer)
-        let normalize_time = |t: Option<&str>| -> Option<String> {
-            let s = t?.trim();
-            if s.is_empty() {
-                return None;
-            }
-            let parts: Vec<&str> = s.split(':').collect();
-            match parts.len() {
-                1 => Some(s.to_string()),
-                2 => Some(format!("00:{:0>2}:{:0>2}", parts[0], parts[1])),
-                3 => Some(format!("{:0>2}:{:0>2}:{:0>2}", parts[0], parts[1], parts[2])),
-                _ => Some(s.to_string()),
-            }
-        };
-
-        let start_norm = normalize_time(opts.start_time.as_deref());
-        let end_norm = normalize_time(opts.end_time.as_deref());
-        if start_norm.is_some() || end_norm.is_some() {
-            let sec = format!("*{}-{}", start_norm.unwrap_or_else(|| "00:00:00".to_string()), end_norm.unwrap_or_else(|| "inf".to_string()));
-            cmd.arg("--download-sections").arg(sec);
+        // Cắt clip theo mốc thời gian (Trimmer). Mốc sai đã bị `start_download` từ chối.
+        // Chương, phụ đề và đoạn SponsorBlock của yt-dlp tính theo mốc của video GỐC,
+        // không dời theo đoạn cắt: clip 10-20s từng mang chương 0-30s, phụ đề lệch 10s,
+        // "Tách theo chương" ra tệp 0,1s, còn SponsorBlock bị yt-dlp lặng lẽ bỏ qua
+        // ("video appears to be already cut"). Khi cắt thì bỏ hẳn các bước đó.
+        let trim = Self::trim_section(opts).ok().flatten();
+        let trimmed = trim.is_some();
+        if let Some(section) = trim {
+            cmd.arg("--download-sections").arg(section);
+            // `--embed-metadata` (cả nhánh âm thanh) mặc định nhúng luôn chương
+            cmd.arg("--no-embed-chapters");
         }
 
         // SponsorBlock — tự động bỏ qua intro/sponsor trên YouTube
-        if opts.sponsor_block && (opts.url.contains("youtube.com") || opts.url.contains("youtu.be")) {
+        if opts.sponsor_block
+            && !trimmed
+            && (opts.url.contains("youtube.com") || opts.url.contains("youtu.be"))
+        {
             cmd.arg("--sponsorblock-remove").arg("default");
         }
 
@@ -981,10 +987,21 @@ impl DownloaderService {
             if let Some(ref vfmt) = opts.video_format {
                 let vf = vfmt.trim().to_lowercase();
                 if vf == "gif" {
+                    // yt-dlp chuyển mã với `-map 0` nên giữ cả luồng tiếng mà GIF không
+                    // chứa được: ffmpeg báo "Encoder not found" với MỌI video có tiếng.
                     cmd.arg("--recode-video").arg("gif");
+                    cmd.arg("--ppa").arg(GIF_CONVERT_ARGS);
                     chosen_container = Some(vf);
                 } else if vf == "mkv" || vf == "mov" || vf == "avi" || vf == "webm" || vf == "mp4" {
-                    cmd.arg("--remux-video").arg(&vf);
+                    match Self::recode_args(&vf).filter(|_| recode_container) {
+                        Some(args) => {
+                            cmd.arg("--recode-video").arg(&vf);
+                            cmd.arg("--ppa").arg(format!("VideoConvertor:{args}"));
+                        }
+                        None => {
+                            cmd.arg("--remux-video").arg(&vf);
+                        }
+                    }
                     chosen_container = Some(vf);
                 }
             }
@@ -1000,9 +1017,27 @@ impl DownloaderService {
         // Nhúng phụ đề vào video nếu được bật. Loại `live_chat`: với video từng
         // livestream, yt-dlp coi toàn bộ chat là một "phụ đề" và tải hàng trăm MB
         // JSON, khiến lượt tải kéo dài hàng chục phút hoặc lỗi 429.
-        if opts.embed_subs && !opts.is_audio {
+        if opts.embed_subs && !opts.is_audio && !trimmed {
             cmd.arg("--embed-subs");
-            cmd.arg("--sub-langs").arg("all,-live_chat");
+            match Self::embed_sub_langs_arg(&opts.embed_sub_langs) {
+                Some(langs) => {
+                    // Chỉ `--embed-subs` thì yt-dlp CHỈ lấy phụ đề thủ công: video YouTube
+                    // chỉ có phụ đề tự động (đa số) ra tệp không có phụ đề nào. Bật cả hai
+                    // loại cho đúng ngôn ngữ đã chọn; `no-keep-subs` để yt-dlp vẫn xoá tệp
+                    // .vtt sau khi nhúng (có `--write-subs` thì mặc định nó giữ lại).
+                    cmd.arg("--write-subs")
+                        .arg("--write-auto-subs")
+                        .arg("--sub-langs")
+                        .arg(langs)
+                        .arg("--compat-options")
+                        .arg("no-keep-subs");
+                }
+                None => {
+                    cmd.arg("--sub-langs").arg("all,-live_chat");
+                }
+            }
+            // WebM chỉ nhận WebVTT; json3 (định dạng đầu tiên của YouTube) không nhúng được
+            cmd.arg("--sub-format").arg("vtt/srt/best");
         }
 
         // Nhúng thumbnail vào video nếu bật. yt-dlp chỉ nhúng được vào
@@ -1028,14 +1063,16 @@ impl DownloaderService {
             }
         }
 
-        // Nhúng metadata & chapters
+        // Nhúng metadata & chapters (chương của video gốc sai mốc với clip đã cắt)
         if opts.embed_metadata && !opts.is_audio {
             cmd.arg("--embed-metadata");
-            cmd.arg("--embed-chapters");
+            if !trimmed {
+                cmd.arg("--embed-chapters");
+            }
         }
 
         // Tách theo chapter
-        if opts.split_chapters {
+        if opts.split_chapters && !trimmed {
             cmd.arg("--split-chapters");
         }
 
@@ -1064,6 +1101,8 @@ impl DownloaderService {
         db: Arc<Database>,
         opts: DownloadOptions,
     ) -> Result<DownloadResult, String> {
+        // Mốc "Cắt đoạn" sai thì báo ngay, không chạy yt-dlp (xem parse_timecode)
+        Self::trim_section(&opts)?;
         let ytdlp_path = Self::find_ytdlp()?;
         let dest_folder = Self::canonical_download_dir(opts.dest_dir.as_deref())?;
         let js_runtime = match BinaryManager::find_binary("node") {
@@ -1105,7 +1144,8 @@ impl DownloaderService {
         let progress_emit = |payload: DownloadProgressPayload| {
             let _ = app_handle.emit("download-progress", payload);
         };
-        let starting_phase = if opts.use_aria2c {
+        // Chưa cài aria2c thì lượt tải chạy bộ tải mặc định (build_ytdlp_command)
+        let starting_phase = if opts.use_aria2c && BinaryManager::has_binary("aria2c") {
             "Đang kết nối qua Aria2c..."
         } else {
             "Đang lấy thông tin tệp..."
@@ -1160,7 +1200,10 @@ impl DownloaderService {
         // làm MỌI lượt tải thất bại kể cả nội dung công khai, kèm thông báo sai là "cần
         // đăng nhập". Engine bóc tách (Python) vốn đã tự thử lại như vậy.
         // Lỗi của lượt chưa giả dạng: thiếu curl_cffi thì báo lỗi này thay cho traceback.
+        // Đổi vỏ sang định dạng đã chọn thất bại (codec không hợp) thì chạy lại một lần với
+        // chuyển mã: tệp gốc đã tải xong nên yt-dlp chỉ chạy lại bước hậu xử lý.
         let mut stderr_before_impersonation: Option<Vec<String>> = None;
+        let mut recode_container = false;
         let (status, collected_stderr, downloaded_file_path, printed_final_path, overall_percent) = loop {
             let mut cmd = Self::build_ytdlp_command(
                 &ytdlp_path,
@@ -1169,6 +1212,7 @@ impl DownloaderService {
                 js_runtime.as_deref(),
                 &cookies,
                 impersonate,
+                recode_container,
             );
 
             info!("Bắt đầu tải tệp với yt-dlp [{task_id}]: {}", opts.url);
@@ -1225,6 +1269,9 @@ impl DownloaderService {
             let mut is_cancelled = false;
             let mut last_progress_emit: Option<std::time::Instant> = None;
             let mut last_emitted_pass = usize::MAX;
+            // Tệp ffmpeg đang ghi ở bước đổi vỏ / chuyển mã, khi đó là bước hậu xử lý cuối
+            // cùng đã bắt đầu (bước sau chạy tới nghĩa là nó đã xong).
+            let mut conversion_output: Option<PathBuf> = None;
 
             loop {
                 tokio::select! {
@@ -1378,6 +1425,7 @@ impl DownloaderService {
 
                         // Các bước hậu xử lý còn lại — báo đúng trạng thái thay vì đoán theo %
                         if let Some(phase) = Self::postprocess_phase(&line) {
+                            conversion_output = Self::conversion_destination(&line);
                             overall_percent = overall_percent.max(DOWNLOAD_SHARE);
                             progress_emit(DownloadProgressPayload {
                                 id: task_id.clone(),
@@ -1546,6 +1594,36 @@ impl DownloaderService {
                 }
             }
 
+            if !status.success() && Self::is_postprocess_failure(&collected_stderr) {
+                if let Some(broken) = conversion_output.filter(|p| p.starts_with(&dest_folder)) {
+                    // Tệp ffmpeg ghi dở (vài trăm byte, không có luồng nào). Để lại thì lượt
+                    // tải sau yt-dlp thấy "has already been downloaded" và app báo xong một
+                    // tệp hỏng.
+                    let _ = std::fs::remove_file(&broken);
+                    if !recode_container {
+                        if let Some(container) = Self::remux_fallback_container(&opts) {
+                            warn!(
+                                "[{task_id}] Không đổi vỏ được sang {container} ({}) — chuyển mã lại",
+                                collected_stderr.last().map(String::as_str).unwrap_or("")
+                            );
+                            progress_emit(DownloadProgressPayload::indeterminate(
+                                &task_id,
+                                "processing",
+                                &format!(
+                                    "Codec gốc không đặt được vào {} — đang chuyển mã (mất thêm thời gian)...",
+                                    container.to_uppercase()
+                                ),
+                            ));
+                            if let Some(pid) = child_pid {
+                                Self::unregister_pid(&task_id, pid).await;
+                            }
+                            recode_container = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             break (status, collected_stderr, downloaded_file_path, printed_final_path, overall_percent);
         };
 
@@ -1682,6 +1760,117 @@ impl DownloaderService {
         })
     }
 
+    /// Mốc "Cắt đoạn" → số giây. Nhận "90", "1:30", "01:02:03", "1:30.5"; trống → `Ok(None)`.
+    /// Trước đây chuỗi bất kỳ được chuyển thẳng cho yt-dlp: gõ "1p30" nhận lỗi cú pháp
+    /// của yt-dlp, còn mốc ngược (30 → 10) ra tệp 0 luồng mà app vẫn báo "Hoàn tất".
+    fn parse_timecode(raw: Option<&str>) -> Result<Option<f64>, ()> {
+        let s = match raw.map(str::trim) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
+        let parts: Vec<&str> = s.split(':').map(str::trim).collect();
+        if parts.len() > 3 {
+            return Err(());
+        }
+        let mut total = 0.0_f64;
+        for (i, part) in parts.iter().enumerate() {
+            let is_last = i + 1 == parts.len();
+            let well_formed = !part.is_empty()
+                && part.chars().all(|c| c.is_ascii_digit() || (is_last && c == '.'))
+                && part.matches('.').count() <= 1
+                && !part.starts_with('.');
+            let value: f64 = if well_formed { part.parse().map_err(|_| ())? } else { return Err(()) };
+            // Phút / giây sau dấu ":" đầu tiên phải dưới 60 ("1:75" là gõ nhầm)
+            if i > 0 && value >= 60.0 {
+                return Err(());
+            }
+            total = total * 60.0 + value;
+        }
+        Ok(Some(total))
+    }
+
+    /// Giá trị `--download-sections` cho mốc "Cắt đoạn" (`*đầu-cuối`, tính bằng giây), hoặc
+    /// `Ok(None)` khi không cắt. `Err` là câu báo lỗi cho người dùng.
+    fn trim_section(opts: &DownloadOptions) -> Result<Option<String>, String> {
+        let invalid = |which: &str, raw: Option<&str>| {
+            format!(
+                "Mốc {which} \"{}\" không hợp lệ — hãy nhập dạng 90 (giây), 1:30 hoặc 01:02:03.",
+                raw.unwrap_or("").trim()
+            )
+        };
+        let start = Self::parse_timecode(opts.start_time.as_deref())
+            .map_err(|_| invalid("bắt đầu", opts.start_time.as_deref()))?;
+        let end = Self::parse_timecode(opts.end_time.as_deref())
+            .map_err(|_| invalid("kết thúc", opts.end_time.as_deref()))?;
+        let start_secs = start.unwrap_or(0.0);
+        match end {
+            Some(e) if e <= start_secs => {
+                Err("Mốc kết thúc của đoạn cắt phải sau mốc bắt đầu.".to_string())
+            }
+            Some(e) => Ok(Some(format!("*{start_secs}-{e}"))),
+            // Chỉ có mốc bắt đầu 0 (hoặc không có mốc nào) = tải nguyên video
+            None if start_secs > 0.0 => Ok(Some(format!("*{start_secs}-inf"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Container sẽ đổi vỏ (`--remux-video`) mà khi codec gốc không hợp thì phải chuyển mã.
+    ///
+    /// Đổi vỏ chỉ chép nguyên luồng: WebM không chứa được H.264/AAC (TikTok, Facebook,
+    /// Instagram, X... đều là H.264), MOV không chứa được VP9/AV1/Opus (YouTube từ 1080p).
+    /// Trước đây cả lượt tải thất bại ở bước cuối với "Error opening output files".
+    fn remux_fallback_container(opts: &DownloadOptions) -> Option<String> {
+        if opts.is_audio {
+            return None;
+        }
+        let vf = opts.video_format.as_deref()?.trim().to_lowercase();
+        Self::recode_args(&vf).map(|_| vf)
+    }
+
+    /// Tham số ffmpeg khi phải chuyển mã sang `container`. Mặc định của ffmpeg cho WebM là
+    /// VP9 256 kbit/s ở chế độ chậm nhất (mờ và lâu); `yuv420p` để QuickTime / iPhone mở được.
+    fn recode_args(container: &str) -> Option<&'static str> {
+        match container {
+            "webm" => Some("-crf 32 -b:v 0 -deadline realtime -cpu-used 8 -row-mt 1"),
+            "mp4" | "mov" => Some("-preset veryfast -crf 20 -pix_fmt yuv420p"),
+            _ => None,
+        }
+    }
+
+    /// `--sub-langs` cho phụ đề nhúng: đúng các ngôn ngữ giao diện gửi (tối đa 4), đã
+    /// escape vì yt-dlp coi mỗi mục là regex. None = không chọn ngôn ngữ nào.
+    fn embed_sub_langs_arg(langs: &[String]) -> Option<String> {
+        let mut picked: Vec<String> = Vec::new();
+        for lang in langs.iter().map(|l| l.trim()) {
+            if lang.is_empty() || lang == "live_chat" || picked.iter().any(|p| p == &regex::escape(lang)) {
+                continue;
+            }
+            picked.push(regex::escape(lang));
+            if picked.len() >= 4 {
+                break;
+            }
+        }
+        (!picked.is_empty()).then(|| picked.join(","))
+    }
+
+    /// Tệp đích của bước đổi vỏ / chuyển mã video:
+    /// `[VideoRemuxer] Remuxing video from mp4 to webm; Destination: <path>`.
+    fn conversion_destination(line: &str) -> Option<PathBuf> {
+        if !(line.starts_with("[VideoRemuxer]") || line.starts_with("[VideoConvertor]")) {
+            return None;
+        }
+        let (_, path) = line.split_once("; Destination: ")?;
+        let path = path.trim().trim_matches('"');
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }
+
+    /// yt-dlp thất bại ở bước hậu xử lý (ffmpeg), không phải ở bước tải.
+    fn is_postprocess_failure(stderr_lines: &[String]) -> bool {
+        stderr_lines
+            .iter()
+            .any(|l| l.starts_with("ERROR:") && l.to_lowercase().contains("postprocessing"))
+    }
+
     /// Thứ tự ưu tiên `--sub-format`. Định dạng đầu tiên YouTube liệt kê là json3 —
     /// định dạng nội bộ mà trình phát không đọc được — nên chỉ giữ yêu cầu của UI khi
     /// đó là định dạng phụ đề văn bản thông dụng.
@@ -1779,9 +1968,11 @@ impl DownloaderService {
 
     /// Các container/định dạng yt-dlp nhúng được ảnh bìa (xem EmbedThumbnailPP).
     fn container_supports_thumbnail(ext: &str) -> bool {
+        // Không có "mov": yt-dlp báo đã nhúng nhưng tệp MOV ra không có ảnh bìa (mutagen
+        // lỗi với brand "qt", ffmpeg bỏ luồng ảnh) — đo với yt-dlp 2026.10.21.
         matches!(
             ext,
-            "mp3" | "mkv" | "mka" | "m4a" | "alac" | "mp4" | "m4v" | "mov" | "ogg" | "vorbis" | "opus" | "flac"
+            "mp3" | "mkv" | "mka" | "m4a" | "alac" | "mp4" | "m4v" | "ogg" | "vorbis" | "opus" | "flac"
         )
     }
 
@@ -3836,6 +4027,8 @@ enum BatchOutcome {
 mod tests {
     use super::DownloaderService as D;
     use super::BatchFileItem;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn single_pass_maps_to_full_download_share() {
@@ -5324,7 +5517,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let ytdlp = std::path::Path::new("/usr/bin/true");
 
-        let plain = args_of(&D::build_ytdlp_command(ytdlp, &dir, &opts, None, &super::CookieArg::None, None));
+        let plain = args_of(&D::build_ytdlp_command(ytdlp, &dir, &opts, None, &super::CookieArg::None, None, false));
         assert!(!plain.iter().any(|a| a == "--js-runtimes"), "yt-dlp cũ không hiểu --js-runtimes");
         assert!(!plain.iter().any(|a| a.starts_with("--cookies")));
         assert!(!plain.iter().any(|a| a == "--impersonate"), "chỉ giả dạng ở lượt thử lại");
@@ -5336,6 +5529,7 @@ mod tests {
             Some("node:/usr/bin/node"),
             &super::CookieArg::Browser("firefox".to_string()),
             Some("firefox"),
+            false,
         ));
         let pos = full.iter().position(|a| a == "--js-runtimes").expect("thiếu --js-runtimes");
         assert_eq!(full[pos + 1], "node:/usr/bin/node");
@@ -5343,6 +5537,286 @@ mod tests {
         assert_eq!(full[pos + 1], "firefox");
         let pos = full.iter().position(|a| a == "--impersonate").expect("thiếu --impersonate");
         assert_eq!(full[pos + 1], "firefox");
+    }
+
+    fn ytdlp_args(opts: &super::DownloadOptions, recode_container: bool) -> Vec<String> {
+        let cmd = D::build_ytdlp_command(
+            std::path::Path::new("/usr/bin/true"),
+            &std::env::temp_dir(),
+            opts,
+            None,
+            &super::CookieArg::None,
+            None,
+            recode_container,
+        );
+        cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect()
+    }
+
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let pos = args.iter().position(|a| a == flag)?;
+        args.get(pos + 1).map(String::as_str)
+    }
+
+    /// Mốc "Cắt đoạn" gõ sai / ngược từng đi thẳng vào yt-dlp: "1p30" ra lỗi cú pháp của
+    /// yt-dlp, "30 → 10" ra tệp 0 luồng mà app báo "Hoàn tất".
+    #[test]
+    fn trim_marks_are_validated_and_sent_in_seconds() {
+        for (raw, secs) in [("90", 90.0), ("1:30", 90.0), ("01:02:03", 3723.0), ("0:05.5", 5.5), (" 2:00 ", 120.0), ("90:00", 5400.0)] {
+            assert_eq!(D::parse_timecode(Some(raw)), Ok(Some(secs)), "{raw}");
+        }
+        assert_eq!(D::parse_timecode(Some("   ")), Ok(None));
+        assert_eq!(D::parse_timecode(None), Ok(None));
+        for bad in ["1p30", "1:75", "-5", "1:2:3:4", "abc", "1..5", ".5", "1:", "1.5:00"] {
+            assert!(D::parse_timecode(Some(bad)).is_err(), "phải từ chối {bad}");
+        }
+
+        let trim = |start: &str, end: &str| {
+            D::trim_section(&super::DownloadOptions {
+                start_time: Some(start.to_string()),
+                end_time: Some(end.to_string()),
+                ..Default::default()
+            })
+        };
+        assert_eq!(trim("0:05", "0:12.5"), Ok(Some("*5-12.5".to_string())));
+        assert_eq!(trim("", "1:00"), Ok(Some("*0-60".to_string())));
+        assert_eq!(trim("20", ""), Ok(Some("*20-inf".to_string())));
+        assert_eq!(trim("", ""), Ok(None));
+        assert_eq!(trim("00:00", ""), Ok(None), "chỉ mốc 0 = tải nguyên video");
+        assert!(trim("0:30", "0:10").unwrap_err().contains("phải sau mốc bắt đầu"));
+        assert!(trim("0:10", "0:10").is_err());
+        assert!(trim("1p30", "").unwrap_err().contains("\"1p30\" không hợp lệ"));
+    }
+
+    /// Chương, phụ đề và đoạn SponsorBlock tính theo mốc của video gốc: với clip đã cắt
+    /// chúng ra sai (chương 0-30s trên clip 20s, phụ đề lệch, tệp chương 0,1s), còn
+    /// SponsorBlock bị yt-dlp bỏ qua. Không cắt thì các cờ vẫn có như trước.
+    #[test]
+    fn trimming_drops_options_whose_timestamps_would_be_wrong() {
+        let opts = super::DownloadOptions {
+            url: "https://www.youtube.com/watch?v=abc".to_string(),
+            embed_subs: true,
+            embed_metadata: true,
+            split_chapters: true,
+            sponsor_block: true,
+            ..Default::default()
+        };
+        let full = ytdlp_args(&opts, false);
+        for flag in ["--embed-subs", "--embed-chapters", "--split-chapters", "--sponsorblock-remove", "--embed-metadata"] {
+            assert!(full.iter().any(|a| a == flag), "thiếu {flag} khi không cắt");
+        }
+        assert!(!full.iter().any(|a| a == "--download-sections" || a == "--no-embed-chapters"));
+
+        let trimmed = ytdlp_args(
+            &super::DownloadOptions {
+                start_time: Some("0:05".to_string()),
+                end_time: Some("0:12".to_string()),
+                ..opts.clone()
+            },
+            false,
+        );
+        assert_eq!(arg_after(&trimmed, "--download-sections"), Some("*5-12"));
+        assert!(trimmed.iter().any(|a| a == "--no-embed-chapters"), "--embed-metadata tự nhúng chương");
+        assert!(trimmed.iter().any(|a| a == "--embed-metadata"), "tiêu đề / tác giả vẫn đúng với clip");
+        for flag in ["--embed-subs", "--embed-chapters", "--split-chapters", "--sponsorblock-remove"] {
+            assert!(!trimmed.iter().any(|a| a == flag), "{flag} sai mốc với clip đã cắt");
+        }
+
+        // Nhánh âm thanh luôn có --embed-metadata → cũng phải tắt chương khi cắt
+        let audio = ytdlp_args(
+            &super::DownloadOptions { is_audio: true, start_time: Some("10".to_string()), ..Default::default() },
+            false,
+        );
+        assert!(audio.iter().any(|a| a == "--no-embed-chapters"));
+    }
+
+    /// Chỉ `--embed-subs` thì yt-dlp bỏ qua phụ đề TỰ ĐỘNG: video YouTube chỉ có phụ đề tự
+    /// động (đa số) ra tệp không có phụ đề nào dù đã tick "Nhúng Phụ đề".
+    #[test]
+    fn embedded_subtitles_follow_the_chosen_language_including_auto_captions() {
+        let opts = super::DownloadOptions {
+            url: "https://www.youtube.com/watch?v=abc".to_string(),
+            embed_subs: true,
+            embed_sub_langs: vec!["vi".to_string(), "en-US".to_string(), "vi".to_string(), " ".to_string()],
+            ..Default::default()
+        };
+        let args = ytdlp_args(&opts, false);
+        assert!(args.iter().any(|a| a == "--embed-subs"));
+        assert!(args.iter().any(|a| a == "--write-auto-subs"), "phụ đề tự động");
+        assert!(args.iter().any(|a| a == "--write-subs"), "phụ đề thủ công cùng ngôn ngữ");
+        assert_eq!(arg_after(&args, "--sub-langs"), Some("vi,en\\-US"));
+        assert_eq!(arg_after(&args, "--compat-options"), Some("no-keep-subs"), "không để lại tệp .vtt");
+        assert_eq!(arg_after(&args, "--sub-format"), Some("vtt/srt/best"));
+
+        let all_manual = ytdlp_args(&super::DownloadOptions { embed_sub_langs: Vec::new(), ..opts.clone() }, false);
+        assert_eq!(arg_after(&all_manual, "--sub-langs"), Some("all,-live_chat"));
+        assert!(!all_manual.iter().any(|a| a == "--write-auto-subs"), "mọi ngôn ngữ tự động = hàng trăm tệp");
+
+        let many: Vec<String> = ["a", "b", "c", "d", "e", "live_chat"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(D::embed_sub_langs_arg(&many).as_deref(), Some("a,b,c,d"));
+    }
+
+    /// GIF: yt-dlp chuyển mã với `-map 0` (giữ luồng tiếng) nên mọi video có tiếng đều
+    /// lỗi "Encoder not found". WebM/MOV/MP4: đổi vỏ trước, chỉ chuyển mã ở lượt thử lại.
+    #[test]
+    fn gif_drops_audio_and_incompatible_containers_fall_back_to_recoding() {
+        let with = |container: &str| super::DownloadOptions {
+            url: "https://example.com/v".to_string(),
+            video_format: Some(container.to_string()),
+            ..Default::default()
+        };
+        let gif = ytdlp_args(&with("gif"), false);
+        assert_eq!(arg_after(&gif, "--recode-video"), Some("gif"));
+        let ppa = arg_after(&gif, "--ppa").expect("thiếu tham số ffmpeg cho GIF");
+        assert!(ppa.starts_with("VideoConvertor:-an "), "{ppa}");
+
+        for container in ["webm", "mov", "mp4"] {
+            let first = ytdlp_args(&with(container), false);
+            assert_eq!(arg_after(&first, "--remux-video"), Some(container), "lượt đầu chỉ đổi vỏ (không mất chất lượng)");
+            assert!(!first.iter().any(|a| a == "--recode-video"));
+            let retry = ytdlp_args(&with(container), true);
+            assert_eq!(arg_after(&retry, "--recode-video"), Some(container));
+            assert!(arg_after(&retry, "--ppa").unwrap_or("").starts_with("VideoConvertor:-"));
+            assert!(!retry.iter().any(|a| a == "--remux-video"));
+            assert_eq!(D::remux_fallback_container(&with(container)).as_deref(), Some(container));
+        }
+        // MKV chứa được mọi codec; âm thanh không đổi vỏ video
+        assert_eq!(arg_after(&ytdlp_args(&with("mkv"), true), "--remux-video"), Some("mkv"));
+        assert_eq!(D::remux_fallback_container(&with("mkv")), None);
+        assert_eq!(D::remux_fallback_container(&super::DownloadOptions { is_audio: true, ..with("webm") }), None);
+        assert_eq!(D::remux_fallback_container(&super::DownloadOptions::default()), None);
+    }
+
+    /// MOV: yt-dlp báo đã nhúng ảnh bìa nhưng tệp ra không có (đo với 2026.10.21).
+    #[test]
+    fn thumbnail_is_only_embedded_where_it_survives() {
+        let with = |container: Option<&str>| super::DownloadOptions {
+            url: "https://example.com/v".to_string(),
+            embed_thumbnail: true,
+            video_format: container.map(str::to_string),
+            ..Default::default()
+        };
+        for container in ["mp4", "mkv"] {
+            assert!(ytdlp_args(&with(Some(container)), false).iter().any(|a| a == "--embed-thumbnail"), "{container}");
+        }
+        for container in ["mov", "webm", "gif"] {
+            assert!(!ytdlp_args(&with(Some(container)), false).iter().any(|a| a == "--embed-thumbnail"), "{container}");
+        }
+        let auto = ytdlp_args(&with(None), false);
+        assert!(auto.iter().any(|a| a == "--embed-thumbnail"));
+        assert_eq!(arg_after(&auto, "--remux-video"), Some("webm>mkv"));
+    }
+
+    #[test]
+    fn conversion_output_lines_are_recognised() {
+        assert_eq!(
+            D::conversion_destination("[VideoRemuxer] Remuxing video from mp4 to webm; Destination: /dl/a: b [x].webm"),
+            Some(PathBuf::from("/dl/a: b [x].webm"))
+        );
+        assert_eq!(
+            D::conversion_destination("[VideoConvertor] Converting video from webm to mov; Destination: /dl/v.mov"),
+            Some(PathBuf::from("/dl/v.mov"))
+        );
+        assert_eq!(D::conversion_destination("[VideoRemuxer] Not remuxing media file \"/dl/v.mp4\"; already is in target format mp4"), None);
+        assert_eq!(D::conversion_destination("[Merger] Merging formats into \"/dl/v.mkv\""), None);
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(D::is_postprocess_failure(&lines(&["ERROR: Postprocessing: Error opening output files: Invalid argument"])));
+        assert!(!D::is_postprocess_failure(&lines(&["ERROR: [youtube] x: Video unavailable"])));
+    }
+
+    /// Chạy yt-dlp + ffmpeg THẬT trên video H.264/AAC phát từ máy chủ cục bộ, theo đúng
+    /// vòng thử lại của `start_download`. Bỏ qua nếu máy không có yt-dlp hoặc ffmpeg.
+    #[tokio::test]
+    async fn real_ytdlp_gif_and_webm_fallback_produce_playable_files() {
+        let (Some(ytdlp), Some(ffmpeg), Some(ffprobe)) = (
+            crate::binary_manager::BinaryManager::find_binary("yt-dlp"),
+            crate::binary_manager::BinaryManager::find_binary("ffmpeg"),
+            crate::binary_manager::BinaryManager::find_binary("ffprobe"),
+        ) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("crwl_container_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mp4");
+        let made = tokio::process::Command::new(&ffmpeg)
+            .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440", "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .args(["-c:a", "aac", "-shortest"])
+            .arg(&source)
+            .status()
+            .await;
+        if !matches!(made, Ok(s) if s.success()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // ffmpeg không có libx264
+        }
+        let body = Arc::new(std::fs::read(&source).unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = Arc::clone(&body);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let is_head = buf[..n].starts_with(b"HEAD");
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    if !is_head {
+                        let _ = socket.write_all(&body).await;
+                    }
+                });
+            }
+        });
+
+        let run = |opts: super::DownloadOptions, out: PathBuf, recode: bool| {
+            let mut cmd = D::build_ytdlp_command(&ytdlp, &out, &opts, None, &super::CookieArg::None, None, recode);
+            async move { cmd.output().await.expect("chạy được yt-dlp") }
+        };
+        let lines_of = |bytes: &[u8]| String::from_utf8_lossy(bytes).lines().map(str::to_string).collect::<Vec<_>>();
+        let probe = |file: PathBuf| {
+            let ffprobe = ffprobe.clone();
+            async move {
+                let out = tokio::process::Command::new(ffprobe)
+                    .args(["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+                    .arg(file)
+                    .output()
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_string).collect::<Vec<_>>()
+            }
+        };
+        let url = format!("http://{addr}/clip.mp4");
+
+        // GIF từ video có tiếng
+        let gif_dir = dir.join("gif");
+        std::fs::create_dir_all(&gif_dir).unwrap();
+        let opts = super::DownloadOptions { url: url.clone(), video_format: Some("gif".to_string()), embed_metadata: true, ..Default::default() };
+        let out = run(opts, gif_dir.clone(), false).await;
+        assert!(out.status.success(), "GIF: {:?}", lines_of(&out.stderr));
+        let gif = std::fs::read_dir(&gif_dir).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "gif"));
+        assert_eq!(probe(gif.expect("không có tệp .gif")).await, vec!["gif".to_string()]);
+
+        // WebM: đổi vỏ H.264 thất bại → xoá tệp hỏng → chuyển mã
+        let webm_dir = dir.join("webm");
+        std::fs::create_dir_all(&webm_dir).unwrap();
+        let opts = super::DownloadOptions { url, video_format: Some("webm".to_string()), ..Default::default() };
+        let first = run(opts.clone(), webm_dir.clone(), false).await;
+        assert!(!first.status.success(), "WebM không chứa được H.264 — yt-dlp đã đổi cách xử lý?");
+        assert!(D::is_postprocess_failure(&lines_of(&first.stderr)), "{:?}", lines_of(&first.stderr));
+        let broken = lines_of(&first.stdout).iter().rev().find_map(|l| D::conversion_destination(l)).expect("không thấy dòng đổi vỏ");
+        assert!(broken.starts_with(&webm_dir) && broken.is_file());
+        std::fs::remove_file(&broken).unwrap();
+        let retry = run(opts, webm_dir.clone(), true).await;
+        assert!(retry.status.success(), "chuyển mã WebM: {:?}", lines_of(&retry.stderr));
+        let codecs = probe(broken).await;
+        assert!(codecs.iter().any(|c| c == "vp9" || c == "vp8"), "{codecs:?}");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Facebook 24/10/2026 (yt-dlp #17906): "Cannot parse data" → tải lại giả dạng Firefox.

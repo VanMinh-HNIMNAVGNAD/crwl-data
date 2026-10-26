@@ -52,6 +52,7 @@ import {
   noDownloadableContentReason,
   splitByDownloader,
 } from '../utils/media'
+import { checkTrimRange, containerNote, embedSubtitleLangs, optionLimits } from '../utils/downloadOptions'
 import { errorToast, openFolderAction, savedToast } from '../utils/toasts'
 import { insertTextAtCursor } from '../utils/textInput'
 
@@ -433,6 +434,29 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
 
   // Số mảnh HLS/DASH tải song song (xem concurrentFragmentsFor)
   const concurrentFragments = concurrentFragmentsFor(accelerate)
+
+  // Mốc "Cắt đoạn" chỉ có tác dụng khi hộp cắt đang mở (xem handleDownloadStream)
+  const trimCheck = useMemo(
+    () => (isTrimmerOpen ? checkTrimRange(trimStart, trimEnd, singleMedia?.duration) : { ok: true, active: false }),
+    [isTrimmerOpen, trimStart, trimEnd, singleMedia]
+  )
+  // Đang định cắt (kể cả mốc còn gõ sai) — trừ khi mốc trống / chỉ có mốc 0
+  const isTrimming = isTrimmerOpen && !(trimCheck.ok && !trimCheck.active)
+  // Tuỳ chọn nào không có tác dụng với kết quả đang mở, và vì sao
+  const limits = useMemo(
+    () => optionLimits(singleMedia, { trimming: isTrimming, videoContainer }),
+    [singleMedia, isTrimming, videoContainer]
+  )
+  const batchLimits = useMemo(() => optionLimits(null, { videoContainer }), [videoContainer])
+  const subLangsToEmbed = useMemo(
+    () => embedSubtitleLangs(singleMedia?.subtitles, selectedSubLang),
+    [singleMedia, selectedSubLang]
+  )
+  const subLangsLabel = useMemo(() => {
+    const byLang = new Map((singleMedia?.subtitles || []).map((sub) => [sub.lang, sub.name || sub.lang]))
+    return subLangsToEmbed.map((lang) => byLang.get(lang) || lang).join(', ')
+  }, [singleMedia, subLangsToEmbed])
+  const chapterCount = singleMedia?.chapters?.length || 0
 
   // Synchronous validation state computed from URL
   const trimmedUrl = url.trim()
@@ -856,6 +880,15 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
       onShowToast?.({ type: 'error', title: 'Không có nguồn tải', message: 'Liên kết này không chứa tệp tải về được.' })
       return
     }
+    // Cắt đoạn / SponsorBlock / tách chương chỉ áp dụng cho kết quả tải đơn đang mở.
+    // "Cắt đoạn" chỉ áp dụng khi hộp cắt đang mở: đóng hộp lại là tải nguyên video
+    // (trước đây mốc đã nhập vẫn âm thầm được dùng dù hộp đã đóng).
+    const isSingle = media === singleMedia
+    const useTrim = isSingle && isTrimmerOpen && trimCheck.active
+    if (isSingle && isTrimmerOpen && !trimCheck.ok) {
+      onShowToast?.({ type: 'warning', title: 'Mốc cắt đoạn chưa đúng', message: trimCheck.error })
+      return
+    }
 
     const targetDir = await pickTargetDir('Đã huỷ tải vì chưa chọn thư mục lưu')
     if (targetDir === null) return
@@ -871,8 +904,6 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
     try {
       const isAudioOnly = stream.streamType === 'audio'
       const isMute = stream.streamType === 'mute'
-      // Cắt đoạn / SponsorBlock / tách chương chỉ áp dụng cho kết quả tải đơn đang mở
-      const isSingle = media === singleMedia
 
       try {
         // Chỉ nhận sự kiện của đúng tác vụ này
@@ -903,9 +934,6 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
       const downloadUrl = isDirectStreamOnly && stream.url ? stream.url : (media.originalUrl || stream.url)
       const downloadFormatId = isDirectStreamOnly && stream.url ? null : (stream.formatId || null)
 
-      // "Cắt đoạn" chỉ áp dụng khi hộp cắt đang mở: đóng hộp lại là tải nguyên video
-      // (trước đây mốc đã nhập vẫn âm thầm được dùng dù hộp đã đóng).
-      const useTrim = isSingle && isTrimmerOpen
       const res = await startNativeDownload({
         url: downloadUrl,
         formatId: downloadFormatId,
@@ -913,15 +941,19 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
         isMute: isMute,
         // Luồng tìm thấy bên trong một trang (trang phim) cần Referer là trang đó
         referer: downloadRefererFor(media),
-        startTime: (useTrim && trimStart) || undefined,
-        endTime: (useTrim && trimEnd) || undefined,
+        // Mốc đã kiểm tra, tính bằng giây (xem checkTrimRange)
+        startTime: (useTrim && trimCheck.startTime) || undefined,
+        endTime: (useTrim && trimCheck.endTime) || undefined,
         title: media.title,
         destDir: targetDir,
-        embedSubs: isSingle && embedSubs,
+        // Ô bị khoá (video không có phụ đề / chương, không phải YouTube, đang cắt đoạn)
+        // thì không gửi đi dù trước đó đã tick
+        embedSubs: isSingle && embedSubs && !limits.embedSubs,
+        embedSubLangs: isSingle ? subLangsToEmbed : [],
         embedMetadata: embedMetadata,
         embedThumbnail: embedThumbnail,
-        sponsorBlock: isSingle && sponsorBlock,
-        splitChapters: isSingle && splitChapters && !isAudioOnly,
+        sponsorBlock: isSingle && sponsorBlock && !limits.sponsorBlock,
+        splitChapters: isSingle && splitChapters && !limits.splitChapters && !isAudioOnly,
         useAria2c,
         concurrentFragments,
         // Container video không thể áp dụng cho stream audio/MP3.
@@ -1948,7 +1980,7 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   />
                   <span>Tăng tốc đa luồng</span>
                 </label>
-                <label className="checkbox-opt-label">
+                <label className="checkbox-opt-label" title="Ghi tiêu đề, tác giả, ngày đăng và chương vào tệp video (tệp âm thanh luôn được ghi)">
                   <input
                     type="checkbox"
                     checked={embedMetadata}
@@ -1956,10 +1988,14 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   />
                   <span>Nhúng Metadata</span>
                 </label>
-                <label className="checkbox-opt-label">
+                <label
+                  className={`checkbox-opt-label ${batchLimits.embedThumbnail ? 'is-disabled' : ''}`}
+                  title={batchLimits.embedThumbnail || 'Gắn ảnh bìa vào tệp video MP4 / MKV (tệp âm thanh luôn có ảnh bìa)'}
+                >
                   <input
                     type="checkbox"
-                    checked={embedThumbnail}
+                    checked={embedThumbnail && !batchLimits.embedThumbnail}
+                    disabled={Boolean(batchLimits.embedThumbnail)}
                     onChange={(e) => onEmbedThumbnailChange?.(e.target.checked)}
                   />
                   <span>Nhúng Thumbnail</span>
@@ -1972,6 +2008,9 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   />
                   <span>Tải bằng aria2c</span>
                 </label>
+                {containerNote(videoContainer) && (
+                  <p className="tools-setting-hint options-note">{containerNote(videoContainer)}</p>
+                )}
               </div>
             )}
 
@@ -2043,6 +2082,8 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                     type="button"
                     className="minimal-small-btn"
                     onClick={() => handleCopy(singleMedia.originalUrl)}
+                    disabled={!singleMedia.originalUrl}
+                    title={singleMedia.originalUrl ? 'Sao chép liên kết gốc' : 'Kết quả này không có liên kết gốc'}
                   >
                     <IconCopy className="w-3 h-3" />
                     <span>Copy URL</span>
@@ -2054,14 +2095,18 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   >
                     <span>Lưu Thumbnail</span>
                   </button>
-                  <button
-                    type="button"
-                    className={`minimal-small-btn ${isTrimmerOpen ? 'active' : ''}`}
-                    onClick={() => setIsTrimmerOpen(!isTrimmerOpen)}
-                  >
-                    <IconScissors className="w-3 h-3" />
-                    <span>Cắt đoạn</span>
-                  </button>
+                  {/* Chỉ cắt được luồng video / âm thanh: bài chỉ có ảnh không có gì để cắt */}
+                  {singleMedia.streams?.length > 0 && (
+                    <button
+                      type="button"
+                      className={`minimal-small-btn ${isTrimmerOpen ? 'active' : ''}`}
+                      onClick={() => setIsTrimmerOpen(!isTrimmerOpen)}
+                      title="Chỉ tải một đoạn của video / âm thanh"
+                    >
+                      <IconScissors className="w-3 h-3" />
+                      <span>Cắt đoạn</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     className={`minimal-small-btn ${isOptionsOpen ? 'active' : ''}`}
@@ -2084,7 +2129,9 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   placeholder="00:00"
                   value={trimStart}
                   onChange={(e) => setTrimStart(e.target.value)}
-                  title="Thời điểm bắt đầu (vd: 00:10)"
+                  title="Thời điểm bắt đầu (vd: 90, 1:30 hoặc 01:02:03) — để trống là từ đầu"
+                  aria-label="Thời điểm bắt đầu"
+                  aria-invalid={!trimCheck.ok && /bắt đầu/.test(trimCheck.error) ? 'true' : undefined}
                 />
                 <span>đến</span>
                 <input
@@ -2093,7 +2140,9 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   placeholder="00:30"
                   value={trimEnd}
                   onChange={(e) => setTrimEnd(e.target.value)}
-                  title="Thời điểm kết thúc (vd: 01:00)"
+                  title="Thời điểm kết thúc (vd: 1:00) — để trống là tới hết video"
+                  aria-label="Thời điểm kết thúc"
+                  aria-invalid={!trimCheck.ok && /kết thúc/.test(trimCheck.error) ? 'true' : undefined}
                 />
                 <div className="trimmer-presets">
                   <button
@@ -2120,6 +2169,14 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                     </button>
                   )}
                 </div>
+                <span
+                  className={`trimmer-status ${trimCheck.ok ? '' : 'is-error'}`}
+                  role={trimCheck.ok ? undefined : 'alert'}
+                >
+                  {trimCheck.ok
+                    ? trimCheck.summary || 'Để trống cả hai mốc là tải nguyên video.'
+                    : trimCheck.error}
+                </span>
               </div>
             )}
 
@@ -2135,7 +2192,10 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   <span>Tăng tốc đa luồng</span>
                 </label>
 
-                <label className="checkbox-opt-label">
+                <label
+                  className="checkbox-opt-label"
+                  title={`Ghi tiêu đề, tác giả, ngày đăng${isTrimming ? '' : ' và chương'} vào tệp video (tệp âm thanh luôn được ghi)`}
+                >
                   <input
                     type="checkbox"
                     checked={embedMetadata}
@@ -2144,40 +2204,56 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                   <span>Nhúng Metadata</span>
                 </label>
 
-                <label className="checkbox-opt-label">
+                <label
+                  className={`checkbox-opt-label ${limits.embedThumbnail ? 'is-disabled' : ''}`}
+                  title={limits.embedThumbnail || 'Gắn ảnh bìa vào tệp video MP4 / MKV (tệp âm thanh luôn có ảnh bìa)'}
+                >
                   <input
                     type="checkbox"
-                    checked={embedThumbnail}
+                    checked={embedThumbnail && !limits.embedThumbnail}
+                    disabled={Boolean(limits.embedThumbnail)}
                     onChange={(e) => onEmbedThumbnailChange?.(e.target.checked)}
                   />
                   <span>Nhúng Thumbnail</span>
                 </label>
 
-                <label className="checkbox-opt-label" title="Nhúng phụ đề vào file video (chỉ có nghĩa với tải đơn link)">
+                <label
+                  className={`checkbox-opt-label ${limits.embedSubs ? 'is-disabled' : ''}`}
+                  title={limits.embedSubs || `Nhúng phụ đề ${subLangsLabel} vào tệp video (gồm cả phụ đề tự động). Nhiều ngôn ngữ thì chọn ở ô "Phụ đề" bên dưới.`}
+                >
                   <input
                     type="checkbox"
-                    checked={embedSubs}
+                    checked={embedSubs && !limits.embedSubs}
+                    disabled={Boolean(limits.embedSubs)}
                     onChange={(e) => setEmbedSubs(e.target.checked)}
                   />
-                  <span>Nhúng Phụ đề</span>
+                  <span>Nhúng Phụ đề{!limits.embedSubs && subLangsLabel ? ` (${shortenMiddle(subLangsLabel, 28)})` : ''}</span>
                 </label>
 
-                <label className="checkbox-opt-label" title="Tự động cắt bỏ đoạn quảng cáo tài trợ, intro... (chỉ video YouTube, dữ liệu từ SponsorBlock)">
+                <label
+                  className={`checkbox-opt-label ${limits.sponsorBlock ? 'is-disabled' : ''}`}
+                  title={limits.sponsorBlock || 'Tự động cắt bỏ đoạn quảng cáo tài trợ, intro... (dữ liệu từ SponsorBlock)'}
+                >
                   <input
                     type="checkbox"
-                    checked={sponsorBlock}
+                    checked={sponsorBlock && !limits.sponsorBlock}
+                    disabled={Boolean(limits.sponsorBlock)}
                     onChange={(e) => setSponsorBlock(e.target.checked)}
                   />
                   <span>Bỏ đoạn tài trợ (YouTube)</span>
                 </label>
 
-                <label className="checkbox-opt-label" title="Tách video thành nhiều tệp theo từng chương (nếu video có chương)">
+                <label
+                  className={`checkbox-opt-label ${limits.splitChapters ? 'is-disabled' : ''}`}
+                  title={limits.splitChapters || 'Tách video thành nhiều tệp theo từng chương (vẫn giữ tệp đầy đủ)'}
+                >
                   <input
                     type="checkbox"
-                    checked={splitChapters}
+                    checked={splitChapters && !limits.splitChapters}
+                    disabled={Boolean(limits.splitChapters)}
                     onChange={(e) => setSplitChapters(e.target.checked)}
                   />
-                  <span>Tách theo chương</span>
+                  <span>Tách theo chương{chapterCount > 0 ? ` (${chapterCount} chương)` : ''}</span>
                 </label>
 
                 <label className="checkbox-opt-label" title="Tải bằng aria2c (8 kết nối) — cần cài aria2c; nếu chưa cài sẽ tự dùng bộ tải mặc định">
@@ -2203,8 +2279,17 @@ function LinkDownloader({ onShowToast, dlOptions = {} }) {
                       </option>
                     ))}
                   </select>
-                  <span className="tools-setting-hint">Chỉ áp dụng khi tải video; stream âm thanh vẫn là audio.</span>
+                  <span className="tools-setting-hint">
+                    {containerNote(videoContainer) || 'Chỉ áp dụng khi tải video; stream âm thanh vẫn là audio.'}
+                  </span>
                 </div>
+
+                {isTrimming && (
+                  <p className="tools-setting-hint options-note">
+                    ✂️ Đang cắt đoạn: không nhúng phụ đề / chương, không tách chương và không bỏ đoạn tài trợ — các mốc
+                    đó tính theo video gốc nên sẽ lệch với đoạn cắt.
+                  </p>
+                )}
               </div>
             )}
 

@@ -26,6 +26,7 @@ import { useDownloadTasks, parseSpeed, formatSpeed } from '../hooks/useDownloadT
 import { useStableCallback } from '../hooks/useStableCallback'
 import { describeError, errorText } from '../utils/messages'
 import { concurrentFragmentsFor } from '../utils/media'
+import { containerNote, optionLimits } from '../utils/downloadOptions'
 import { errorToast, openFolderAction, savedToast } from '../utils/toasts'
 
 // Số tệp lỗi trong câu tổng kết của backend: "Đã tải 3 tệp ..., 2 tệp thất bại."
@@ -225,6 +226,8 @@ function AccountDownloader({ onShowToast, dlOptions = {} }) {
 
   // Số mảnh HLS/DASH tải song song (xem concurrentFragmentsFor)
   const concurrentFragments = concurrentFragmentsFor(accelerate)
+  // MOV / WebM / GIF không chứa được ảnh bìa (xem optionLimits)
+  const thumbnailLimit = optionLimits(null, { videoContainer }).embedThumbnail
   // maxParallelVideos: số video tải song song trong batch
   const maxParallelVideos = accelerate ? 2 : 1
 
@@ -1042,7 +1045,7 @@ function AccountDownloader({ onShowToast, dlOptions = {} }) {
           </label>
           {mediaTypeFilter !== 'image' && (
             <>
-              <label className="checkbox-opt-label">
+              <label className="checkbox-opt-label" title="Ghi tiêu đề, tác giả, ngày đăng và chương vào tệp video (tệp âm thanh luôn được ghi)">
                 <input
                   type="checkbox"
                   checked={embedMetadata}
@@ -1050,10 +1053,14 @@ function AccountDownloader({ onShowToast, dlOptions = {} }) {
                 />
                 <span>Nhúng Metadata</span>
               </label>
-              <label className="checkbox-opt-label">
+              <label
+                className={`checkbox-opt-label ${thumbnailLimit ? 'is-disabled' : ''}`}
+                title={thumbnailLimit || 'Gắn ảnh bìa vào tệp video MP4 / MKV (tệp âm thanh luôn có ảnh bìa)'}
+              >
                 <input
                   type="checkbox"
-                  checked={embedThumbnail}
+                  checked={embedThumbnail && !thumbnailLimit}
+                  disabled={Boolean(thumbnailLimit)}
                   onChange={(e) => onEmbedThumbnailChange?.(e.target.checked)}
                 />
                 <span>Nhúng Thumbnail</span>
@@ -1066,6 +1073,9 @@ function AccountDownloader({ onShowToast, dlOptions = {} }) {
                 />
                 <span>Tải bằng aria2c</span>
               </label>
+              {containerNote(videoContainer) && (
+                <p className="tools-setting-hint options-note">{containerNote(videoContainer)}</p>
+              )}
             </>
           )}
         </div>
