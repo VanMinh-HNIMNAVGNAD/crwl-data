@@ -1187,8 +1187,12 @@ class MediaDispatcher(BaseExtractor):
             if username.lower() == "status" or subpath == "status":
                 return url
 
-            # Đã có subpath media hoặc timeline
+            # Đã có subpath media hoặc timeline. Giữ bộ lọc ảnh/video của trang Media
+            # (/media?filter=photo|video — X tách hai timeline riêng từ 11/2026).
             if subpath in ("media", "timeline", "likes"):
+                filt = re.search(r"[?&]filter=(photo|video)s?\b", url, re.IGNORECASE)
+                if subpath == "media" and filt:
+                    return f"{clean}?filter={filt.group(1).lower()}"
                 return clean
 
             # Chuyển user profile thông thường sang /media

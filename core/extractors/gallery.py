@@ -195,9 +195,15 @@ class GalleryDlExtractor(BaseExtractor):
         else:
             first_post, last_post = 1, 0  # 0 = quét toàn bộ
 
-        raw_entries, code, stderr, timed_out = self._crawl_entries(
-            profile_url, browser, last_post, timeout
-        )
+        x_timelines = self._x_media_timelines(profile_url, media_type)
+        if x_timelines:
+            raw_entries, code, stderr, timed_out = self._crawl_x_media(
+                x_timelines, browser, last_post, timeout
+            )
+        else:
+            raw_entries, code, stderr, timed_out = self._crawl_entries(
+                profile_url, browser, last_post, timeout
+            )
 
         # gallery-dl -j báo lỗi qua entry [-1, {...}] trên STDOUT (không phải stderr),
         # nên phải soi cả hai nguồn mới nhận ra được trường hợp thiếu cookie đăng nhập.
@@ -240,6 +246,10 @@ class GalleryDlExtractor(BaseExtractor):
         # những bài còn thiếu tệp. Nhờ vậy mỗi bài đăng giữ được ĐỦ ảnh/video
         # thay vì chỉ một ảnh đại diện.
         groups = self._group_by_post(raw_entries)
+        if x_timelines and len(x_timelines) > 1:
+            # Ghép hai timeline ảnh + video lại theo thời gian: ID tweet (snowflake)
+            # tăng dần theo thời điểm đăng, mới nhất lên đầu như trên trang Media.
+            groups.sort(key=self._tweet_order, reverse=True)
         if last_post > 0:
             groups = groups[first_post - 1:last_post]
         groups = self._expand_incomplete_posts(groups, browser)
@@ -332,6 +342,81 @@ class GalleryDlExtractor(BaseExtractor):
                 break
         media_found = any(isinstance(x, list) and len(x) >= 2 and x[0] == 3 for x in collected)
         return collected, (0 if media_found else last_code), "\n".join(stderr_parts), timed_out
+
+    # ── Trang Media của X ────────────────────────────────────────────────
+    # 11/2026 X tách trang Media thành hai timeline riêng (UserPhotoTimeline /
+    # UserVideoTimeline, ứng với /media?filter=photo|video). gallery-dl mới đọc
+    # "/media" thành TOÀN BỘ ảnh rồi mới tới video, nên giới hạn số bài của app chỉ
+    # còn thấy ảnh: chọn "Video" ra rỗng, "Tất cả" mất hết video mới. Vì vậy app gọi
+    # thẳng timeline đúng loại, và với "Tất cả" thì quét cả hai rồi trộn theo thời gian.
+    # gallery-dl cũ vẫn nhận URL có ?filter= (bỏ qua bộ lọc, trả timeline gộp như trước)
+    # — hai lượt trùng nhau được khử trùng nên kết quả vẫn đúng.
+    _X_MEDIA_RE = re.compile(
+        r"^(https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/(?!i/)[^/?#]+/media)/?$", re.IGNORECASE
+    )
+
+    @classmethod
+    def _x_media_timelines(cls, url: str, media_type: str) -> Optional[List[str]]:
+        """Các URL timeline cần quét cho trang /media của X (chưa có bộ lọc), hoặc None."""
+        m = cls._X_MEDIA_RE.match((url or "").strip())
+        if not m:
+            return None
+        base = m.group(1)
+        if media_type == "video":
+            return [f"{base}?filter=video"]
+        if media_type == "image":
+            return [f"{base}?filter=photo"]
+        return [f"{base}?filter=photo", f"{base}?filter=video"]
+
+    @staticmethod
+    def _tweet_order(group: Dict[str, Any]) -> int:
+        for entry in group.get("entries") or []:
+            meta = entry[2] if len(entry) > 2 and isinstance(entry[2], dict) else {}
+            try:
+                return int(meta.get("tweet_id") or 0)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def _crawl_x_media(
+        self,
+        urls: List[str],
+        browser: Optional[str],
+        last_post: int,
+        timeout: float,
+    ) -> Tuple[List[Any], int, str, bool]:
+        """Quét song song các timeline Media của X rồi gộp lại (khử trùng tệp)."""
+        if len(urls) == 1:
+            return self._crawl_entries(urls[0], browser, last_post, timeout)
+
+        parent_req = current_request_id()
+
+        def worker(url: str) -> Tuple[List[Any], int, str, bool]:
+            # Như _expand_incomplete_posts: gắn req_id để nút "Hủy" kill được tiến trình
+            previous = attach_request(parent_req)
+            try:
+                return self._crawl_entries(url, browser, last_post, timeout)
+            finally:
+                detach_request(previous)
+
+        with ThreadPoolExecutor(max_workers=len(urls), thread_name_prefix="crwl-x") as pool:
+            results = list(pool.map(worker, urls))
+
+        merged: List[Any] = []
+        seen_files = set()
+        for entries, _, _, _ in results:
+            for x in entries:
+                if isinstance(x, list) and len(x) >= 2 and x[0] == 3:
+                    # Tweet vừa có ảnh vừa có video nằm ở cả hai timeline
+                    if x[1] in seen_files:
+                        continue
+                    seen_files.add(x[1])
+                merged.append(x)
+        has_media = bool(seen_files)
+        code = 0 if has_media else next((c for _, c, _, _ in results if c), 0)
+        stderr = "\n".join(err for _, _, err, _ in results if err)
+        timed_out = any(t for _, _, _, t in results)
+        return merged, code, stderr, timed_out
 
     def _raise_probe_error(self, url: str, browser: Optional[str]) -> None:
         """Thăm dò ngắn bằng `-j` thường để lộ ra entry lỗi mà chế độ jsonl nuốt mất."""
