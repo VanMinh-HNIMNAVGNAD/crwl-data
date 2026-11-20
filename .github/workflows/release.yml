@@ -1,5 +1,8 @@
 name: Release App
 
+# Quy tắc đánh số phiên bản: xem docs/guide-cicd-and-release.md (mục "Quy tắc đánh số phiên bản").
+# Tag phải đúng bằng "v" + version trong code (pnpm bump <X.Y.Z>), nếu lệch thì workflow dừng.
+
 on:
   push:
     tags:
@@ -7,12 +10,83 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Phiên bản tag phát hành (ví dụ: v0.1.1)'
-        required: false
-        default: 'v0.1.1'
+        description: 'Tag đã có sẵn cần build lại (ví dụ: v1.10.3)'
+        required: true
+
+# Không cho hai lượt build cùng một tag chạy song song.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
-  release:
+  # Tạo (hoặc cập nhật) trang Release đúng MỘT lần trước khi các máy build tải file lên.
+  # Trước đây mỗi máy build tự tạo release nên từng sinh ra release nháp bị trùng.
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
+
+      - name: Kiểm tra tag khớp version trong code
+        run: |
+          node scripts/bump_version.mjs --check
+          VERSION=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::Tag $TAG không khớp version trong code (v$VERSION). Chạy 'pnpm bump X.Y.Z', commit rồi gắn tag vX.Y.Z vào đúng commit đó."
+            exit 1
+          fi
+
+      - name: Soạn ghi chú phát hành từ commit
+        run: |
+          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$TAG^" 2>/dev/null || true)
+          RANGE="$TAG"
+          [ -n "$PREV" ] && RANGE="$PREV..$TAG"
+          {
+            echo "## Thay đổi"
+            echo
+            git log --no-merges --format='- %s' "$RANGE" \
+              | grep -vE '^- chore(\(release\))?: (bump version|release|đánh lại)' || echo "- Không có thay đổi mã nguồn."
+            [ -n "$PREV" ] && { echo; echo "So sánh đầy đủ: https://github.com/${{ github.repository }}/compare/$PREV...$TAG"; }
+            echo
+            cat <<'EOF'
+          ## Tệp cài đặt
+
+          | Hệ điều hành | Tệp | Ghi chú |
+          | :--- | :--- | :--- |
+          | Windows 10/11 | `*_x64-setup.exe` | Trình cài đặt NSIS (khuyên dùng) |
+          | Windows 10/11 | `*_x64_en-US.msi` | Windows Installer |
+          | Linux | `*_amd64.AppImage` | Chạy trực tiếp, không cần cài |
+          | Linux (Ubuntu/Debian) | `*_amd64.deb` | `sudo apt install ./<tệp>.deb` |
+          | Linux (Fedora/openSUSE) | `*.x86_64.rpm` | `sudo dnf install ./<tệp>.rpm` |
+          EOF
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Tạo hoặc cập nhật release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Social Media Crawler $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file release-notes.md --draft=false
+          else
+            gh release create "$TAG" --verify-tag --title "$TITLE" --notes-file release-notes.md
+          fi
+          echo "id=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq .id)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
     permissions:
       contents: write
 
@@ -28,8 +102,10 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout tag
         uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -65,21 +141,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: 'apps/desktop'
-          tagName: ${{ github.event.inputs.tag || github.ref_name }}
-          releaseName: 'Social Media Crawler ${{ github.event.inputs.tag || github.ref_name }}'
-          releaseBody: |
-            ## 🚀 Social Media Crawler ${{ github.event.inputs.tag || github.ref_name }}
-            
-            Bản phát hành chính thức đồng thời cho cả **Linux** và **Windows** với cơ sở dữ liệu SQLite cục bộ (bảo mật & riêng tư 100%).
-
-            ### 📦 Tệp cài đặt đính kèm cho cả 2 hệ điều hành:
-
-            #### 🐧 Linux (Ubuntu, Debian, Fedora, Arch...):
-            - `social-media-crawler_amd64.AppImage`: Chạy trực tiếp, không cần cài đặt
-            - `social-media-crawler_amd64.deb`: Gói cài đặt cho Ubuntu / Debian / Linux Mint
-
-            #### 🪟 Windows (Windows 10 / 11):
-            - `social-media-crawler_x64-setup.exe`: Trình cài đặt tự động (NSIS Setup - Khuyên dùng)
-            - `social-media-crawler_x64_en-US.msi`: Gói Windows Installer (.msi)
-          releaseDraft: false
-          prerelease: false
+          releaseId: ${{ needs.prepare.outputs.release_id }}

@@ -228,7 +228,7 @@ pnpm --filter desktop tauri build
 ### 📍 Thư mục chứa kết quả build:
 Sau khi build thành công, các file cài đặt sẽ nằm tại:
 - **Gói Debian/Ubuntu (.deb)**:
-  `apps/desktop/src-tauri/target/release/bundle/deb/social-media-crawler_0.1.1_amd64.deb`
+  `apps/desktop/src-tauri/target/release/bundle/deb/social-media-crawler_1.10.3_amd64.deb`
 - **Gói Chạy Nhanh (.AppImage)**:
   `apps/desktop/src-tauri/target/release/bundle/appimage/social-media-crawler_0.1.0_amd64.AppImage`
 - **File nhị phân độc lập (Standalone Binary)**:
@@ -316,17 +316,18 @@ Dự án đã tích hợp sẵn GitHub Actions workflow tại `.github/workflows
 ### 9.2. Cách tạo bản phát hành (Release)
 **Cách 1: Đẩy Git Tag (Khuyên dùng)**
 ```bash
+pnpm bump 1.10.4   # số mới theo quy tắc trong docs/guide-cicd-and-release.md
 git add .
-git commit -m "chore: release v0.1.1"
+git commit -m "chore: bump version to 1.10.4"
 git push origin main
-git tag v0.1.1
-git push origin v0.1.1
+git tag -a v1.10.4 -m "Release v1.10.4"
+git push origin v1.10.4
 ```
 
 **Cách 2: Chạy thủ công trên GitHub UI (Workflow Dispatch)**
 - Vào tab **Actions** trên GitHub.
 - Chọn workflow **Release App**.
-- Bấm nút **Run workflow**, điền tag phiên bản (ví dụ `v0.1.1`) và xác nhận.
+- Bấm nút **Run workflow**, điền tag phiên bản (một tag đã có sẵn, ví dụ `v1.10.4`) và xác nhận.
 
 Sau khi quy trình hoàn tất (khoảng 5-10 phút):
 - GitHub Actions sẽ tự động tạo một bản phát hành mới trong mục **Releases**.
